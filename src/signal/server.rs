@@ -8,8 +8,6 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::peer_search::PeerSearchManager;
 use super::Peer;
-use crate::commands::create_base_commands;
-use crate::commands::get_path_blobs;
 use crate::config::Config;
 use crate::crypto::crypto::generate_uuid;
 use crate::db::{P2PDatabase, Storage};
@@ -64,8 +62,7 @@ impl SignalServer {
         let my_public_addr = Arc::new(format!("{}:{}", public_ip, config.signal_server_port));
         let my_public_key = db.get_or_create_peer_id().unwrap();
 
-        let commands = create_base_commands();
-        let path_blobs = get_path_blobs(&commands.get_matches());
+        let path_blobs = format!("{}/blobs", db.path);
 
         let peers = Arc::new(RwLock::new(Vec::new()));
         let connected_servers = Arc::new(RwLock::new(Vec::new()));

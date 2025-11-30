@@ -19,7 +19,6 @@ reqwest = { version = "0.12.7", features = ["json"] }
 toml = "0.8.19"
 serde_derive = "1.0.214"
 tempdir = "0.3.7"
-clap = "4.5.27"
 lazy_static = "1.5.0"
 base64 = "0.22.1"
 colored = "3.0.0"
@@ -43,8 +42,7 @@ mime_guess = "2.0.4"
 dashmap = "6.1.0"
 chrono = "0.4"
 bincode = "1.3.3"
-pyo3 = { version = "0.25.0", features = ["auto-initialize"] }
-termcolor = "1.2.0"
+async-trait = "0.1"
 
 [dependencies.uuid]
 version = "1.12.1"
@@ -59,3 +57,19 @@ rustflags = ["-L", "E:\\VHP\\P2P-Server\\libs\\Packet.lib"]
 [lib]
 name = "p2p_server"
 path = "src/lib.rs"
+
+[[example]]
+name = "daemon_example"
+path = "examples/daemon_example.rs"
+
+[[example]]
+name = "peer_daemon"
+path = "examples/peer_daemon.rs"
+
+[[example]]
+name = "peer_with_packet_handling"
+path = "examples/peer_with_packet_handling.rs"
+
+[[example]]
+name = "peer_with_custom_handlers"
+path = "examples/peer_with_custom_handlers.rs"

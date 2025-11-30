@@ -3,6 +3,7 @@ use crate::connection::Connection;
 use crate::crypto::crypto::generate_uuid;
 use crate::http::proxy::handle_http_proxy_response;
 use crate::logger::{debug, error, info, peer, storage, turn};
+use crate::manager::packet_handler::PacketHandlerResult;
 use crate::manager::types::{ConnectionTurnStatus, ConnectionType};
 use crate::packets::{
     Message, Protocol, StorageToken,
@@ -56,6 +57,32 @@ impl ConnectionManager {
         packet: TransportPacket,
         connection: Option<Arc<Connection>>,
     ) {
+        // Сначала проверяем пользовательские обработчики
+        for entry in self.packet_handlers.iter() {
+            let handler = entry.value();
+            let result = handler.handle_packet(&packet, &connection_type, &connection).await;
+            
+            match result {
+                PacketHandlerResult::Handled => {
+                    debug(&format!("Packet handled by custom handler: {}", entry.key()));
+                    return; // Пакет обработан, стандартная обработка не нужна
+                }
+                PacketHandlerResult::HandledWithResponse(response_packet) => {
+                    debug(&format!("Packet handled by custom handler with response: {}", entry.key()));
+                    // Отправляем ответ
+                    if let Err(e) = self.auto_send_packet(response_packet).await {
+                        error(&format!("Failed to send handler response: {}", e));
+                    }
+                    return; // Пакет обработан, стандартная обработка не нужна
+                }
+                PacketHandlerResult::Pass => {
+                    // Продолжаем проверку других обработчиков или стандартную обработку
+                    continue;
+                }
+            }
+        }
+
+        // Если ни один обработчик не обработал пакет, используем стандартную обработку
         match connection_type {
             ConnectionType::Signal(id) => {
                 debug(&format!("Received signal packet: {:?}", packet));

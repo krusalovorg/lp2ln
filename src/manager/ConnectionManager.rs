@@ -1,16 +1,14 @@
-use crate::commands::{create_base_commands, get_db_path, get_path_blobs};
 use crate::connection::{Connection, Message};
 use crate::db::P2PDatabase;
 use crate::http::http_proxy::HttpProxy;
 use crate::manager::types::{ConnectionTurnStatus, ConnectionType};
+use crate::manager::packet_handler::PacketHandler;
 use crate::packets::{SearchPathNode, TransportData, TransportPacket};
 use crate::crypto::signature::sign_packet;
-use crate::peer::peer_api::PeerAPI;
 use crate::tunnel::Tunnel;
-use crate::ui::console_manager;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use super::types::PeerOpenNetInfo;
 
@@ -32,10 +30,11 @@ pub struct ConnectionManager {
 
     pub proxy_http_tx_reciever: Arc<Mutex<mpsc::Sender<TransportPacket>>>,
     pub path_blobs: String,
+    pub packet_handlers: Arc<DashMap<String, crate::manager::packet_handler::PacketHandlerWrapper>>,
 }
 
 impl ConnectionManager {
-    pub async fn new(db: &P2PDatabase) -> Self {
+    pub async fn new(db: &P2PDatabase, db_path: Option<&str>) -> Self {
         let (incoming_packet_tx, incoming_packet_rx) = mpsc::channel(4096);
         let (proxy_http_tx, mut proxy_http_rx) = mpsc::channel(4096);
         let (proxy_http_tx_reciever, mut proxy_http_rx_reciever) = mpsc::channel(4096);
@@ -44,8 +43,8 @@ impl ConnectionManager {
 
         let connections_stun = Arc::new(DashMap::new());
 
-        let commands = create_base_commands();
-        let path_blobs = get_path_blobs(&commands.get_matches());
+        let db_path_str = db_path.unwrap_or("./storage");
+        let path_blobs = format!("{}/blobs", db_path_str);
 
         let db_arc = Arc::new(db.clone());
         let proxy_http_tx_clone = proxy_http_tx.clone();
@@ -80,6 +79,7 @@ impl ConnectionManager {
 
             proxy_http_tx_reciever: Arc::new(Mutex::new(proxy_http_tx_reciever)),
             path_blobs,
+            packet_handlers: Arc::new(DashMap::new()),
         };
 
         let manager_clone = manager.clone();
@@ -247,23 +247,6 @@ impl ConnectionManager {
         let id_clone = id.clone();
         let connections_turn_clone = self.connections_turn.clone();
 
-        let api = PeerAPI::new(connection.clone(), &self.db, &self);
-        let api_clone = api.clone();
-        let db_clone = self.db.clone();
-
-        tokio::spawn({
-            async move {
-                loop {
-                    console_manager(
-                        Arc::new(api_clone.clone()),
-                        connections_turn_clone.clone(),
-                        &db_clone,
-                    )
-                    .await;
-                }
-            }
-        });
-
         tokio::spawn({
             let tx_clone = tx.clone();
             let connection_clone = connection.clone();
@@ -348,5 +331,19 @@ impl ConnectionManager {
         });
 
         self.tunnels.insert(id.clone(), tunnel_clone);
+    }
+
+    /// Регистрация пользовательского обработчика пакетов
+    /// 
+    /// # Arguments
+    /// * `name` - уникальное имя обработчика
+    /// * `handler` - обработчик пакетов
+    pub fn register_packet_handler(&self, name: String, handler: Arc<dyn PacketHandler>) {
+        self.packet_handlers.insert(name, crate::manager::packet_handler::PacketHandlerWrapper::new(handler));
+    }
+
+    /// Удаление обработчика пакетов
+    pub fn unregister_packet_handler(&self, name: &str) {
+        self.packet_handlers.remove(name);
     }
 }

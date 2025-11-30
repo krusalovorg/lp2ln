@@ -7,14 +7,14 @@ use crate::manager::ConnectionManager::ConnectionManager;
 use crate::db::P2PDatabase;
 
 pub struct Peer {
-    connection_manager: Arc<ConnectionManager>,
-    connection: Arc<Connection>,
-    db: Arc<P2PDatabase>,
+    pub connection_manager: Arc<ConnectionManager>,
+    pub connection: Arc<Connection>,
+    pub db: Arc<P2PDatabase>,
 }
 
 impl Peer {
     pub async fn new(config: &Config, db: &P2PDatabase) -> Self {
-        let connection_manager = Arc::new(ConnectionManager::new(db).await);
+        let connection_manager = Arc::new(ConnectionManager::new(db, Some(&db.path)).await);
 
         let connection = Arc::new(
             Connection::new(
@@ -46,5 +46,15 @@ impl Peer {
         logger::info("[Peer] Starting peer...");
 
         self.connection_manager.handle_incoming_packets().await;
+    }
+
+    /// Получить ConnectionManager для отправки пакетов
+    pub fn get_connection_manager(&self) -> Arc<ConnectionManager> {
+        self.connection_manager.clone()
+    }
+
+    /// Получить Connection для прямой отправки пакетов
+    pub fn get_connection(&self) -> Arc<Connection> {
+        self.connection.clone()
     }
 }
