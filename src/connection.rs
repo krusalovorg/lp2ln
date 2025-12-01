@@ -29,6 +29,7 @@ pub struct Connection {
     pub ip: String,
     pub port: i64,
     db: Arc<P2PDatabase>,
+    cached_peer_id: Arc<String>,
     reconnect_attempts: Arc<RwLock<i32>>,
     max_reconnect_attempts: i32,
 }
@@ -65,6 +66,9 @@ impl Connection {
         reconnect_attempts: Arc<RwLock<i32>>,
         max_reconnect_attempts: i32,
     ) -> Connection {
+        let db_arc = Arc::new(db.clone());
+        let cached_peer_id = Arc::new(db_arc.get_or_create_peer_id().unwrap());
+
         let mut attempts = 0;
         let mut stream = None;
 
@@ -97,20 +101,20 @@ impl Connection {
             data: Some(
                 TransportData::PeerInfo(PeerInfo {
                     is_signal_server: false,
-                    total_space: db.get_storage_size().await.unwrap_or(0),
-                    free_space: db.get_storage_free_space().await.unwrap_or(0),
+                    total_space: db_arc.get_storage_size().await.unwrap_or(0),
+                    free_space: db_arc.get_storage_free_space().await.unwrap_or(0),
                     stored_files: Vec::new(),
-                    public_key: db.get_or_create_peer_id().unwrap(),
+                    public_key: cached_peer_id.as_str().to_string(),
                 }),
             ),
             protocol: Protocol::SIGNAL,
-            peer_key: db.get_or_create_peer_id().unwrap(),
+            peer_key: cached_peer_id.as_str().to_string(),
             uuid: generate_uuid(),
             nodes: vec![],
             signature: None,
         };
 
-        let mut signing_key = db.get_private_signing_key().unwrap();
+        let signing_key = db_arc.get_private_signing_key().unwrap();
         let _ = sign_packet(&mut connect_packet, &signing_key);
 
         if let Err(e) = Self::write_packet(&writer, &connect_packet).await {
@@ -124,7 +128,8 @@ impl Connection {
             rx,
             reader.clone(),
             writer.clone(),
-            Arc::new(db.clone()),
+            db_arc.clone(),
+            cached_peer_id.clone(),
         ));
 
         Connection { 
@@ -133,7 +138,8 @@ impl Connection {
             reader,
             ip: signal_server_ip.to_string(),
             port: signal_server_port,
-            db: Arc::new(db.clone()),
+            db: db_arc,
+            cached_peer_id,
             reconnect_attempts,
             max_reconnect_attempts,
         }
@@ -167,17 +173,18 @@ impl Connection {
     }
 
     async fn process_messages(
-        tx: mpsc::Sender<Message>,
+        _tx: mpsc::Sender<Message>,
         mut rx: mpsc::Receiver<Message>,
         reader: Arc<RwLock<tokio::io::ReadHalf<TcpStream>>>,
         writer: Arc<RwLock<tokio::io::WriteHalf<TcpStream>>>,
         db: Arc<P2PDatabase>,
+        cached_peer_id: Arc<String>,
     ) {
         info(&format!("[Connection] Processing messages started"));
 
         sleep(Duration::from_millis(100)).await;
 
-        match Self::send_peer_info_request(&writer, &db).await {
+        match Self::send_peer_info_request(&writer, &db, &cached_peer_id).await {
             Ok(_) => info(&format!("[Connection] Peer info request sent successfully")),
             Err(e) => {
                 error(&format!("[Connection] Failed to send peer info request: {}", e));
@@ -218,7 +225,8 @@ impl Connection {
 
     pub async fn send_peer_info_request(
         writer: &Arc<RwLock<tokio::io::WriteHalf<TcpStream>>>,
-        db: &P2PDatabase,
+        db: &Arc<P2PDatabase>,
+        cached_peer_id: &Arc<String>,
     ) -> Result<(), String> {
         let fragments = db.get_storage_fragments().unwrap_or(Vec::new());
         let mut stored_files = Vec::new();
@@ -234,11 +242,11 @@ impl Connection {
                     total_space: db.get_total_space().unwrap_or(0),
                     free_space: db.get_storage_free_space().await.unwrap_or(0),
                     stored_files: stored_files,
-                    public_key: db.get_or_create_peer_id().unwrap(),
+                    public_key: cached_peer_id.as_str().to_string(),
                 }),
             ),
             protocol: Protocol::STUN,
-            peer_key: db.get_or_create_peer_id().unwrap(),
+            peer_key: cached_peer_id.as_str().to_string(),
             uuid: generate_uuid(),
             nodes: vec![],
             signature: None,
@@ -316,7 +324,7 @@ impl Connection {
     }
 
     pub async fn send_peer_info_request_self(&self) -> Result<(), String> {
-        Self::send_peer_info_request(&self.writer, &self.db).await
+        Self::send_peer_info_request(&self.writer, &self.db, &self.cached_peer_id).await
     }
 
     pub async fn send_packet(&self, mut packet: TransportPacket) -> Result<(), String> {

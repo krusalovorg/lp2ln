@@ -2,17 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
-use uuid::Uuid;
 
 use crate::crypto::crypto::generate_uuid;
 use crate::crypto::signature::sign_packet;
 use crate::db::P2PDatabase;
 use crate::packets::{
-    PeerInfo, PeerSearchRequest, PeerSearchResponse, Protocol, SearchPathNode, TransportData, TransportPacket,
+    PeerSearchRequest, PeerSearchResponse, Protocol, SearchPathNode, TransportData, TransportPacket,
 };
 use crate::signal::client::SignalClient;
 
-use super::{peer, Peer};
+use super::Peer;
 
 #[derive(Debug)]
 struct SearchCache {

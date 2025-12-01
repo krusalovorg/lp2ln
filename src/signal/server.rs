@@ -8,13 +8,9 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::peer_search::PeerSearchManager;
 use super::Peer;
-use crate::commands::create_base_commands;
-use crate::commands::get_path_blobs;
 use crate::config::Config;
 use crate::crypto::crypto::generate_uuid;
 use crate::db::{P2PDatabase, Storage};
-use crate::http::http_api::HttpApi;
-use crate::http::http_proxy::HttpProxy;
 use crate::packets::{
     FragmentSearchResponse, PeerWaitConnection, Protocol, SearchPathNode, SyncPeerInfo,
     SyncPeerInfoData, TransportData, TransportPacket,
@@ -42,13 +38,9 @@ pub struct SignalServer {
     ip: String,
     message_tx: mpsc::Sender<(Arc<Peer>, String)>,
     pub response_tx: mpsc::Sender<TransportPacket>,
-    pub proxy_http_tx: mpsc::Sender<TransportPacket>,
-    pub api_http_tx: mpsc::Sender<TransportPacket>,
     my_public_addr: Arc<String>,
     my_public_key: Arc<String>,
     pub db: Arc<P2PDatabase>,
-    pub http_proxy: Arc<HttpProxy>,
-    pub http_api: Arc<HttpApi>,
     pending_responses: Arc<DashMap<String, oneshot::Sender<TransportPacket>>>,
 }
 
@@ -56,51 +48,25 @@ impl SignalServer {
     pub async fn new(config: &Config, db: &P2PDatabase) -> Arc<Self> {
         let (message_tx, mut message_rx) = mpsc::channel(4096);
         let (response_tx, mut response_rx) = mpsc::channel(4096);
-        let (proxy_http_tx, mut proxy_http_rx) = mpsc::channel(4096);
-        let (api_http_tx, mut api_http_rx) = mpsc::channel(4096);
 
         let tunnel = Tunnel::new().await;
         let public_ip = tunnel.get_public_ip();
         let my_public_addr = Arc::new(format!("{}:{}", public_ip, config.signal_server_port));
         let my_public_key = db.get_or_create_peer_id().unwrap();
 
-        let commands = create_base_commands();
-        let path_blobs = get_path_blobs(&commands.get_matches());
-
         let peers = Arc::new(RwLock::new(Vec::new()));
         let connected_servers = Arc::new(RwLock::new(Vec::new()));
+        let db_arc = Arc::new(db.clone());
         let peer_search_manager = PeerSearchManager::new(
             db.get_or_create_peer_id().unwrap(),
-            public_ip.to_string().clone(),
+            public_ip.to_string(),
             config.signal_server_port.clone(),
             peers.clone(),
             connected_servers.clone(),
-            Arc::new(db.clone()),
+            db_arc.clone(),
         );
-
-        let proxy_http_tx_clone = proxy_http_tx.clone();
-        let api_http_tx_clone = api_http_tx.clone();
-        let proxy = Arc::new(HttpProxy::new(
-            Arc::new(db.clone()),
-            proxy_http_tx_clone,
-            path_blobs.clone(),
-        ));
-        let proxy_clone = Arc::clone(&proxy);
-        let proxy_http_clone = Arc::clone(&proxy);
 
         let pending_responses = Arc::new(DashMap::new());
-
-        let http_api = Arc::new(
-            HttpApi::new(
-                Arc::new(db.clone()),
-                public_ip.clone(),
-                api_http_tx_clone,
-                path_blobs.clone(),
-            )
-            .await,
-        );
-        let http_api_clone = Arc::clone(&http_api);
-        let http_api_clone2 = Arc::clone(&http_api);
 
         let server = SignalServer {
             peers,
@@ -109,24 +75,12 @@ impl SignalServer {
             port: config.signal_server_port,
             message_tx,
             response_tx,
-            proxy_http_tx,
-            api_http_tx,
             ip: public_ip,
             my_public_addr,
             my_public_key: Arc::new(my_public_key),
-            db: Arc::new(db.clone()),
-            http_proxy: proxy,
-            http_api,
+            db: db_arc,
             pending_responses,
         };
-
-        tokio::spawn(async move {
-            proxy_clone.start().await;
-        });
-
-        tokio::spawn(async move {
-            http_api_clone.start().await;
-        });
 
         let server_arc = Arc::new(server);
 
@@ -166,91 +120,15 @@ impl SignalServer {
         }
 
         let server_clone = Arc::clone(&server_arc);
-        let server_clone_for_proxy = Arc::clone(&server_arc);
-        let server_clone_for_proxy_http = Arc::clone(&server_arc);
 
         tokio::spawn(async move {
             while let Some((peer, message)) = message_rx.recv().await {
-                let server_clone = server_clone.clone();
+                let server_clone_for_task = Arc::clone(&server_clone);
                 let peer_clone = peer.clone();
                 tokio::spawn(async move {
-                    server_clone
-                        .handle_message(&server_clone, peer_clone, message)
+                    server_clone_for_task
+                        .handle_message(&server_clone_for_task, peer_clone, message)
                         .await;
-                });
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(packet) = proxy_http_rx.recv().await {
-                let server_clone = server_clone_for_proxy.clone();
-                tokio::spawn(async move {
-                    server_clone.auto_send_packet(packet).await;
-                });
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(packet) = api_http_rx.recv().await {
-                let server_clone = server_clone_for_proxy_http.clone();
-                tokio::spawn(async move {
-                    if packet.to.is_some() {
-                        server_clone.auto_send_packet(packet).await;
-                    } else {
-                        let target_peer = server_clone.db.get_peer_with_most_space();
-                        let mut packet_clone = packet.clone();
-                        packet_clone.to = target_peer;
-                        server_clone.auto_send_packet(packet_clone).await;
-                    }
-                });
-            }
-        });
-
-        let proxy_clone_rx = proxy_http_clone.clone();
-        tokio::spawn(async move {
-            while let Some(packet) = response_rx.recv().await {
-                println!(
-                    "[HTTP Proxy] Getted request from http proxy: {:?}",
-                    packet.to
-                );
-                let proxy = proxy_clone_rx.clone();
-                let http_api = http_api_clone2.clone();
-                tokio::spawn(async move {
-                    let packet_clone = packet.clone();
-                    match &packet_clone.data {
-                        Some(TransportData::ProxyMessage(msg)) => {
-                            println!(
-                                "[HTTP Proxy] Getted request from http proxy: {:?}",
-                                msg.from_peer_id
-                            );
-                            http_api
-                                .set_response(msg.request_id.clone(), packet_clone.clone())
-                                .await;
-                            proxy
-                                .set_response(msg.request_id.clone(), packet_clone)
-                                .await;
-                        }
-                        Some(TransportData::FragmentSearchResponse(_)) => {
-                            println!(
-                                "[HTTP Proxy] Getted request from http proxy: {:?}",
-                                packet_clone.peer_key.clone()
-                            );
-                            http_api
-                                .set_response(packet_clone.uuid.clone(), packet_clone.clone())
-                                .await;
-                            proxy
-                                .set_response(packet_clone.uuid.clone(), packet_clone)
-                                .await;
-                        }
-                        _ => {
-                            http_api
-                                .set_response(packet_clone.uuid.clone(), packet_clone.clone())
-                                .await;
-                            proxy
-                                .set_response(packet_clone.uuid.clone(), packet_clone)
-                                .await;
-                        }
-                    }
                 });
             }
         });
@@ -519,18 +397,6 @@ impl SignalServer {
             let _ = sender.send(message.clone());
         }
 
-        if message.act == "http_proxy_response" {
-            if let Some(target_peer_id) = &message.to {
-                if *target_peer_id != *self.my_public_key {
-                    log(&format!("Sending response to peer: {:?}", message.to));
-                    self.auto_send_packet(message).await;
-                } else {
-                    log("Sending response to channel response");
-                    self.response_tx.send(message).await;
-                }
-            }
-            return;
-        }
 
         let peer_key = &message.peer_key;
         let is_peer_wait_connection = message.act == "wait_connection";
@@ -1055,13 +921,13 @@ impl SignalServer {
         }
     }
 
-    async fn send_to_peer_by_packet(&self, message: TransportPacket) {
-        for peer in self.peers.read().await.iter() {
-            if peer.info.peer_key.read().await.clone().unwrap() == message.to.clone().unwrap() {
-                peer.send(serde_json::to_string(&message).unwrap()).await;
-            }
-        }
-    }
+    // async fn send_to_peer_by_packet(&self, message: TransportPacket) {
+    //     for peer in self.peers.read().await.iter() {
+    //         if peer.info.peer_key.read().await.clone().unwrap() == message.to.clone().unwrap() {
+    //             let _ = peer.send(serde_json::to_string(&message).unwrap()).await;
+    //         }
+    //     }
+    // }
 
     async fn connect_peers(&self, first_peer: Arc<Peer>, second_peer: Arc<Peer>) {
         log("[SignalServer] Connecting peers");

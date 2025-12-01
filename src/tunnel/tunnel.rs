@@ -312,7 +312,7 @@ impl Tunnel {
         let sock_clone = sock.clone();
 
         thread::spawn(move || loop {
-            task::block_on(sock_clone.send_to(b"KPL", client)).map_err(|e| {
+            let _ = task::block_on(sock_clone.send_to(b"KPL", client)).map_err(|e| {
                 println!("[STUN] Failed to send keep-alive packet: {:?}", e);
             });
             thread::sleep(Duration::from_secs_f64(1.0 / freq as f64));

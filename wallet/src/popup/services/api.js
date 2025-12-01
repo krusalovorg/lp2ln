@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://lp2ln.tech:8081';
+const API_BASE_URL = 'http://localhost:8081';
 
 // Готовые JSON пакеты для разных действий
 export const API_ACTIONS = {

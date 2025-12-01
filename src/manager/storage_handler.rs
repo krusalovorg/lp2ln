@@ -1,4 +1,4 @@
-use super::ConnectionManager::ConnectionManager;
+use super::connection_manager::ConnectionManager;
 use crate::crypto::crypto::generate_uuid;
 use crate::packets::{
     FragmentMetadata, FragmentMetadataSync, Protocol, StorageReservationRequest, StorageReservationResponse, StorageToken, StorageValidTokenResponse, TransportData, TransportPacket

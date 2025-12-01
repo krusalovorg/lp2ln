@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::crypto::crypto::generate_uuid;
 use crate::crypto::signature::sign_packet;
 use crate::db::P2PDatabase;
