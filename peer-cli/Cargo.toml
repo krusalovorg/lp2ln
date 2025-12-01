@@ -1,0 +1,18 @@
+[package]
+name = "peer-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive CLI daemon for the LP2LN P2P network"
+authors = ["LP2LN Contributors"]
+
+[dependencies]
+P2P-Server = { path = ".." }
+tokio = { version = "1.28", features = ["full"] }
+colored = "3.0.0"
+
+[[bin]]
+name = "peer-cli"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.19.1"
