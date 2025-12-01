@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::io::{self, Read};
+use std::io::Read;
 use flate2::read::GzEncoder;
 use flate2::Compression;
 
-use crate::manager::ConnectionManager::ConnectionManager;
-use crate::packets::{Protocol, ProxyMessage, TransportData, TransportPacket};
+use p2p_server::manager::connection_manager::ConnectionManager;
+use p2p_server::packets::{Protocol, ProxyMessage, TransportData, TransportPacket};
 
 pub async fn handle_http_proxy_response(
     packet: TransportPacket,

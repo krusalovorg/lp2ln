@@ -3,7 +3,6 @@ use base64;
 use hex;
 use k256;
 use serde_json;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::ecdsa::signature::Verifier;
 
 pub async fn get_metadata_from_token(token: String) -> Result<StorageToken, String> {

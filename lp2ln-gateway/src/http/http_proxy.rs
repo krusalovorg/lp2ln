@@ -1,10 +1,9 @@
-use crate::config::Config;
-use crate::db::P2PDatabase;
-use crate::packets::{
-    FileRequest, FragmentSearchRequest, Protocol, ProxyMessage, TransportData, TransportPacket,
+use p2p_server::config::Config;
+use p2p_server::db::P2PDatabase;
+use p2p_server::packets::{
+    FileRequest, FragmentSearchRequest, Protocol, TransportData, TransportPacket,
 };
 use bytes::Bytes;
-use colored::Colorize;
 use dashmap::DashMap;
 use flate2::read::{GzDecoder, GzEncoder};
 use flate2::Compression;
@@ -13,17 +12,16 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::rt::tokio::TokioIo;
-use std::io::{self, Read};
+use std::io::{Read};
 use std::time::{Duration, Instant};
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use crate::logger;
+use p2p_server::logger;
 use std::collections::HashSet;
-use std::net::IpAddr;
 
-use crate::http::security::{SecurityManager, SecurityConfig, SecurityError};
+use crate::http::security::{SecurityManager, SecurityConfig};
 
 #[derive(Clone, Debug)]
 struct CachedFile {
@@ -94,7 +92,7 @@ impl HttpProxy {
         let listener = listener.unwrap();
 
         loop {
-            let (stream, socket) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
             let peer_ip = format!(
                 "{}:{}",
                 stream.peer_addr().unwrap().ip().to_string(),
@@ -208,7 +206,7 @@ impl HttpProxy {
             logger::info(&format!("  {}: {}", name, value.to_str().unwrap_or("(invalid)")));
         }
 
-        let mut hash_file = self.get_hash_file_from_request(&req, &client_ip).await;
+        let hash_file = self.get_hash_file_from_request(&req, &client_ip).await;
         logger::info(&format!("[HTTP Proxy] Hash File: {}", hash_file));
 
         let mut request_str = String::new();
@@ -435,7 +433,7 @@ impl HttpProxy {
                         decompressed = decrypted.clone();
                     }
 
-                    let mut response_builder = Response::builder()
+                    let response_builder = Response::builder()
                         .status(hyper::StatusCode::OK)
                         .header("Content-Type", &mime_type)
                         .header("Content-Length", decompressed.len().to_string())

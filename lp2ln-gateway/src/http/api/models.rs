@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::packets::{Protocol, TransportData};
+use p2p_server::packets::{Protocol, TransportData};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PacketRequest {

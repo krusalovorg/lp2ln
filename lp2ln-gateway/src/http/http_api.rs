@@ -1,11 +1,10 @@
-use super::api::{full, log, FileAccessRequest, FileCache, UpdateRequest, UploadRequest};
-use crate::db::P2PDatabase;
-use crate::packets::{
+use super::api::{full, FileAccessRequest, FileCache};
+use p2p_server::db::P2PDatabase;
+use p2p_server::packets::{
     ContractExecutionRequest, FragmentSearchRequest, PeerFileGet, PeerFileUpdate, PeerUploadFile, Protocol, TransportData, TransportPacket
 };
 use bytes::Bytes;
 use chrono;
-use colored::Colorize;
 use dashmap::DashMap;
 use hex;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -21,7 +20,7 @@ use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use crate::logger;
+use p2p_server::logger;
 
 #[derive(Clone, Debug)]
 pub struct HttpApi {
@@ -899,7 +898,6 @@ impl HttpApi {
 
             let mut headers = Vec::new();
             let mut content = Vec::new();
-            let mut is_content = false;
 
             let mut header_end = 0;
             for (i, window) in part.windows(4).enumerate() {
@@ -1131,7 +1129,7 @@ impl HttpApi {
                 .unwrap());
         }
 
-        let access_request: FileAccessRequest = match serde_json::from_slice(&whole_body) {
+        let _: FileAccessRequest = match serde_json::from_slice(&whole_body) {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Response::builder()

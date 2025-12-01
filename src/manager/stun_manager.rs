@@ -1,4 +1,3 @@
-use crate::connection::Connection;
 use crate::crypto::crypto::generate_uuid;
 use crate::manager::ConnectionTurnStatus;
 use crate::packets::{PeerWaitConnection, Protocol, TransportData, TransportPacket};
@@ -6,7 +5,7 @@ use crate::tunnel::Tunnel;
 use anyhow::Result;
 
 use super::types::PeerOpenNetInfo;
-use super::ConnectionManager::ConnectionManager;
+use super::connection_manager::ConnectionManager;
 
 impl ConnectionManager {
     pub async fn send_wait_connection(

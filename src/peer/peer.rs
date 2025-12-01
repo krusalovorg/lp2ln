@@ -3,7 +3,7 @@ use crate::logger;
 
 use crate::config::Config;
 use crate::connection::Connection;
-use crate::manager::ConnectionManager::ConnectionManager;
+use crate::manager::connection_manager::ConnectionManager;
 use crate::db::P2PDatabase;
 
 pub struct Peer {

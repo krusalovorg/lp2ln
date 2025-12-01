@@ -147,7 +147,7 @@ impl SecurityManager {
         }
 
         // Проверка заголовков
-        for (name, value) in req.headers() {
+        for (_, value) in req.headers() {
             if let Ok(value_str) = value.to_str() {
                 if self.suspicious_patterns.iter().any(|pattern| {
                     value_str.to_lowercase().contains(&pattern.to_lowercase())
@@ -201,6 +201,4 @@ pub enum SecurityError {
     TooManyHeaders,
     TooManyQueryParams,
     SuspiciousRequest,
-    InvalidMimeType,
-    UnauthorizedIp,
 } 

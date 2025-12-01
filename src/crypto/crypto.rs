@@ -1,10 +1,9 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 use k256::elliptic_curve::ecdh::diffie_hellman;
-use k256::elliptic_curve::ecdh::EphemeralSecret;
 use k256::elliptic_curve::sec1::FromEncodedPoint;
 use k256::EncodedPoint;
-use k256::{ecdh::SharedSecret, PublicKey, SecretKey};
+use k256::{PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;

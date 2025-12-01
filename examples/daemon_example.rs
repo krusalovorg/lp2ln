@@ -1,16 +1,13 @@
-// Пример использования библиотеки p2p_server как демона
-// Этот пример показывает, как использовать библиотеку для создания P2P пира
-
 use p2p_server::config::Config;
 use p2p_server::db::P2PDatabase;
 use p2p_server::logger;
-use p2p_server::peer::Peer;
 use p2p_server::signal::SignalServer;
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
     // Инициализация логирования
+    logger::info("Запуск P2P демона...");
     logger::set_log_file(Some("./daemon.log"));
     logger::info("Запуск P2P демона...");
 

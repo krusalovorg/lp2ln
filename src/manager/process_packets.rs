@@ -1,7 +1,6 @@
-use super::ConnectionManager::ConnectionManager;
+use super::connection_manager::ConnectionManager;
 use crate::connection::Connection;
 use crate::crypto::crypto::generate_uuid;
-use crate::http::proxy::handle_http_proxy_response;
 use crate::logger::{debug, error, info, peer, storage, turn};
 use crate::manager::packet_handler::PacketHandlerResult;
 use crate::manager::types::{ConnectionTurnStatus, ConnectionType};
@@ -84,10 +83,9 @@ impl ConnectionManager {
 
         // Если ни один обработчик не обработал пакет, используем стандартную обработку
         match connection_type {
-            ConnectionType::Signal(id) => {
+            ConnectionType::Signal(_id) => {
                 debug(&format!("Received signal packet: {:?}", packet));
                 let from_peer_key = packet.peer_key.clone();
-                let packet_clone = packet.clone();
                 let protocol_connection = packet.protocol.clone();
 
                 if let Some(data) = &packet.data {
@@ -131,21 +129,11 @@ impl ConnectionManager {
                                 error(&format!("Failed to handle file update: {}", e));
                             }
                         }
-                        TransportData::ProxyMessage(data) => {
-                            let _ = self
-                                .proxy_http_tx_reciever
-                                .lock()
-                                .await
-                                .send(packet.clone())
-                                .await;
+                        TransportData::ProxyMessage(_data) => {
+                            // Обработка ProxyMessage - теперь в gateway демоне
                         }
-                        TransportData::FragmentSearchResponse(response) => {
-                            let _ = self
-                                .proxy_http_tx_reciever
-                                .lock()
-                                .await
-                                .send(packet.clone())
-                                .await;
+                        TransportData::FragmentSearchResponse(_response) => {
+                            // Обработка FragmentSearchResponse - теперь в gateway демоне
                         }
                         TransportData::StorageReservationRequest(request) => {
                             if let Err(e) = self
@@ -369,16 +357,7 @@ impl ConnectionManager {
                     }
                 }
 
-                if packet.act == "http_proxy_request" {
-                    debug("Received http proxy request");
-                    let connection = connection.clone();
-                    let manager = Arc::new(self.clone());
-                    let packet_clone = packet.clone();
-                    let path_blobs = self.path_blobs.clone().to_string();
-                    tokio::spawn(async move {
-                        let _ = handle_http_proxy_response(packet_clone, manager, path_blobs).await;
-                    });
-                } else if packet.act == "request_fragments" {
+                if packet.act == "request_fragments" {
                     let _ = self.handle_fragments_request(packet).await;
                 } else if packet.act == "message_response" {
                     if let Err(e) = self.handle_message_response().await {

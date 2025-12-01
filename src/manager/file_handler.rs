@@ -1,5 +1,4 @@
-use super::ConnectionManager::ConnectionManager;
-use crate::connection::Connection;
+use super::connection_manager::ConnectionManager;
 use crate::contract::runtime::execute_contract_with_payload;
 use crate::crypto::crypto::generate_uuid;
 use crate::crypto::token::validate_signature_token;

@@ -2,7 +2,7 @@ use crate::connection::Connection;
 use crate::crypto::crypto::generate_uuid;
 use crate::crypto::token::get_metadata_from_token;
 use crate::db::P2PDatabase;
-use crate::manager::ConnectionManager::ConnectionManager;
+use crate::manager::connection_manager::ConnectionManager;
 use crate::packets::{
     ContractExecutionRequest, EncryptedData, FragmentMetadata, FragmentMetadataSync,
     GetFragmentsMetadata, Message, PeerFileAccessChange, PeerFileDelete, PeerFileGet, PeerFileMove,
@@ -252,7 +252,7 @@ impl PeerAPI {
             signature: None,
         };
 
-        self.manager.auto_send_packet(packet).await;
+        let _ = self.manager.auto_send_packet(packet).await;
 
         self.db
             .update_token_used_space(&owner_peer_id, used_space + file_size)
@@ -788,7 +788,7 @@ impl PeerAPI {
             )),
             protocol: Protocol::SIGNAL,
             peer_key: self.db.get_or_create_peer_id().unwrap(),
-            uuid: generate_uuid().clone(),
+            uuid: generate_uuid(),
             nodes: vec![],
             signature: None,
         };

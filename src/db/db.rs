@@ -1,10 +1,8 @@
 use async_std::path::PathBuf;
 use redb::{Database, Error};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::tables;
-use super::models::{PeerStats, ContractMetadata};
 
 #[derive(Clone, Debug)]
 pub struct P2PDatabase {

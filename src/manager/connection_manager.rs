@@ -1,9 +1,8 @@
 use crate::connection::{Connection, Message};
 use crate::db::P2PDatabase;
-use crate::http::http_proxy::HttpProxy;
 use crate::manager::types::{ConnectionTurnStatus, ConnectionType};
 use crate::manager::packet_handler::PacketHandler;
-use crate::packets::{SearchPathNode, TransportData, TransportPacket};
+use crate::packets::{SearchPathNode, TransportPacket};
 use crate::crypto::signature::sign_packet;
 use crate::tunnel::Tunnel;
 use dashmap::DashMap;
@@ -14,7 +13,7 @@ use super::types::PeerOpenNetInfo;
 
 #[derive(Clone)]
 pub struct ConnectionManager {
-    pub connections: Arc<DashMap<String, Connection>>,
+    pub connections: Arc<DashMap<String, Arc<Connection>>>,
     pub tunnels: Arc<DashMap<String, Arc<Mutex<Tunnel>>>>,
     pub connections_stun: Arc<DashMap<String, PeerOpenNetInfo>>,
 
@@ -25,10 +24,6 @@ pub struct ConnectionManager {
 
     pub connections_turn: Arc<DashMap<String, ConnectionTurnStatus>>,
     pub db: Arc<P2PDatabase>,
-    pub http_proxy: Arc<HttpProxy>,
-    pub proxy_http_tx: mpsc::Sender<TransportPacket>,
-
-    pub proxy_http_tx_reciever: Arc<Mutex<mpsc::Sender<TransportPacket>>>,
     pub path_blobs: String,
     pub packet_handlers: Arc<DashMap<String, crate::manager::packet_handler::PacketHandlerWrapper>>,
 }
@@ -36,8 +31,6 @@ pub struct ConnectionManager {
 impl ConnectionManager {
     pub async fn new(db: &P2PDatabase, db_path: Option<&str>) -> Self {
         let (incoming_packet_tx, incoming_packet_rx) = mpsc::channel(4096);
-        let (proxy_http_tx, mut proxy_http_rx) = mpsc::channel(4096);
-        let (proxy_http_tx_reciever, mut proxy_http_rx_reciever) = mpsc::channel(4096);
 
         let connections_turn: Arc<DashMap<String, ConnectionTurnStatus>> = Arc::new(DashMap::new());
 
@@ -47,21 +40,6 @@ impl ConnectionManager {
         let path_blobs = format!("{}/blobs", db_path_str);
 
         let db_arc = Arc::new(db.clone());
-        let proxy_http_tx_clone = proxy_http_tx.clone();
-        let proxy = Arc::new(HttpProxy::new(
-            db_arc.clone(),
-            proxy_http_tx_clone,
-            path_blobs.clone(),
-        ));
-
-        let proxy_clone = Arc::clone(&proxy);
-        let proxy_clone_for_spawn = proxy_clone.clone();
-
-        let mut proxy_http_rx_reciever = proxy_http_rx_reciever;
-
-        tokio::spawn(async move {
-            proxy_clone_for_spawn.start().await;
-        });
 
         let manager = ConnectionManager {
             connections: Arc::new(DashMap::new()),
@@ -74,60 +52,9 @@ impl ConnectionManager {
             connections_turn,
 
             db: db_arc,
-            http_proxy: proxy,
-            proxy_http_tx,
-
-            proxy_http_tx_reciever: Arc::new(Mutex::new(proxy_http_tx_reciever)),
             path_blobs,
             packet_handlers: Arc::new(DashMap::new()),
         };
-
-        let manager_clone = manager.clone();
-        let manager_clone_for_http = manager_clone.clone();
-        tokio::spawn(async move {
-            while let Some(packet) = proxy_http_rx.recv().await {
-                println!(
-                    "[HTTP Proxy] Getted request from http proxy: {:?}",
-                    packet.to
-                );
-                manager_clone_for_http.auto_send_packet(packet).await;
-            }
-        });
-
-        let proxy_clone_rx = proxy_clone.clone();
-        tokio::spawn(async move {
-            while let Some(packet) = proxy_http_rx_reciever.recv().await {
-                println!(
-                    "[HTTP Proxy] Getted request from http proxy: {:?}",
-                    packet.to
-                );
-                let proxy = proxy_clone_rx.clone();
-                tokio::spawn(async move {
-                    let packet_clone = packet.clone();
-                    match &packet_clone.data {
-                        Some(TransportData::ProxyMessage(msg)) => {
-                            println!(
-                                "[HTTP Proxy] Getted request from http proxy: {:?}",
-                                msg.from_peer_id
-                            );
-                            proxy
-                                .set_response(msg.request_id.clone(), packet_clone)
-                                .await;
-                        }
-                        Some(TransportData::FragmentSearchResponse(_)) => {
-                            // println!(
-                            //     "[HTTP Proxy] Getted FragmentSearchResponse from http proxy: {:?}",
-                            //     packet_clone
-                            // );
-                            proxy
-                                .set_response(packet_clone.uuid.clone(), packet_clone)
-                                .await;
-                        }
-                        _ => {}
-                    }
-                });
-            }
-        });
 
         manager
     }
@@ -138,7 +65,7 @@ impl ConnectionManager {
         data: TransportPacket,
     ) -> Result<(), String> {
         if let Some(conn) = self.connections.get(server_address) {
-            if let Err(e) = conn.tx.send(Message::SendData(data)).await {
+            if let Err(e) = conn.value().tx.send(Message::SendData(data)).await {
                 return Err(format!(
                     "Failed to send message to {}: {}",
                     server_address, e
@@ -154,8 +81,8 @@ impl ConnectionManager {
     }
 
     pub async fn auto_send_peer_info(&self) -> Result<(), String> {
-        for connection in self.connections.iter() {
-            connection.send_peer_info_request_self().await;
+        for entry in self.connections.iter() {
+            let _ = entry.value().send_peer_info_request_self().await;
         }
         Ok(())
     }
@@ -173,14 +100,16 @@ impl ConnectionManager {
             public_port: -1,
         });
 
+        let packet_clone = packet.clone();
         let mut sended_by_uuid = false;
+        let packet_to = packet_clone.to.clone();
 
-        if let Some(to) = &packet.to {
+        if let Some(to) = &packet_to {
             if let Some(status) = self.connections_turn.get(to) {
                 println!("Status: stun: {:?}, connected: {:?}", status.stun_connection, status.connected);
                 if status.connected && status.stun_connection {
                     if let Some(tunnel) = self.tunnels.get(to) {
-                        match serde_json::to_string(&packet) {
+                        match serde_json::to_string(&packet_clone) {
                             Ok(message) => {
                                 println!("[DEBUG] Sending packet to tunnel {}", to);
                                 let tunnel = tunnel.lock().await;
@@ -199,22 +128,25 @@ impl ConnectionManager {
 
             if !sended_by_uuid {
                 if let Some(connection) = self.connections.get(to) {
-                    if let Err(e) = connection.send_packet(packet.clone()).await {
+                    let packet_to_value = packet_clone.to.clone();
+                    if let Err(e) = connection.value().send_packet(packet_clone.clone()).await {
                         println!("[ERROR] Failed to send packet to connection {}: {}", to, e);
                     } else {
                         println!(
                             "[AUTO SEND] Sended packet to connection {}: {:?}",
-                            to, packet.to
+                            to, packet_to_value
                         );
                         sended_by_uuid = true;
+                        return Ok(());
                     }
                 }
             }
         }
 
         if !sended_by_uuid {
+            let packet_to_value = packet_clone.to.clone();
             for entry in self.connections.iter() {
-                if let Err(e) = entry.send_packet(packet.clone()).await {
+                if let Err(e) = entry.value().send_packet(packet_clone.clone()).await {
                     println!(
                         "[ERROR] Failed to send packet to connection {}: {}",
                         entry.key(),
@@ -224,7 +156,7 @@ impl ConnectionManager {
                     println!(
                         "[BROADCAST] Sended packet to connection {}: {:?}",
                         entry.key(),
-                        packet.to
+                        packet_to_value
                     );
                 }
             }
@@ -245,7 +177,6 @@ impl ConnectionManager {
         );
 
         let id_clone = id.clone();
-        let connections_turn_clone = self.connections_turn.clone();
 
         tokio::spawn({
             let tx_clone = tx.clone();
@@ -263,10 +194,7 @@ impl ConnectionManager {
             }
         });
 
-        self.connections.insert(
-            id,
-            Arc::try_unwrap(connection).unwrap_or_else(|arc| (*arc).clone()),
-        );
+        self.connections.insert(id, connection);
     }
 
     pub async fn get_tunnel(&self, id: String) -> Option<Arc<Mutex<Tunnel>>> {

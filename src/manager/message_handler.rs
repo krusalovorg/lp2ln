@@ -1,4 +1,4 @@
-use super::ConnectionManager::ConnectionManager;
+use super::connection_manager::ConnectionManager;
 use crate::{
     crypto::crypto::generate_uuid, packets::{Message, Protocol, TransportData, TransportPacket}
 };
