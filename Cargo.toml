@@ -64,7 +64,3 @@ path = "examples/peer_with_packet_handling.rs"
 [[example]]
 name = "peer_with_custom_handlers"
 path = "examples/peer_with_custom_handlers.rs"
-
-[[bin]]
-name = "peer-cli"
-path = "src/bin/peer_cli.rs"
