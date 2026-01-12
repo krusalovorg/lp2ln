@@ -1,4 +1,4 @@
-use redb::{Database, Error, ReadableTable};
+use redb::{Error, ReadableTable};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::db::P2PDatabase;

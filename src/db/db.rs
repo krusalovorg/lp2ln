@@ -1,7 +1,6 @@
 use async_std::path::PathBuf;
 use redb::{Database, Error};
 use std::sync::{Arc, Mutex};
-
 use super::tables;
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::{
     config::Config,
     db::{models::Storage, tables::STORAGE_TABLE},
@@ -7,7 +5,7 @@ use crate::{
 use async_std::stream::StreamExt;
 use redb::{Error, ReadableTable};
 
-use super::{models::TokenInfo, tables::{TOKENS_TABLE, PEER_STATS_TABLE}, P2PDatabase};
+use super::{models::TokenInfo, tables::{TOKENS_TABLE}, P2PDatabase};
 
 #[derive(Debug)]
 pub enum StorageError {

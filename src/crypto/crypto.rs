@@ -5,6 +5,8 @@ use k256::elliptic_curve::sec1::FromEncodedPoint;
 use k256::EncodedPoint;
 use k256::{PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
+use rand::TryRngCore;
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -25,7 +27,7 @@ pub fn encrypt(plaintext: &[u8], key_bytes: [u8; 32]) -> (Vec<u8>, [u8; 12]) {
     let cipher = ChaCha20Poly1305::new(key);
 
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng.try_fill_bytes(&mut nonce_bytes).expect("failed to fill bytes");
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

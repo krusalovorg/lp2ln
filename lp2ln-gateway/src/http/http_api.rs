@@ -341,7 +341,7 @@ impl HttpApi {
                             peer_key: self.db.get_or_create_peer_id().unwrap(),
                             uuid: request_id.clone(),
                             nodes: vec![],
-            signature: None,
+                            signature: None,
                         };
 
                         let (search_tx, search_rx) = oneshot::channel();
