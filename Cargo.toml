@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/lp2ln-core",
-  "crates/lp2ln-gateway"
+  "crates/lp2ln-gateway",
+  "crates/lp2ln-core-v2",
+  "crates/lp2lnd"
 ]
 resolver = "2"

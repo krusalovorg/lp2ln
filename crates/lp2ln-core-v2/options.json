@@ -1,0 +1,17 @@
+{
+  "listens": {
+    "tcp": "0.0.0.0:8080",
+    "udp": "0.0.0.0:8081"
+  },
+  "default_nodes": [],
+  "private_key_hex": "19f1985bc392a9a44b18030a13886686b197ecc91f8ddf4ffc32b97124415a3f",
+  "allow_unsigned_packets": true,
+  "logger_options": {
+    "log_dir": "./logs",
+    "file_enabled": true,
+    "show_debug": true,
+    "show_info": true,
+    "show_warning": true,
+    "show_error": true
+  }
+}
