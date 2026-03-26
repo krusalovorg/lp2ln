@@ -1,0 +1,282 @@
+{
+  "timestamp_secs": 1772613352,
+  "update_count": 14,
+  "nodes": [
+    {
+      "peer_id": "036daa05876e28b27a6dfa53f27a81897ea279fa11ef04b0097c356ec061928590",
+      "role": "central",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8621,
+          "packets_received": 8620,
+          "bytes_sent": 2960226,
+          "bytes_received": 2296438,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4545,
+          "packets_received": 4544,
+          "bytes_sent": 1527120,
+          "bytes_received": 1185984,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4428,
+          "packets_received": 4427,
+          "bytes_sent": 1487808,
+          "bytes_received": 1155447,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    },
+    {
+      "peer_id": "03eb67b9e7bab41465732a96a361d16fb07fb3abe79ac6cb800608f6dab19878c2",
+      "role": "central",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8580,
+          "packets_received": 8579,
+          "bytes_sent": 2946450,
+          "bytes_received": 2285737,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4340,
+          "packets_received": 4339,
+          "bytes_sent": 1458240,
+          "bytes_received": 1132479,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4275,
+          "packets_received": 4274,
+          "bytes_sent": 1436400,
+          "bytes_received": 1115514,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    },
+    {
+      "peer_id": "0381ea9779f6b0e613b6461c30ded21fb8ab7a868ff8c133675cb72c9bc467e162",
+      "role": "central",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4441,
+          "packets_received": 4441,
+          "bytes_sent": 1492176,
+          "bytes_received": 1159101,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4541,
+          "packets_received": 4540,
+          "bytes_sent": 1525776,
+          "bytes_received": 1184940,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8549,
+          "packets_received": 8549,
+          "bytes_sent": 2936034,
+          "bytes_received": 2277907,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    },
+    {
+      "peer_id": "025809b571aed85aa072bb419fc1b3b02112bc66051f7fe34c3aae6e037d41348d",
+      "role": "client",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 69,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8621,
+          "packets_received": 8620,
+          "bytes_sent": 2960160,
+          "bytes_received": 2266772,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 69,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4340,
+          "packets_received": 4339,
+          "bytes_sent": 1458174,
+          "bytes_received": 1132479,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4541,
+          "packets_received": 4540,
+          "bytes_sent": 1525710,
+          "bytes_received": 1184940,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    },
+    {
+      "peer_id": "02297516f8a60e43dc2ace595942daca135b2a7b6af23887fdb795ddd345d94067",
+      "role": "client",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 69,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4545,
+          "packets_received": 4545,
+          "bytes_sent": 1527054,
+          "bytes_received": 1186245,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 69,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8580,
+          "packets_received": 8579,
+          "bytes_sent": 2946384,
+          "bytes_received": 2256071,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4442,
+          "packets_received": 4441,
+          "bytes_sent": 1492446,
+          "bytes_received": 1159101,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    },
+    {
+      "peer_id": "033ddf6ec7c0f054cd26b64c3954c6c814355e234983280ece9f159156ac2f4a7e",
+      "role": "client",
+      "timestamp_secs": 1772613352,
+      "sessions": [
+        {
+          "protocol": "tcp",
+          "uptime_secs": 69,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4429,
+          "packets_received": 4428,
+          "bytes_sent": 1488078,
+          "bytes_received": 1155708,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 4275,
+          "packets_received": 4275,
+          "bytes_sent": 1436334,
+          "bytes_received": 1115775,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        },
+        {
+          "protocol": "tcp",
+          "uptime_secs": 68,
+          "last_activity_secs_ago": 0,
+          "packets_sent": 8550,
+          "packets_received": 8549,
+          "bytes_sent": 2936304,
+          "bytes_received": 2248241,
+          "send_errors": 0,
+          "receive_errors": 0,
+          "reconnections": 0,
+          "is_active": true
+        }
+      ]
+    }
+  ]
+}

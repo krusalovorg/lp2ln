@@ -38,8 +38,28 @@ impl NodeOptions {
         options
     }
 
+    pub fn empty() -> Self {
+        Self {
+            listens: DashMap::new(),
+            default_nodes: vec![],
+            keypair: None,
+            allow_unsigned_packets: true,
+            logger_options: Some(LoggerOptions::default()),
+        }
+    }
+
     pub fn keypair(mut self, keypair: NodeKeypair) -> Self {
         self.keypair = Some(keypair);
+        self
+    }
+
+    pub fn keypair_from_hex(mut self, hex: &str) -> Result<Self, String> {
+        self.keypair = Some(NodeKeypair::from_hex(hex)?);
+        Ok(self)
+    }
+
+    pub fn keypair_generate(mut self) -> Self {
+        self.keypair = Some(NodeKeypair::generate());
         self
     }
 
@@ -65,6 +85,21 @@ impl NodeOptions {
         self
     }
 
+    pub fn with_listen(self, protocol: impl Into<String>, addr: SocketAddr) -> Self {
+        self.listens.insert(protocol.into(), addr);
+        self
+    }
+
+    pub fn with_default_nodes(mut self, nodes: Vec<SocketAddr>) -> Self {
+        self.default_nodes = nodes;
+        self
+    }
+
+    pub fn with_logger_options(mut self, opts: LoggerOptions) -> Self {
+        self.logger_options = Some(opts);
+        self
+    }
+
     pub fn add_node(&mut self, node: SocketAddr) -> &mut Self {
         self.default_nodes.push(node);
         self
@@ -73,7 +108,11 @@ impl NodeOptions {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let file: NodeOptionsFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        Self::from_json(&data)
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        let file: NodeOptionsFile = serde_json::from_str(s).map_err(|e| e.to_string())?;
         file.try_into()
     }
 

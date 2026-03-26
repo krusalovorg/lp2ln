@@ -1769,6 +1769,8 @@ dependencies = [
  "anyhow",
  "console-subscriber",
  "lp2ln-core-v2",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

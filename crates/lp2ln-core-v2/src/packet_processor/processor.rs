@@ -53,6 +53,22 @@ impl PacketProcessor for DefaultPacketProcessor {
 
         if receiver == self.our_peer_id || receiver.is_empty() {
             match incoming_packet.packet.data.as_slice() {
+                [] => {
+                    let ack = Packet {
+                        signature: None,
+                        data: vec![],
+                        nodes: vec![],
+                        sender: self.our_peer_id.clone(),
+                        receiver: from.to_string(),
+                        max_hops: 1,
+                        chunk_stream_id: None,
+                        chunk_index: None,
+                        total_chunks: None,
+                    };
+                    if let Err(e) = router.send_to_session(session_id, ack).await {
+                        crate::error!("[PacketProcessor] Failed to send handshake ack: {}", e);
+                    }
+                }
                 PING => {
                     crate::processor!("Ping from {} -> sending pong", from);
                     let pong = Packet {

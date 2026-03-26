@@ -225,21 +225,42 @@ impl NodeRuntime {
 
         let session_manager = self.session_manager.clone();
         let incoming_packets_tx_for_sessions = router.incoming_sender();
+        let router_for_incoming = router.clone();
+        let our_peer_id_for_incoming = self.keypair.peer_id().to_string();
         tokio::spawn(async move {
             while let Some(session) = incoming_sessions_rx.recv().await {
                 crate::session!("[NodeRuntime] New session: {} (kind: {:?})", session.id(), session.kind());
-                
+
+                let session_id = SessionId::from(session.id().to_string());
                 if let Some(peer_id) = session.peer_id() {
-                    use crate::types::PeerId;
-                    use crate::types::SessionId;
                     session_manager.register(
                         PeerId::from(peer_id.to_string()),
-                        SessionId::from(session.id().to_string()),
+                        session_id.clone(),
                         session.clone(),
                     );
+                } else {
+                    session_manager.register_session(session_id.clone(), session.clone());
                 }
-                
+
                 session.clone().spawn_reader(incoming_packets_tx_for_sessions.clone());
+
+                if session.peer_id().is_some() {
+                    let peer_id_str = session.peer_id().unwrap().to_string();
+                    let ack = Packet {
+                        signature: None,
+                        data: vec![],
+                        nodes: vec![],
+                        sender: our_peer_id_for_incoming.clone(),
+                        receiver: peer_id_str,
+                        max_hops: 1,
+                        chunk_stream_id: None,
+                        chunk_index: None,
+                        total_chunks: None,
+                    };
+                    if let Err(e) = router_for_incoming.send_to_session(session_id, ack).await {
+                        crate::error!("[NodeRuntime] Failed to send handshake ack to incoming session: {}", e);
+                    }
+                }
             }
         });
 
@@ -247,6 +268,7 @@ impl NodeRuntime {
         let transports = self.transports.clone();
         let router_outgoing = router.clone();
         let incoming_packets_tx_outgoing = router.incoming_sender();
+        let our_peer_id = self.keypair.peer_id().to_string();
         tokio::spawn(async move {
             for addr in default_nodes {
                 for transport in &transports {
@@ -257,8 +279,22 @@ impl NodeRuntime {
                         Ok(session) => {
                             crate::info!("[NodeRuntime] Connected to default node {} via {}", addr, transport.name());
                             let session_id = SessionId::from(session.id().to_string());
-                            router_outgoing.register_session_only(session_id, session.clone());
+                            router_outgoing.register_session_only(session_id.clone(), session.clone());
                             session.spawn_reader(incoming_packets_tx_outgoing.clone());
+                            let handshake = Packet {
+                                signature: None,
+                                data: vec![],
+                                nodes: vec![],
+                                sender: our_peer_id.clone(),
+                                receiver: String::new(),
+                                max_hops: 8,
+                                chunk_stream_id: None,
+                                chunk_index: None,
+                                total_chunks: None,
+                            };
+                            if let Err(e) = router_outgoing.send_to_session(session_id, handshake).await {
+                                crate::error!("[NodeRuntime] Failed to send handshake to {}: {}", addr, e);
+                            }
                             break;
                         }
                         Err(e) => {

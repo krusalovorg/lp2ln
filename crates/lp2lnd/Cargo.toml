@@ -9,7 +9,13 @@ lp2ln-core-v2 = { path = "../lp2ln-core-v2" }
 tokio = { version = "1.28", features = ["full"] }
 anyhow = "1.0.89"
 console-subscriber = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [[bin]]
 name = "lp2lnd"
 path = "src/main.rs"
+
+[[bin]]
+name = "test_daemon"
+path = "src/test_daemon.rs"
