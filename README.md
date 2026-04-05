@@ -14,6 +14,7 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
 - [Crates](#crates)
 - [Requirements](#requirements)
 - [Build](#build)
+- [Using `lp2ln-core-v2` as a library](#using-lp2ln-core-v2-as-a-library)
 - [Run](#run)
   - [`lp2lnd` (v2 node)](#lp2lnd-v2-node)
   - [`lp2ln-gateway` (HTTP + legacy core)](#lp2ln-gateway-http--legacy-core)
@@ -105,6 +106,57 @@ Run tests:
 ```bash
 cargo test --workspace
 ```
+
+---
+
+## Using `lp2ln-core-v2` as a library
+
+Add the crate to your `Cargo.toml` (path, git, or crates.io when published):
+
+```toml
+[dependencies]
+lp2ln-core-v2 = { path = "../P2P-Server/crates/lp2ln-core-v2" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+anyhow = "1"
+```
+
+Minimal flow: **`NodeOptions`** → **`NodeBuilder`** (transports, optional `P2PDatabase`) → **`build`** → **`start`**. Shutdown with **`stop`**.
+
+```rust
+use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
+use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
+use lp2ln_core_v2::transport::{tcp::TcpTransport, udp::UdpTransport};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let options = NodeOptions::empty()
+        .with_listen("tcp", "0.0.0.0:8080".parse()?)
+        .with_listen("udp", "0.0.0.0:8080".parse()?)
+        .with_default_nodes(vec![] /* bootstrap / initial peers */)
+        .with_peer_connection_policy(PeerConnectionPolicy {
+            min_active_peers: 2,
+            target_active_peers: 4,
+            max_active_peers: 8,
+        })
+        .allow_unsigned_packets(true)
+        .keypair_generate();
+
+    let mut node = NodeBuilder::new()
+        .add_transport(Arc::new(TcpTransport::new()))
+        .add_transport(Arc::new(UdpTransport::new()))
+        // .db(Arc::new(lp2ln_core_v2::db::P2PDatabase::new("./data")?))
+        .build(options)?;
+
+    node.start().await?;
+    tokio::signal::ctrl_c().await?;
+    node.stop().await?;
+    Ok(())
+}
+```
+
+- **File-based config:** `let options = NodeOptions::from_file("options.json")?;` (same schema as `lp2lnd`).
+- **Runnable example** in the repo: `cargo run -p lp2ln-core-v2 --example minimal_node` — source: [`crates/lp2ln-core-v2/examples/minimal_node.rs`](crates/lp2ln-core-v2/examples/minimal_node.rs).
 
 ---
 
