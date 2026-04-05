@@ -20,6 +20,10 @@ Cargo.lock
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Python topology viewer (venv)
+tools/topology-viewer/venv/
+tools/topology-viewer/.venv/
+
 # Storage directories
 storage/
 storage-2/
@@ -31,3 +35,5 @@ signal_servers.json
 deploy-docker.sh
 deploy.sh
 copy-to-server.bat
+./temp_configs
+./temp_db

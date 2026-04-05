@@ -1,0 +1,63 @@
+{
+  "listens": {
+    "udp": "192.168.0.16:18194",
+    "tcp": "192.168.0.16:18094"
+  },
+  "default_nodes": [],
+  "private_key_hex": null,
+  "allow_unsigned_packets": true,
+  "logger_options": {
+    "log_dir": "./logs/client-2",
+    "file_enabled": true,
+    "show_debug": true,
+    "show_info": true,
+    "show_warning": true,
+    "show_error": true
+  },
+  "peer_connection_policy": {
+    "min_active_peers": 2,
+    "target_active_peers": 6,
+    "max_active_peers": 16
+  },
+  "peer_score_weights": {
+    "w_uptime": 1.0,
+    "w_success": 1.2,
+    "w_bandwidth": 0.8,
+    "w_relay": 0.6,
+    "w_nat": 0.7,
+    "w_trust": 0.0,
+    "w_geo": 0.0,
+    "w_load": 1.0,
+    "w_latency": 0.9,
+    "latency_norm_ms": 200.0
+  },
+  "bootstrap_peer_hints": null,
+  "bootstrap_nodes": [
+    {
+      "addr": "192.168.0.16:18080",
+      "protocols": [
+        "tcp"
+      ],
+      "peer_id_hint": null
+    },
+    {
+      "addr": "192.168.0.16:18081",
+      "protocols": [
+        "tcp"
+      ],
+      "peer_id_hint": null
+    },
+    {
+      "addr": "192.168.0.16:18082",
+      "protocols": [
+        "tcp"
+      ],
+      "peer_id_hint": null
+    }
+  ],
+  "database_dir": "./db/client-2",
+  "log_peer_score_snapshot": true,
+  "node_role": "regular",
+  "catalog_max_peers": 4096,
+  "peer_discovery_random_fraction": 0.35
+}

@@ -1,0 +1,25 @@
+[package]
+name = "lp2ln-db-export"
+version = "0.1.0"
+edition = "2021"
+description = "Export lp2ln redb node database to JSON"
+
+[[bin]]
+name = "lp2ln-db-export"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+lp2ln-core-v2 = { path = "../lp2ln-core-v2" }
+redb = "2.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+
+[features]
+default = ["pick"]
+pick = ["dep:rfd"]
+
+[dependencies.rfd]
+version = "0.15"
+optional = true

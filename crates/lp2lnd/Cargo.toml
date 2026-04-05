@@ -1,0 +1,24 @@
+[package]
+name = "lp2lnd"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.81"
+
+[features]
+default = []
+tokio-console = ["dep:console-subscriber"]
+
+[dependencies]
+lp2ln-core-v2 = { path = "../lp2ln-core-v2" }
+tokio = { version = "1.28", features = ["full"] }
+anyhow = "1.0.89"
+serde_json = "1.0"
+console-subscriber = { version = "0.2", optional = true }
+
+[[bin]]
+name = "lp2lnd"
+path = "src/main.rs"
+
+[[bin]]
+name = "lp2lnd-scale"
+path = "src/scale_daemon.rs"
