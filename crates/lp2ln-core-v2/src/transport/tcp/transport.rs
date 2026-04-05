@@ -111,10 +111,16 @@ impl Transport for TcpTransport {
                                 
                                 match TcpSession::new_from_stream(stream, peer_id, LinkKind::DirectTcp) {
                                     Ok(session) => {
-                                        if incoming_sessions_tx.try_send(session.clone() as Arc<dyn Session>).is_err() {
-                                            crate::error!("[TcpTransport] Failed to send incoming session: channel full or closed");
-                                        } else {
-                                            crate::session!("[TcpTransport] Session registered: {} (peer_id: {:?})", session.id(), session.peer_id());
+                                        match incoming_sessions_tx
+                                            .send(session.clone() as Arc<dyn Session>)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                crate::session!("[TcpTransport] Session registered: {} (peer_id: {:?})", session.id(), session.peer_id());
+                                            }
+                                            Err(_) => {
+                                                crate::error!("[TcpTransport] Failed to send incoming session: channel closed");
+                                            }
                                         }
                                     }
                                     Err(e) => {

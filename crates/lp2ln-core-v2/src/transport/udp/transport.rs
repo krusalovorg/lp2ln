@@ -124,13 +124,16 @@ impl Transport for UdpTransport {
                                             crate::info!("[UdpTransport] New session from {}", peer_addr);
                                             
                                             let session_dyn = session.clone() as Arc<dyn Session>;
-                                            if incoming_sessions_tx.try_send(session_dyn.clone()).is_err() {
-                                                crate::error!("[UdpTransport] Failed to send incoming session: channel full or closed");
-                                            } else {
-                                                let mut sessions_guard = sessions_clone.lock().await;
-                                                if !sessions_guard.contains_key(&peer_addr) {
-                                                    sessions_guard.insert(peer_addr, session_dyn);
-                                                    crate::session!("[UdpTransport] Session registered: {}", session.id());
+                                            match incoming_sessions_tx.send(session_dyn.clone()).await {
+                                                Ok(()) => {
+                                                    let mut sessions_guard = sessions_clone.lock().await;
+                                                    if !sessions_guard.contains_key(&peer_addr) {
+                                                        sessions_guard.insert(peer_addr, session_dyn);
+                                                        crate::session!("[UdpTransport] Session registered: {}", session.id());
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    crate::error!("[UdpTransport] Failed to send incoming session: channel closed");
                                                 }
                                             }
                                         }

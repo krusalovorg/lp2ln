@@ -8,23 +8,78 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::NodeKeypair;
 use crate::logger::LoggerOptions;
+use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
+use crate::types::PeerId;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    #[default]
+    Regular,
+    BootstrapJoin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapNode {
+    pub addr: SocketAddr,
+    pub protocols: Vec<String>,
+    pub peer_id_hint: Option<PeerId>,
+}
+
+impl BootstrapNode {
+    pub fn new(
+        addr: SocketAddr,
+        protocols: impl IntoIterator<Item = impl Into<String>>,
+        peer_id_hint: Option<PeerId>,
+    ) -> Self {
+        let mut protocols: Vec<String> = protocols.into_iter().map(Into::into).collect();
+        if protocols.is_empty() {
+            protocols.push("tcp".to_string());
+        }
+        Self {
+            addr,
+            protocols,
+            peer_id_hint,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct NodeOptions {
     pub listens: DashMap<String, SocketAddr>,
+    pub advertise_addrs: HashMap<String, SocketAddr>,
     pub default_nodes: Vec<SocketAddr>,
     pub keypair: Option<NodeKeypair>,
     pub allow_unsigned_packets: bool,
     pub logger_options: Option<LoggerOptions>,
+    pub peer_connection_policy: PeerConnectionPolicy,
+    pub peer_score_weights: PeerScoreWeights,
+    pub bootstrap_peer_hints: HashMap<SocketAddr, PeerId>,
+    pub bootstrap_nodes: Vec<BootstrapNode>,
+    pub database_dir: Option<PathBuf>,
+    pub log_peer_score_snapshot: bool,
+    pub node_role: NodeRole,
+    pub catalog_max_peers: Option<usize>,
+    pub peer_discovery_random_fraction: f32,
 }
 
 impl NodeOptions {
     pub fn new() -> Self {
         let mut options = Self {
             listens: DashMap::new(),
+            advertise_addrs: HashMap::new(),
             default_nodes: vec![],
             keypair: Some(NodeKeypair::generate()),
-            allow_unsigned_packets: true,
+            allow_unsigned_packets: false,
+            peer_connection_policy: PeerConnectionPolicy::default(),
+            peer_score_weights: PeerScoreWeights::default(),
+            bootstrap_peer_hints: HashMap::new(),
+            bootstrap_nodes: vec![],
+            database_dir: None,
+            log_peer_score_snapshot: false,
+            node_role: NodeRole::Regular,
+            catalog_max_peers: None,
+            peer_discovery_random_fraction: 0.33,
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -41,11 +96,72 @@ impl NodeOptions {
     pub fn empty() -> Self {
         Self {
             listens: DashMap::new(),
+            advertise_addrs: HashMap::new(),
             default_nodes: vec![],
             keypair: None,
             allow_unsigned_packets: true,
+            peer_connection_policy: PeerConnectionPolicy::default(),
+            peer_score_weights: PeerScoreWeights::default(),
+            bootstrap_peer_hints: HashMap::new(),
+            bootstrap_nodes: vec![],
+            database_dir: None,
+            log_peer_score_snapshot: false,
+            node_role: NodeRole::Regular,
+            catalog_max_peers: None,
+            peer_discovery_random_fraction: 0.33,
             logger_options: Some(LoggerOptions::default()),
         }
+    }
+
+    pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {
+        let p = self.peer_connection_policy.normalized();
+        match self.node_role {
+            NodeRole::Regular => p,
+            NodeRole::BootstrapJoin => {
+                let target = p.target_active_peers.min(8).max(1);
+                let max = p.max_active_peers.min(24).max(target);
+                PeerConnectionPolicy {
+                    min_active_peers: p.min_active_peers.min(2).max(1),
+                    target_active_peers: target,
+                    max_active_peers: max,
+                }
+                .normalized()
+            }
+        }
+    }
+
+    pub fn with_peer_connection_policy(mut self, policy: PeerConnectionPolicy) -> Self {
+        self.peer_connection_policy = policy;
+        self
+    }
+
+    pub fn with_peer_score_weights(mut self, weights: PeerScoreWeights) -> Self {
+        self.peer_score_weights = weights;
+        self
+    }
+
+    pub fn with_bootstrap_peer_hints(mut self, hints: HashMap<SocketAddr, PeerId>) -> Self {
+        self.bootstrap_peer_hints = hints;
+        self
+    }
+
+    pub fn with_bootstrap_nodes(mut self, nodes: Vec<BootstrapNode>) -> Self {
+        self.bootstrap_nodes = nodes;
+        self
+    }
+
+    pub fn add_bootstrap_node(
+        mut self,
+        addr: SocketAddr,
+        protocols: impl IntoIterator<Item = impl Into<String>>,
+        peer_id_hint: Option<PeerId>,
+    ) -> Self {
+        self.bootstrap_nodes
+            .push(BootstrapNode::new(addr, protocols, peer_id_hint.clone()));
+        if let Some(peer_id) = peer_id_hint {
+            self.bootstrap_peer_hints.insert(addr, peer_id);
+        }
+        self
     }
 
     pub fn keypair(mut self, keypair: NodeKeypair) -> Self {
@@ -87,6 +203,16 @@ impl NodeOptions {
 
     pub fn with_listen(self, protocol: impl Into<String>, addr: SocketAddr) -> Self {
         self.listens.insert(protocol.into(), addr);
+        self
+    }
+
+    pub fn set_advertise(&mut self, protocol: String, addr: SocketAddr) -> &mut Self {
+        self.advertise_addrs.insert(protocol, addr);
+        self
+    }
+
+    pub fn with_advertise(mut self, protocol: impl Into<String>, addr: SocketAddr) -> Self {
+        self.advertise_addrs.insert(protocol.into(), addr);
         self
     }
 
@@ -149,12 +275,46 @@ struct NodeOptionsFile {
     #[serde(default)]
     listens: HashMap<String, String>,
     #[serde(default)]
+    advertise_addrs: Option<HashMap<String, String>>,
+    #[serde(default)]
     default_nodes: Vec<String>,
     private_key_hex: Option<String>,
     #[serde(default = "default_allow_unsigned")]
     allow_unsigned_packets: bool,
     #[serde(default)]
     logger_options: Option<LoggerOptionsFile>,
+    #[serde(default)]
+    peer_connection_policy: Option<PeerConnectionPolicy>,
+    #[serde(default)]
+    peer_score_weights: Option<PeerScoreWeights>,
+    /// `"addr" -> peer_id` strings for JSON maps.
+    #[serde(default)]
+    bootstrap_peer_hints: Option<HashMap<String, String>>,
+    #[serde(default)]
+    bootstrap_nodes: Option<Vec<BootstrapNodeFile>>,
+    #[serde(default)]
+    database_dir: Option<String>,
+    #[serde(default)]
+    log_peer_score_snapshot: bool,
+    #[serde(default)]
+    node_role: NodeRole,
+    #[serde(default)]
+    catalog_max_peers: Option<u64>,
+    #[serde(default = "default_peer_discovery_random_fraction")]
+    peer_discovery_random_fraction: f32,
+}
+
+fn default_peer_discovery_random_fraction() -> f32 {
+    0.33
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BootstrapNodeFile {
+    addr: String,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(default)]
+    peer_id_hint: Option<String>,
 }
 
 fn default_allow_unsigned() -> bool {
@@ -201,10 +361,24 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
     fn try_from(file: NodeOptionsFile) -> Result<Self, String> {
         let mut options = Self {
             listens: DashMap::new(),
+            advertise_addrs: HashMap::new(),
             default_nodes: vec![],
             keypair: None,
             allow_unsigned_packets: file.allow_unsigned_packets,
             logger_options: file.logger_options.map(LoggerOptions::from),
+            peer_connection_policy: file
+                .peer_connection_policy
+                .unwrap_or_default(),
+            peer_score_weights: file.peer_score_weights.unwrap_or_default(),
+            bootstrap_peer_hints: HashMap::new(),
+            bootstrap_nodes: vec![],
+            database_dir: file.database_dir.map(PathBuf::from),
+            log_peer_score_snapshot: file.log_peer_score_snapshot,
+            node_role: file.node_role,
+            catalog_max_peers: file
+                .catalog_max_peers
+                .map(|n| (n as usize).min(1_000_000).max(128)),
+            peer_discovery_random_fraction: file.peer_discovery_random_fraction.clamp(0.0, 0.9),
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -212,11 +386,54 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
                 .map_err(|e: std::net::AddrParseError| e.to_string())?;
             options.listens.insert(protocol, addr);
         }
+        if let Some(map) = file.advertise_addrs {
+            for (protocol, addr_str) in map {
+                let addr: SocketAddr = addr_str
+                    .parse()
+                    .map_err(|e: std::net::AddrParseError| e.to_string())?;
+                options.advertise_addrs.insert(protocol, addr);
+            }
+        }
         for addr_str in file.default_nodes {
             let addr: SocketAddr = addr_str
                 .parse()
                 .map_err(|e: std::net::AddrParseError| e.to_string())?;
             options.default_nodes.push(addr);
+        }
+        if let Some(map) = file.bootstrap_peer_hints {
+            for (addr_s, peer_s) in map {
+                let addr: SocketAddr = addr_s
+                    .parse()
+                    .map_err(|e: std::net::AddrParseError| e.to_string())?;
+                options
+                    .bootstrap_peer_hints
+                    .insert(addr, PeerId::from(peer_s.as_str()));
+            }
+        }
+        if let Some(nodes) = file.bootstrap_nodes {
+            for n in nodes {
+                let addr: SocketAddr = n
+                    .addr
+                    .parse()
+                    .map_err(|e: std::net::AddrParseError| e.to_string())?;
+                let protocols = if n.protocols.is_empty() {
+                    vec!["tcp".to_string()]
+                } else {
+                    n.protocols
+                };
+                let peer_id_hint = n
+                    .peer_id_hint
+                    .as_deref()
+                    .map(PeerId::from);
+                if let Some(ref pid) = peer_id_hint {
+                    options.bootstrap_peer_hints.insert(addr, pid.clone());
+                }
+                options.bootstrap_nodes.push(BootstrapNode {
+                    addr,
+                    protocols,
+                    peer_id_hint,
+                });
+            }
         }
         if let Some(hex) = file.private_key_hex {
             options.keypair = Some(NodeKeypair::from_hex(&hex)?);
@@ -237,6 +454,16 @@ impl From<&NodeOptions> for NodeOptionsFile {
             .iter()
             .map(SocketAddr::to_string)
             .collect();
+        let advertise_addrs = if opts.advertise_addrs.is_empty() {
+            None
+        } else {
+            Some(
+                opts.advertise_addrs
+                    .iter()
+                    .map(|(p, a)| (p.clone(), a.to_string()))
+                    .collect(),
+            )
+        };
         let private_key_hex = opts.keypair.as_ref().map(|k| k.to_hex());
         let logger_options = Some(
             opts.logger_options
@@ -244,12 +471,49 @@ impl From<&NodeOptions> for NodeOptionsFile {
                 .map(LoggerOptionsFile::from)
                 .unwrap_or_else(|| LoggerOptionsFile::from(&LoggerOptions::default())),
         );
+        let bootstrap_peer_hints = if opts.bootstrap_peer_hints.is_empty() {
+            None
+        } else {
+            Some(
+                opts.bootstrap_peer_hints
+                    .iter()
+                    .map(|(a, p)| (a.to_string(), p.as_str().to_string()))
+                    .collect(),
+            )
+        };
+        let bootstrap_nodes = if opts.bootstrap_nodes.is_empty() {
+            None
+        } else {
+            Some(
+                opts.bootstrap_nodes
+                    .iter()
+                    .map(|n| BootstrapNodeFile {
+                        addr: n.addr.to_string(),
+                        protocols: n.protocols.clone(),
+                        peer_id_hint: n.peer_id_hint.as_ref().map(|p| p.as_str().to_string()),
+                    })
+                    .collect(),
+            )
+        };
         Self {
             listens,
+            advertise_addrs,
             default_nodes,
             private_key_hex,
             allow_unsigned_packets: opts.allow_unsigned_packets,
             logger_options,
+            peer_connection_policy: Some(opts.peer_connection_policy.clone()),
+            peer_score_weights: Some(opts.peer_score_weights.clone()),
+            bootstrap_peer_hints,
+            bootstrap_nodes,
+            database_dir: opts
+                .database_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            log_peer_score_snapshot: opts.log_peer_score_snapshot,
+            node_role: opts.node_role,
+            catalog_max_peers: opts.catalog_max_peers.map(|n| n as u64),
+            peer_discovery_random_fraction: opts.peer_discovery_random_fraction,
         }
     }
 }

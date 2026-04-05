@@ -8,11 +8,17 @@ use crate::{
     crypto::signature::sign_packet,
     packet::Packet,
     packet_processor::{ChunkAssembler, ChunkAssemblerResult, PacketProcessor},
+    protocol::control::NetworkControlPayload,
     sessions::{
         manager::SessionManager, session::IncomingPacket, LinkKind, Session, SessionMetrics,
     },
     types::{PeerId, SessionId},
 };
+
+pub const ROUTER_INCOMING_QUEUE_CAP: usize = 16384;
+const ROUTER_BROADCAST_CAP: usize = 4096;
+const ROUTER_PROCESS_SEMAPHORE_PERMITS: usize = 256;
+const ROUTER_FALLBACK_FANOUT: usize = 4;
 
 pub struct Router {
     session_manager: Arc<SessionManager>,
@@ -30,8 +36,8 @@ impl Router {
         signing_key: Option<Arc<SigningKey>>,
         our_peer_id: impl Into<String>,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
-        let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(1024);
-        let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(1024);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
+        let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
 
         (
             Self {
@@ -75,6 +81,7 @@ impl Router {
             Err(e) => {
                 self.session_manager
                     .update_metrics(&session_id, |m| m.increment_send_errors());
+                let _ = self.session_manager.close_session(&session_id).await;
                 Err(e)
             }
         }
@@ -87,9 +94,15 @@ impl Router {
         exclude_from: Option<PeerId>,
     ) -> Result<()> {
         let packet = self.prepare_outgoing(packet)?;
+        let is_control_packet = NetworkControlPayload::decode(&packet.data).is_ok();
         let in_nodes = packet.nodes.iter().any(|n| n == peer_id.as_str());
         if in_nodes || exclude_from.as_ref() == Some(&peer_id) {
-        } else if let Some(session) = self.session_manager.get_best_session_for_peer(&peer_id) {
+            return Err(anyhow::anyhow!(
+                "No route to peer '{}': target on path or excluded",
+                peer_id
+            ));
+        }
+        if let Some(session) = self.session_manager.get_best_session_for_peer(&peer_id) {
             let session_id = SessionId::from(session.id().to_string());
             match session.send(packet.clone()).await {
                 Ok(bytes) => {
@@ -100,12 +113,23 @@ impl Router {
                 Err(e) => {
                     self.session_manager
                         .update_metrics(&session_id, |m| m.increment_send_errors());
+                    let _ = self.session_manager.close_session(&session_id).await;
                     return Err(e);
                 }
             }
         }
 
-        let peers = self.session_manager.get_all_peers();
+        // Control packets should not use flood fallback.
+        // If we lost a direct session temporarily (e.g. during pruning), flooding
+        // creates many duplicate forwards and max_hops noise.
+        if is_control_packet {
+            return Err(anyhow::anyhow!(
+                "No direct session for control packet to '{}'",
+                peer_id
+            ));
+        }
+
+        let peers = self.session_manager.get_all_peers_sorted_by_score();
         if peers.is_empty() {
             return Err(anyhow::anyhow!(
                 "No sessions for peer '{}' and no neighbors to broadcast",
@@ -113,12 +137,13 @@ impl Router {
             ));
         }
         let mut any_ok = false;
+        let mut sent_count = 0usize;
         let mut last_err = None;
         for neighbor in peers {
-            if packet.nodes.iter().any(|n| n == neighbor.as_str()) {
+            if exclude_from.as_ref() == Some(&neighbor) {
                 continue;
             }
-            if exclude_from.as_ref() == Some(&neighbor) {
+            if packet.nodes.iter().any(|n| n == neighbor.as_str()) {
                 continue;
             }
             if let Some(session) = self.session_manager.get_best_session_for_peer(&neighbor) {
@@ -128,10 +153,15 @@ impl Router {
                         self.session_manager
                             .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
                         any_ok = true;
+                        sent_count += 1;
+                        if sent_count >= ROUTER_FALLBACK_FANOUT {
+                            break;
+                        }
                     }
                     Err(e) => {
                         self.session_manager
                             .update_metrics(&session_id, |m| m.increment_send_errors());
+                        let _ = self.session_manager.close_session(&session_id).await;
                         last_err = Some(e);
                     }
                 }
@@ -169,6 +199,10 @@ impl Router {
             .set_peer_for_session(session_id, peer_id);
     }
 
+    pub async fn teardown_session(&self, session_id: &SessionId) -> Result<()> {
+        self.session_manager.close_session(session_id).await
+    }
+
     pub fn get_metrics_for_protocol(&self, kind: LinkKind) -> Vec<SessionMetrics> {
         self.session_manager.get_metrics_for_protocol(kind)
     }
@@ -177,8 +211,12 @@ impl Router {
         self.session_manager.get_metrics_by_protocol()
     }
 
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.session_manager.get_all_peers()
+    }
+
     pub async fn run(self: Arc<Self>, mut incoming_rx: mpsc::Receiver<IncomingPacket>) {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(ROUTER_PROCESS_SEMAPHORE_PERMITS));
 
         while let Some(incoming) = incoming_rx.recv().await {
             let session_id = SessionId::from(incoming.session_id.clone());
@@ -206,9 +244,11 @@ impl Router {
 
             let processor = self.packet_processor.clone();
             let router = self.clone();
-            let permit = semaphore.clone().acquire_owned().await;
-
+            let semaphore = semaphore.clone();
             tokio::spawn(async move {
+                let Ok(permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
                 let _permit = permit;
                 processor.process(incoming, router).await;
             });

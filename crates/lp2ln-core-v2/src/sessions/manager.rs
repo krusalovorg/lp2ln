@@ -1,5 +1,9 @@
 use std::sync::Arc;
+
+use anyhow::Result;
 use dashmap::DashMap;
+
+use crate::peer_score::{total_score, PeerScoreStore, PeerScoreWeights};
 use crate::sessions::session::LinkKind;
 use crate::sessions::{Session, SessionMetrics};
 use crate::types::{PeerId, SessionId};
@@ -10,17 +14,43 @@ pub struct SessionManager {
     session_to_peer: Arc<DashMap<SessionId, PeerId>>,
     metrics: Arc<DashMap<SessionId, SessionMetrics>>,
     by_protocol: Arc<DashMap<LinkKind, Vec<SessionId>>>,
+    peer_scores: Arc<PeerScoreStore>,
+    peer_weights: PeerScoreWeights,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
+    fn prune_stale_peer_index(&self) {
+        let peers: Vec<PeerId> = self.by_peer.iter().map(|r| r.key().clone()).collect();
+        for pid in peers {
+            let mut remove = false;
+            if let Some(mut ids) = self.by_peer.get_mut(&pid) {
+                ids.retain(|id| self.sessions.contains_key(id));
+                remove = ids.is_empty();
+            }
+            if remove {
+                self.by_peer.remove(&pid);
+            }
+        }
+    }
+
+    pub fn new(peer_scores: Arc<PeerScoreStore>, peer_weights: PeerScoreWeights) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             by_peer: Arc::new(DashMap::new()),
             session_to_peer: Arc::new(DashMap::new()),
             metrics: Arc::new(DashMap::new()),
             by_protocol: Arc::new(DashMap::new()),
+            peer_scores,
+            peer_weights,
         }
+    }
+
+    pub fn peer_score_store(&self) -> Arc<PeerScoreStore> {
+        self.peer_scores.clone()
+    }
+
+    pub fn peer_weights(&self) -> &PeerScoreWeights {
+        &self.peer_weights
     }
 
     fn add_to_protocol(&self, kind: LinkKind, session_id: SessionId) {
@@ -31,6 +61,7 @@ impl SessionManager {
     }
 
     pub fn register(&self, peer_id: PeerId, session_id: SessionId, session: Arc<dyn Session + Send + Sync>) {
+        self.peer_scores.touch_peer(&peer_id);
         self.add_to_protocol(session.kind(), session_id.clone());
         self.sessions.insert(session_id.clone(), session);
         self.metrics.insert(session_id.clone(), SessionMetrics::new());
@@ -51,6 +82,7 @@ impl SessionManager {
         if self.session_to_peer.contains_key(&session_id) {
             return;
         }
+        self.peer_scores.touch_peer(&peer_id);
         self.session_to_peer.insert(session_id.clone(), peer_id.clone());
         self.by_peer
             .entry(peer_id)
@@ -63,10 +95,12 @@ impl SessionManager {
     }
 
     pub fn get_session_ids(&self, peer_id: &PeerId) -> Option<Vec<SessionId>> {
+        self.prune_stale_peer_index();
         self.by_peer.get(peer_id).map(|v| v.clone())
     }
 
     pub fn get_all_for_peer(&self, peer_id: &PeerId) -> Vec<Arc<dyn Session + Send + Sync>> {
+        self.prune_stale_peer_index();
         let Some(ids_ref) = self.by_peer.get(peer_id) else { return vec![] };
         let ids = ids_ref.clone();
         drop(ids_ref);
@@ -77,7 +111,28 @@ impl SessionManager {
     }
 
     pub fn get_all_peers(&self) -> Vec<PeerId> {
+        self.prune_stale_peer_index();
         self.by_peer.iter().map(|r| r.key().clone()).collect()
+    }
+
+    pub fn get_all_peers_sorted_by_score(&self) -> Vec<PeerId> {
+        let peers = self.get_all_peers();
+        crate::peer_score::rank_peers(&peers, |p| self.peer_scores.get(p), &self.peer_weights)
+    }
+
+    fn session_send_priority(
+        &self,
+        peer_id: &PeerId,
+        _session_id: &SessionId,
+        metrics: &SessionMetrics,
+    ) -> f32 {
+        let peer_score = self.peer_scores.get(peer_id);
+        let base = total_score(&peer_score, &self.peer_weights);
+        let packets = metrics.total_packets().max(1) as f32;
+        let err_rate = (metrics.total_errors() as f32 / packets).min(1.0);
+        let stale_secs = metrics.time_since_last_activity().as_secs_f32();
+        let stale = (stale_secs / 120.0).min(1.0);
+        base - self.peer_weights.w_latency * stale * 0.35 - self.peer_weights.w_load * err_rate
     }
 
     pub fn get_best_session_for_peer(&self, peer_id: &PeerId) -> Option<Arc<dyn Session + Send + Sync>> {
@@ -88,24 +143,17 @@ impl SessionManager {
         if sessions.len() == 1 {
             return sessions.into_iter().next();
         }
-        let mut best: Option<(Arc<dyn Session + Send + Sync>, SessionMetrics)> = None;
+        let mut best: Option<(Arc<dyn Session + Send + Sync>, f32)> = None;
         for session in sessions {
             let session_id = SessionId::from(session.id().to_string());
             let Some(metrics) = self.get_metrics(&session_id) else { continue };
+            let rank = self.session_send_priority(peer_id, &session_id, &metrics);
             let better = match &best {
                 None => true,
-                Some((_, ref m)) => {
-                    if metrics.is_active != m.is_active {
-                        metrics.is_active
-                    } else if metrics.total_errors() != m.total_errors() {
-                        metrics.total_errors() < m.total_errors()
-                    } else {
-                        metrics.time_since_last_activity() < m.time_since_last_activity()
-                    }
-                }
+                Some((_, prev)) => rank > *prev,
             };
             if better {
-                best = Some((session, metrics));
+                best = Some((session, rank));
             }
         }
         best.map(|(s, _)| s)
@@ -148,5 +196,78 @@ impl SessionManager {
                 (kind, metrics)
             })
             .collect()
+    }
+
+    pub fn peer_metrics_rollup(&self) -> Vec<(PeerId, Vec<SessionMetrics>)> {
+        self.by_peer
+            .iter()
+            .map(|entry| {
+                let peer_id = entry.key().clone();
+                let metrics = entry
+                    .value()
+                    .iter()
+                    .filter_map(|sid| self.metrics.get(sid).map(|m| m.clone()))
+                    .collect::<Vec<_>>();
+                (peer_id, metrics)
+            })
+            .collect()
+    }
+
+    pub fn total_sessions_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Distinct remote peers with at least one registered session.
+    pub fn distinct_peer_count(&self) -> usize {
+        self.prune_stale_peer_index();
+        self.by_peer.len()
+    }
+
+    pub fn is_connected_to_peer(&self, peer_id: &PeerId) -> bool {
+        self.prune_stale_peer_index();
+        self.by_peer.contains_key(peer_id)
+    }
+
+    /// Worst-ranked peers (low `total_score`), for pruning when above `max_active_peers`.
+    pub fn lowest_scored_distinct_peers(&self, take: usize) -> Vec<PeerId> {
+        let mut peers: Vec<_> = self.get_all_peers();
+        peers.sort_by(|a, b| {
+            let ta = total_score(&self.peer_scores.get(a), &self.peer_weights);
+            let tb = total_score(&self.peer_scores.get(b), &self.peer_weights);
+            ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        peers.into_iter().take(take).collect()
+    }
+
+    pub async fn close_session(&self, session_id: &SessionId) -> Result<()> {
+        let session = self.sessions.remove(session_id).map(|(_, s)| s);
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let kind = session.kind();
+        let peer_id = self.session_to_peer.remove(session_id).map(|(_, p)| p);
+        self.metrics.remove(session_id);
+        if let Some(ref pid) = peer_id {
+            if let Some(mut ids) = self.by_peer.get_mut(pid) {
+                ids.retain(|id| id != session_id);
+                let empty = ids.is_empty();
+                drop(ids);
+                if empty {
+                    self.by_peer.remove(pid);
+                }
+            }
+        }
+        if let Some(mut list) = self.by_protocol.get_mut(&kind) {
+            list.retain(|id| id != session_id);
+        }
+        session.close().await
+    }
+
+    pub async fn close_all_sessions_for_peer(&self, peer_id: &PeerId) -> Result<()> {
+        let ids: Vec<SessionId> = self.get_session_ids(peer_id).unwrap_or_default();
+        for id in ids {
+            self.close_session(&id).await?;
+        }
+        Ok(())
     }
 }

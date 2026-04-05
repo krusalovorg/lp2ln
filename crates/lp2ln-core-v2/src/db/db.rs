@@ -20,6 +20,8 @@ impl P2PDatabase {
             {
                 write_txn.open_table(tables::STORAGE_TABLE)?;
                 write_txn.open_table(tables::PEER_INFO_TABLE)?;
+                write_txn.open_table(tables::PEER_DESCRIPTOR_TABLE)?;
+                write_txn.open_table(tables::PEER_SCORE_TABLE)?;
             }
             write_txn.commit()?;
         }

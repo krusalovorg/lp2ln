@@ -54,12 +54,21 @@ impl Session for UdpSession {
             loop {
                 match self.read_packet().await {
                     Ok(pkt) => {
-                        if incoming_packets_tx.try_send(IncomingPacket {
-                            session_id: session_id.clone(),
-                            from_node: peer_id.clone(),
-                            packet: pkt,
-                        }).is_err() {
-                            crate::warn!("[UdpSession] Failed to send packet: channel full or closed");
+                        match incoming_packets_tx
+                            .send(IncomingPacket {
+                                session_id: session_id.clone(),
+                                from_node: peer_id.clone(),
+                                packet: pkt,
+                            })
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(_) => {
+                                crate::warn!(
+                                    "[UdpSession] Incoming packets channel closed, stopping reader"
+                                );
+                                break;
+                            }
                         }
                     }
                     Err(e) => {

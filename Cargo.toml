@@ -3,6 +3,7 @@ members = [
   "crates/lp2ln-core",
   "crates/lp2ln-gateway",
   "crates/lp2ln-core-v2",
-  "crates/lp2lnd"
+  "crates/lp2lnd",
+  "crates/lp2ln-db-export"
 ]
 resolver = "2"

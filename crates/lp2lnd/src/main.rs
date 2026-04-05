@@ -1,12 +1,13 @@
 use core::fmt;
+use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::logger::LoggerOptions;
+use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
 use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
 use lp2ln_core_v2::transport::{tcp::TcpTransport, udp::UdpTransport};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::task;
 
 struct Args {
     options_path: String,
@@ -34,7 +35,7 @@ fn parse_args() -> Args {
             continue;
         }
         let prev_arg = &args[i - 1];
-        if prev_arg.starts_with("-") && prev_arg[1..] == *"o" && !item.starts_with("-") {
+        if (prev_arg == "-o" || prev_arg == "--options") && !item.starts_with("-") {
             result.options_path = item.clone();
         }
     }
@@ -46,6 +47,11 @@ fn developer_options() -> NodeOptions {
         .with_listen("udp", "0.0.0.0:8080".parse().unwrap())
         .with_listen("tcp", "0.0.0.0:8080".parse().unwrap())
         .with_default_nodes(vec![])
+        .with_peer_connection_policy(PeerConnectionPolicy {
+            min_active_peers: 4,
+            target_active_peers: 8,
+            max_active_peers: 16,
+        })
         .allow_unsigned_packets(true)
         .keypair_generate()
         .with_logger_options(LoggerOptions {
@@ -61,41 +67,76 @@ fn developer_options() -> NodeOptions {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     lp2ln_core_v2::info!("[Main] Starting LP2LN-Demon");
-    console_subscriber::init();
-    lp2ln_core_v2::info!("[Main] console_subscriber inited");
+    #[cfg(feature = "tokio-console")]
+    {
+        console_subscriber::init();
+        lp2ln_core_v2::info!("[Main] console_subscriber inited (needs RUSTFLAGS=\"--cfg tokio_unstable\")");
+    }
 
     let args = parse_args();
 
     lp2ln_core_v2::info!("[Main] Loaded args: {}", args);
-    let options: NodeOptions;
-
-    if args.options_path.is_empty() {
-        options = developer_options();
+    let options_path = if args.options_path.is_empty() {
+        let default_path = PathBuf::from("./options.json");
+        if default_path.exists() {
+            Some(default_path.to_string_lossy().to_string())
+        } else {
+            None
+        }
     } else {
-        options = match NodeOptions::from_file(args.options_path.clone()) {
-            Ok(opts) => opts,
-            Err(err) => {
-                lp2ln_core_v2::error!("[Main] Error of reading config: {}", err);
-                NodeOptions::new()
+        Some(args.options_path.clone())
+    };
+
+    let options = if let Some(path) = options_path.as_ref() {
+        match NodeOptions::from_file(path) {
+            Ok(opts) => {
+                lp2ln_core_v2::info!("[Main] Loaded options from {}", path);
+                opts
             }
-        };
+            Err(err) => {
+                lp2ln_core_v2::error!("[Main] Error reading options '{}': {}", path, err);
+                developer_options()
+            }
+        }
+    } else {
+        developer_options()
+    };
+
+    if let Some(path) = options_path.as_ref() {
+        let _ = options.save(path);
     }
 
-    if !args.options_path.is_empty() {
-        options.save(args.options_path.clone()).unwrap();
-    }
-
-    let builder = NodeBuilder::new()
+    let mut builder = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new()))
         .add_transport(Arc::new(UdpTransport::new()));
+    if let Some(ref dir) = options.database_dir {
+        let dir_s = dir.to_string_lossy();
+        match P2PDatabase::new(dir_s.as_ref()) {
+            Ok(db) => {
+                builder = builder.db(Arc::new(db));
+                lp2ln_core_v2::info!("[Main] database_dir = {}", dir.display());
+            }
+            Err(e) => {
+                lp2ln_core_v2::warn!(
+                    "[Main] database_dir {:?} open failed (running without db): {}",
+                    dir,
+                    e
+                );
+            }
+        }
+    }
     let mut node = builder.build(options)?;
     node.start().await?;
 
     info("[Main] Node started");
-
-    task::spawn(async {
-        info("Main sosat hui!");
-    });
+    let eff = node.effective_peer_connection_policy();
+    info(&format!(
+        "[Main] peer-policy (effective): min={}, target={}, max={}; role={:?}",
+        eff.min_active_peers,
+        eff.target_active_peers,
+        eff.max_active_peers,
+        node.node_role()
+    ));
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

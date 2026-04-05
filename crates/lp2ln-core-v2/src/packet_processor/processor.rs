@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use std::sync::Arc;
+
 use crate::crypto::signature::verify_packet;
-use crate::packet::Packet;
 use crate::router::Router;
 use crate::sessions::IncomingPacket;
+use crate::topology::PeerCatalog;
 use crate::types::{PeerId, SessionId};
 
 pub const PING: &[u8] = b"ping";
@@ -17,13 +18,22 @@ pub trait PacketProcessor: Send + Sync {
 pub struct DefaultPacketProcessor {
     our_peer_id: String,
     allow_unsigned_packets: bool,
+    peer_catalog: Arc<PeerCatalog>,
+    peer_discovery_random_fraction: f32,
 }
 
 impl DefaultPacketProcessor {
-    pub fn new(our_peer_id: impl Into<String>, allow_unsigned_packets: bool) -> Self {
+    pub fn new(
+        our_peer_id: impl Into<String>,
+        allow_unsigned_packets: bool,
+        peer_catalog: Arc<PeerCatalog>,
+        peer_discovery_random_fraction: f32,
+    ) -> Self {
         Self {
             our_peer_id: our_peer_id.into(),
             allow_unsigned_packets,
+            peer_catalog,
+            peer_discovery_random_fraction: peer_discovery_random_fraction.clamp(0.0, 0.9),
         }
     }
 }
@@ -49,73 +59,42 @@ impl PacketProcessor for DefaultPacketProcessor {
         let peer_id = PeerId::from_str(from);
         router.set_peer_for_session(session_id.clone(), peer_id.clone());
 
-        let receiver = incoming_packet.packet.receiver.as_str();
+        let receiver = incoming_packet.packet.receiver.clone();
 
         if receiver == self.our_peer_id || receiver.is_empty() {
-            match incoming_packet.packet.data.as_slice() {
-                [] => {
-                    let ack = Packet {
-                        signature: None,
-                        data: vec![],
-                        nodes: vec![],
-                        sender: self.our_peer_id.clone(),
-                        receiver: from.to_string(),
-                        max_hops: 1,
-                        chunk_stream_id: None,
-                        chunk_index: None,
-                        total_chunks: None,
-                    };
-                    if let Err(e) = router.send_to_session(session_id, ack).await {
-                        crate::error!("[PacketProcessor] Failed to send handshake ack: {}", e);
-                    }
-                }
-                PING => {
-                    crate::processor!("Ping from {} -> sending pong", from);
-                    let pong = Packet {
-                        signature: None,
-                        data: PONG.to_vec(),
-                        nodes: vec![],
-                        sender: self.our_peer_id.clone(),
-                        receiver: from.to_string(),
-                        max_hops: 1,
-                        chunk_stream_id: None,
-                        chunk_index: None,
-                        total_chunks: None,
-                    };
-                    if let Err(e) = router.send_to_peer(peer_id, pong, None).await {
-                        crate::error!("[PacketProcessor] Failed to send pong: {}", e);
-                    }
-                }
-                PONG => {
-                    crate::processor!("Pong from {}", from);
-                }
-                _ => {
-                    crate::processor!(
-                        "Received packet (for us): Session ID: {}, From: {:?}, Sender: {}, Receiver: {}, Data: {} bytes",
-                        incoming_packet.session_id,
-                        incoming_packet.from_node,
-                        incoming_packet.packet.sender,
-                        incoming_packet.packet.receiver,
-                        incoming_packet.packet.data.len()
-                    );
-                }
+            if super::control::try_handle_control_packet(
+                &incoming_packet.packet.data,
+                &self.our_peer_id,
+                from,
+                &peer_id,
+                self.peer_catalog.as_ref(),
+                router.clone(),
+                self.peer_discovery_random_fraction,
+            )
+            .await
+            {
+                return;
             }
+            super::local::handle_local_packet(
+                &incoming_packet.packet.data,
+                &self.our_peer_id,
+                from,
+                &peer_id,
+                &session_id,
+                self.peer_catalog.as_ref(),
+                router,
+            )
+            .await;
         } else {
-            let mut packet = incoming_packet.packet.clone();
-            packet.nodes.push(self.our_peer_id.clone());
-            let target = PeerId::from_str(receiver);
-            let sid = SessionId::from(incoming_packet.session_id.clone());
-            let ok = if target == peer_id {
-                router.send_to_session(sid, packet.clone()).await.is_ok()
-            } else {
-                false
-            };
-            let ok = ok || router.send_to_peer(target, packet, Some(peer_id)).await.is_ok();
-            if !ok {
-                crate::error!("[PacketProcessor] Failed to forward to {}: No sessions for peer", receiver);
-            } else {
-                crate::processor!("Forwarded packet to {}", receiver);
-            }
+            super::forwarding::forward_packet(
+                incoming_packet.packet,
+                incoming_packet.session_id.as_str(),
+                &self.our_peer_id,
+                &peer_id,
+                PeerId::from_str(receiver.as_str()),
+                router,
+            )
+            .await;
         }
     }
 }

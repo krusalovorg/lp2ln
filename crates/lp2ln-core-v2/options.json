@@ -1,9 +1,21 @@
 {
   "listens": {
-    "tcp": "0.0.0.0:8080",
-    "udp": "0.0.0.0:8081"
+    "udp": "0.0.0.0:8081",
+    "tcp": "0.0.0.0:8080"
   },
   "default_nodes": [],
+  "bootstrap_nodes": [
+    {
+      "addr": "127.0.0.1:18080",
+      "protocols": ["tcp"],
+      "peer_id_hint": null
+    },
+    {
+      "addr": "127.0.0.1:18081",
+      "protocols": ["tcp", "udp"],
+      "peer_id_hint": null
+    }
+  ],
   "private_key_hex": "19f1985bc392a9a44b18030a13886686b197ecc91f8ddf4ffc32b97124415a3f",
   "allow_unsigned_packets": true,
   "logger_options": {
