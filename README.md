@@ -1,16 +1,20 @@
 # LP2LN — Layered Peer-to-Peer Network
 
-Decentralized P2P networking stack in Rust: encrypted transport, peer discovery, optional HTTP gateway on the classic stack, and a **v2** node runtime focused on TCP/UDP transports and a structured node model.
+Decentralized P2P networking stack in Rust. The **current direction** is **`lp2ln-core-v2`**: a flat network where **peers are equal** (no special coordinator role) and **no signal servers are required**—bootstrap and discovery follow the new node model. The older **`lp2ln-core`** stack remains for the HTTP gateway and legacy flows; it still assumes a **signal server** and the classic peer architecture. **`lp2ln-gateway` is frozen for now**—active development is on finishing **v2** first; the gateway will be revisited afterward.
+
+**Wiki:** [https://deepwiki.com/krusalovorg/lp2ln](https://deepwiki.com/krusalovorg/lp2ln)
 
 ---
 
 ## Contents
 
+- [Documentation (Wiki)](#documentation-wiki)
 - [Overview](#overview)
 - [Workspace layout](#workspace-layout)
 - [Crates](#crates)
 - [Requirements](#requirements)
 - [Build](#build)
+- [Using `lp2ln-core-v2` as a library](#using-lp2ln-core-v2-as-a-library)
 - [Run](#run)
   - [`lp2lnd` (v2 node)](#lp2lnd-v2-node)
   - [`lp2ln-gateway` (HTTP + legacy core)](#lp2ln-gateway-http--legacy-core)
@@ -21,10 +25,19 @@ Decentralized P2P networking stack in Rust: encrypted transport, peer discovery,
 
 ---
 
+## Documentation (Wiki)
+
+Architecture and deeper explanations for this project are on DeepWiki:
+
+[https://deepwiki.com/krusalovorg/lp2ln](https://deepwiki.com/krusalovorg/lp2ln)
+
+---
+
 ## Overview
 
 | Area | Notes |
 |------|--------|
+| **Stacks** | **v2 (`lp2ln-core-v2`):** egalitarian peers, no signal server—**main focus**. **Legacy (`lp2ln-core` + `lp2ln-gateway`):** signal server + classic model; **gateway crate frozen** until v2 is further along. |
 | **Networking** | Async I/O (Tokio), TCP/UDP transports in v2; STUN client usage in core crates |
 | **Crypto** | ECDH/ECDSA (k256), ChaCha20-Poly1305, SHA-256 |
 | **Storage** | Embedded [redb](https://github.com/cberner/redb) databases where enabled |
@@ -39,12 +52,12 @@ This repository is a **Cargo workspace**. There is no single root `src/main.rs`;
 ```
 P2P-Server/
 ├── Cargo.toml              # workspace manifest
-├── config.toml             # used by lp2ln-gateway (signal server, storage, proxy)
+├── config.toml             # legacy gateway only: signal server, storage, proxy
 ├── LICENSE
 ├── crates/
-│   ├── lp2ln-core/         # original library (peer, signal, HTTP pieces, wasmtime, …)
-│   ├── lp2ln-core-v2/      # v2 library (node runtime, transports, DB tables, …)
-│   ├── lp2ln-gateway/      # binary: P2P + HTTP proxy/API on lp2ln-core
+│   ├── lp2ln-core/         # legacy core (signal server model, gateway, wasmtime, …)
+│   ├── lp2ln-core-v2/      # current core: equal peers, no signal server, node runtime, …
+│   ├── lp2ln-gateway/      # binary: legacy P2P + HTTP proxy/API (development frozen pending v2)
 │   ├── lp2lnd/             # binary: v2 node daemon (lp2ln-core-v2)
 │   └── lp2ln-db-export/    # binary: export redb / node DB to JSON
 ├── contracts/              # WASM contract build notes
@@ -58,10 +71,10 @@ P2P-Server/
 
 | Crate | Role |
 |-------|------|
-| **lp2ln-core-v2** | Library: `NodeBuilder`, `NodeOptions`, TCP/UDP transports, logging, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.81** (see `Cargo.toml`). |
+| **lp2ln-core-v2** | **Current** library: flat topology—**all peers are equal**; **no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, logging, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.81** (see `Cargo.toml`). |
 | **lp2lnd** | Default entry point for the v2 stack. Loads `options.json` (or path from CLI), starts the node, waits for Ctrl+C. Optional binary: `lp2lnd-scale` (`scale_daemon.rs`). Optional feature: `tokio-console` (needs `RUSTFLAGS="--cfg tokio_unstable"`). |
-| **lp2ln-core** | Original integrated library used by the gateway (peer, connection manager, tunnels, WASM runtime, etc.). |
-| **lp2ln-gateway** | Standalone daemon: reads `config.toml` from the **current working directory**, opens `./gateway_storage`, runs HTTP proxy/API over the P2P layer. |
+| **lp2ln-core** | **Legacy** core: signal-server-oriented peer stack, connection manager, tunnels, WASM runtime, etc. Kept for **`lp2ln-gateway`** and older tooling—not the model for new work. |
+| **lp2ln-gateway** | Standalone daemon on **legacy** `lp2ln-core` (`config.toml`, `./gateway_storage`, HTTP proxy/API). **Frozen**—no active work until **v2** is in better shape. |
 | **lp2ln-db-export** | CLI to dump node `redb` data to JSON (`-h` for usage). Default build includes file-picker support via the `pick` feature. |
 
 ---
@@ -69,7 +82,7 @@ P2P-Server/
 ## Requirements
 
 - **Rust** toolchain matching workspace **1.81+** (as declared in crate manifests).
-- **Gateway only:** a valid `config.toml` in the process working directory (repository root already contains an example).
+- **Gateway only (legacy stack, currently frozen):** if you still run it, you need `config.toml` in the working directory (signal server settings; repository root has an example). **v2 nodes** use `options.json` and no signal server.
 - **WASM contracts:** `rustup target add wasm32-unknown-unknown` (see `contracts/readme.md`).
 
 ---
@@ -96,9 +109,62 @@ cargo test --workspace
 
 ---
 
+## Using `lp2ln-core-v2` as a library
+
+Add the crate to your `Cargo.toml` (path, git, or crates.io when published):
+
+```toml
+[dependencies]
+lp2ln-core-v2 = { path = "../P2P-Server/crates/lp2ln-core-v2" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+anyhow = "1"
+```
+
+Minimal flow: **`NodeOptions`** → **`NodeBuilder`** (transports, optional `P2PDatabase`) → **`build`** → **`start`**. Shutdown with **`stop`**.
+
+```rust
+use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
+use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
+use lp2ln_core_v2::transport::{tcp::TcpTransport, udp::UdpTransport};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let options = NodeOptions::empty()
+        .with_listen("tcp", "0.0.0.0:8080".parse()?)
+        .with_listen("udp", "0.0.0.0:8080".parse()?)
+        .with_default_nodes(vec![] /* bootstrap / initial peers */)
+        .with_peer_connection_policy(PeerConnectionPolicy {
+            min_active_peers: 2,
+            target_active_peers: 4,
+            max_active_peers: 8,
+        })
+        .allow_unsigned_packets(true)
+        .keypair_generate();
+
+    let mut node = NodeBuilder::new()
+        .add_transport(Arc::new(TcpTransport::new()))
+        .add_transport(Arc::new(UdpTransport::new()))
+        // .db(Arc::new(lp2ln_core_v2::db::P2PDatabase::new("./data")?))
+        .build(options)?;
+
+    node.start().await?;
+    tokio::signal::ctrl_c().await?;
+    node.stop().await?;
+    Ok(())
+}
+```
+
+- **File-based config:** `let options = NodeOptions::from_file("options.json")?;` (same schema as `lp2lnd`).
+- **Runnable example** in the repo: `cargo run -p lp2ln-core-v2 --example minimal_node` — source: [`crates/lp2ln-core-v2/examples/minimal_node.rs`](crates/lp2ln-core-v2/examples/minimal_node.rs).
+
+---
+
 ## Run
 
 ### `lp2lnd` (v2 node)
+
+Runs on **`lp2ln-core-v2`**: **egalitarian peers**, **no signal server**—configure bootstrap / discovery via `options.json` (see `bootstrap_nodes`, `default_nodes`, etc.).
 
 ```bash
 cargo run -p lp2lnd --release
@@ -123,9 +189,11 @@ Secondary binary (same package):
 cargo run -p lp2lnd --bin lp2lnd-scale --release
 ```
 
-### `lp2ln-gateway` (HTTP + legacy core)
+### `lp2ln-gateway` (HTTP + **legacy** core)
 
-Run from a directory that contains `config.toml` (e.g. clone root):
+**Status: frozen.** Maintenance and feature work on the gateway are on hold while **v2** (`lp2ln-core-v2` / `lp2lnd`) is the priority. The code may still build and run as-is.
+
+Uses **`lp2ln-core`** (signal-server model), not v2. Run from a directory that contains `config.toml` (e.g. clone root):
 
 ```bash
 cargo run -p lp2ln-gateway --release
@@ -147,15 +215,15 @@ Point it at a redb `db` file or a node data directory that contains `db`.
 
 | Component | File | Format |
 |-----------|------|--------|
-| **lp2lnd** / v2 node | `options.json` (or path via `-o`/`--options`) | JSON |
-| **lp2ln-gateway** | `config.toml` | TOML |
+| **lp2lnd** / v2 node | `options.json` (or path via `-o`/`--options`) | JSON — no signal server |
+| **lp2ln-gateway** (legacy, frozen) | `config.toml` | TOML — includes `signal_server_*` |
 
 ---
 
 ## Development
 
-- **v2 node logic:** `crates/lp2ln-core-v2/src/` (notably `node/`, `transport/`, `db/`).
-- **Gateway + legacy peer path:** `crates/lp2ln-core/src/` and `crates/lp2ln-gateway/src/`.
+- **New work / v2:** `crates/lp2ln-core-v2/src/` (`node/`, `transport/`, `db/`, …)—equal peers, no signal server.
+- **Legacy gateway stack (frozen):** `crates/lp2ln-core/src/` and `crates/lp2ln-gateway/src/`—no active development until v2 matures.
 - **Docker:** a `Dockerfile` exists at the repository root but targets an older single-binary layout (`P2P-Server`, `start.sh`). Expect to adapt it if you want container builds for the current workspace outputs (`target/release/lp2lnd`, `lp2ln-gateway`, etc.).
 
 ---
