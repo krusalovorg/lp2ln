@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use async_trait::async_trait;
 use crate::transport::{Transport, bind_with_port_fallback};
+use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::transport::transport::{TransportContext, PublicAddress, TunnelPunchParams};
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
@@ -17,6 +18,7 @@ pub struct UdpTransport {
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     stun_client: StunClient,
     is_listener: bool,
+    obfuscator: Arc<Obfuscator>,
 }
 
 impl UdpTransport {
@@ -26,6 +28,7 @@ impl UdpTransport {
             shutdown_tx: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: true,
+            obfuscator: Arc::new(Obfuscator::plain()),
         }
     }
 
@@ -35,6 +38,7 @@ impl UdpTransport {
             shutdown_tx: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: true,
+            obfuscator: Arc::new(Obfuscator::plain()),
         }
     }
 
@@ -44,6 +48,27 @@ impl UdpTransport {
             shutdown_tx: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: false,
+            obfuscator: Arc::new(Obfuscator::plain()),
+        }
+    }
+
+    pub fn new_listener_with_obfuscation(listen_addr: SocketAddr, config: ObfuscationConfig) -> Self {
+        Self {
+            listen_addr,
+            shutdown_tx: Arc::new(Mutex::new(None)),
+            stun_client: StunClient::new(),
+            is_listener: true,
+            obfuscator: Arc::new(Obfuscator::from_config(config)),
+        }
+    }
+
+    pub fn new_dial_with_obfuscation(config: ObfuscationConfig) -> Self {
+        Self {
+            listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
+            shutdown_tx: Arc::new(Mutex::new(None)),
+            stun_client: StunClient::new(),
+            is_listener: false,
+            obfuscator: Arc::new(Obfuscator::from_config(config)),
         }
     }
 }
@@ -84,6 +109,7 @@ impl Transport for UdpTransport {
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
         let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
+        let obfuscator = self.obfuscator.clone();
         
         let sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<dyn Session>>>> = 
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -119,6 +145,7 @@ impl Transport for UdpTransport {
                                         peer_addr,
                                         None,
                                         LinkKind::DirectUdp,
+                                        obfuscator.clone(),
                                     ) {
                                         Ok(session) => {
                                             crate::info!("[UdpTransport] New session from {}", peer_addr);
@@ -179,7 +206,13 @@ impl Transport for UdpTransport {
         
         let socket = Arc::new(socket);
         
-        let session = UdpSession::new_from_socket(socket, addr, None, LinkKind::DirectUdp)?;
+        let session = UdpSession::new_from_socket(
+            socket,
+            addr,
+            None,
+            LinkKind::DirectUdp,
+            self.obfuscator.clone(),
+        )?;
         
         crate::info!("[UdpTransport] Session created for {}", addr);
         
@@ -246,6 +279,7 @@ impl Transport for UdpTransport {
                             target_addr,
                             None,
                             LinkKind::TunnelUdp,
+                            self.obfuscator.clone(),
                         )?;
                         
                         crate::info!("[UdpTransport] Tunnel session created: {}", session.id());

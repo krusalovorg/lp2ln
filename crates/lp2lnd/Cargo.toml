@@ -1,8 +1,8 @@
 [package]
 name = "lp2lnd"
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.81"
+edition = "2024"
+rust-version = "1.85"
 
 [features]
 default = []

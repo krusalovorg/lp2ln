@@ -1,4 +1,5 @@
 mod transport;
+pub mod obfuscation;
 pub mod tcp;
 pub mod udp;
 
