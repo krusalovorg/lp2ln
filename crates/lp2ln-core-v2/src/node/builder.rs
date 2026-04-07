@@ -3,6 +3,8 @@ use crate::db::P2PDatabase;
 use crate::node::options::NodeOptions;
 use crate::node::runtime::NodeRuntime;
 use crate::transport::Transport;
+use crate::transport::tcp::TcpTransport;
+use crate::transport::udp::UdpTransport;
 use crate::packet_processor::PacketProcessor;
 use anyhow::Result;
 
@@ -28,6 +30,26 @@ impl NodeBuilder {
 
     pub fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transports.push(transport);
+        self
+    }
+
+    pub fn add_default_transports_from_options(mut self, options: &NodeOptions) -> Self {
+        let tcp_transport = if let Some(cfg) = options.transport_obfuscation_for("tcp") {
+            Arc::new(TcpTransport::new_listener_with_obfuscation(None, cfg)) as Arc<dyn Transport>
+        } else {
+            Arc::new(TcpTransport::new()) as Arc<dyn Transport>
+        };
+        self.transports.push(tcp_transport);
+
+        let udp_transport = if let Some(cfg) = options.transport_obfuscation_for("udp") {
+            Arc::new(UdpTransport::new_listener_with_obfuscation(
+                "0.0.0.0:8081".parse().expect("valid socket addr"),
+                cfg,
+            )) as Arc<dyn Transport>
+        } else {
+            Arc::new(UdpTransport::new()) as Arc<dyn Transport>
+        };
+        self.transports.push(udp_transport);
         self
     }
 

@@ -170,6 +170,7 @@ impl NodeRuntime {
                 node_role: options.node_role,
                 catalog_max_peers: options.catalog_max_peers,
                 peer_discovery_random_fraction: options.peer_discovery_random_fraction,
+                transport_obfuscation: options.transport_obfuscation,
             },
             keypair,
             transports: vec![],

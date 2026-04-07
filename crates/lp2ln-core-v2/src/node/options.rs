@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::NodeKeypair;
 use crate::logger::LoggerOptions;
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
+use crate::transport::obfuscation::ObfuscationConfig;
 use crate::types::PeerId;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ pub struct NodeOptions {
     pub node_role: NodeRole,
     pub catalog_max_peers: Option<usize>,
     pub peer_discovery_random_fraction: f32,
+    pub transport_obfuscation: HashMap<String, ObfuscationConfig>,
 }
 
 impl NodeOptions {
@@ -80,6 +82,7 @@ impl NodeOptions {
             node_role: NodeRole::Regular,
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
+            transport_obfuscation: default_transport_obfuscation(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -109,6 +112,7 @@ impl NodeOptions {
             node_role: NodeRole::Regular,
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
+            transport_obfuscation: HashMap::new(),
             logger_options: Some(LoggerOptions::default()),
         }
     }
@@ -221,6 +225,38 @@ impl NodeOptions {
         self
     }
 
+    pub fn with_transport_obfuscation(
+        mut self,
+        protocol: impl Into<String>,
+        config: ObfuscationConfig,
+    ) -> Self {
+        self.transport_obfuscation
+            .insert(protocol.into().to_ascii_lowercase(), config);
+        self
+    }
+
+    pub fn set_transport_obfuscation(
+        &mut self,
+        protocol: impl Into<String>,
+        config: ObfuscationConfig,
+    ) -> &mut Self {
+        self.transport_obfuscation
+            .insert(protocol.into().to_ascii_lowercase(), config);
+        self
+    }
+
+    pub fn disable_transport_obfuscation(&mut self, protocol: &str) -> &mut Self {
+        self.transport_obfuscation
+            .remove(&protocol.to_ascii_lowercase());
+        self
+    }
+
+    pub fn transport_obfuscation_for(&self, protocol: &str) -> Option<ObfuscationConfig> {
+        self.transport_obfuscation
+            .get(&protocol.to_ascii_lowercase())
+            .cloned()
+    }
+
     pub fn with_logger_options(mut self, opts: LoggerOptions) -> Self {
         self.logger_options = Some(opts);
         self
@@ -302,6 +338,10 @@ struct NodeOptionsFile {
     catalog_max_peers: Option<u64>,
     #[serde(default = "default_peer_discovery_random_fraction")]
     peer_discovery_random_fraction: f32,
+    #[serde(default)]
+    transport_obfuscation: HashMap<String, ObfuscationConfig>,
+    #[serde(default)]
+    transport_obfuscation_enabled: HashMap<String, bool>,
 }
 
 fn default_peer_discovery_random_fraction() -> f32 {
@@ -379,6 +419,20 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
                 .catalog_max_peers
                 .map(|n| (n as usize).min(1_000_000).max(128)),
             peer_discovery_random_fraction: file.peer_discovery_random_fraction.clamp(0.0, 0.9),
+            transport_obfuscation: {
+                let mut map = default_transport_obfuscation();
+                map.extend(
+                    file.transport_obfuscation
+                        .into_iter()
+                        .map(|(k, v): (String, ObfuscationConfig)| (k.to_ascii_lowercase(), v)),
+                );
+                for (proto, enabled) in file.transport_obfuscation_enabled {
+                    if !enabled {
+                        map.remove(&proto.to_ascii_lowercase());
+                    }
+                }
+                map
+            },
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -440,6 +494,13 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
         }
         Ok(options)
     }
+}
+
+fn default_transport_obfuscation() -> HashMap<String, ObfuscationConfig> {
+    HashMap::from([
+        ("tcp".to_string(), ObfuscationConfig::default()),
+        ("udp".to_string(), ObfuscationConfig::default()),
+    ])
 }
 
 impl From<&NodeOptions> for NodeOptionsFile {
@@ -514,6 +575,12 @@ impl From<&NodeOptions> for NodeOptionsFile {
             node_role: opts.node_role,
             catalog_max_peers: opts.catalog_max_peers.map(|n| n as u64),
             peer_discovery_random_fraction: opts.peer_discovery_random_fraction,
+            transport_obfuscation: opts.transport_obfuscation.clone(),
+            transport_obfuscation_enabled: opts
+                .transport_obfuscation
+                .keys()
+                .map(|k| (k.clone(), true))
+                .collect(),
         }
     }
 }

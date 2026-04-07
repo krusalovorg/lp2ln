@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use uuid::Uuid;
 use crate::packet::Packet;
 use crate::sessions::{IncomingPacket, LinkKind, Session};
+use crate::transport::obfuscation::Obfuscator;
 use crate::transport::udp::codec::{decode_packet, encode_packet};
 
 pub struct UdpSession {
@@ -17,6 +18,7 @@ pub struct UdpSession {
     socket: Arc<UdpSocket>,
     
     peer_addr: SocketAddr,
+    obfuscator: Arc<Obfuscator>,
 }
 
 #[async_trait::async_trait]
@@ -88,6 +90,7 @@ impl UdpSession {
         peer_addr: SocketAddr,
         peer_id: Option<String>,
         kind: LinkKind,
+        obfuscator: Arc<Obfuscator>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
         
@@ -100,12 +103,21 @@ impl UdpSession {
             tx,
             socket: socket.clone(),
             peer_addr,
+            obfuscator: obfuscator.clone(),
         });
         
         let socket_clone = socket.clone();
+        let obfuscator_clone = obfuscator.clone();
         tokio::spawn(async move {
             while let Some((data, addr)) = rx.recv().await {
-                if let Err(e) = socket_clone.send_to(&data, addr).await {
+                let encoded = match obfuscator_clone.encode_datagram(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::error!("[UdpSession] Error obfuscating datagram: {}", e);
+                        break;
+                    }
+                };
+                if let Err(e) = socket_clone.send_to(&encoded, addr).await {
                     crate::error!("[UdpSession] Error sending datagram: {}", e);
                     break;
                 }
@@ -121,7 +133,8 @@ impl UdpSession {
         match self.socket.recv_from(&mut buf).await {
             Ok((size, _from_addr)) => {
                 buf.truncate(size);
-                let packet = decode_packet(buf)?;
+                let decoded = self.obfuscator.decode_datagram(&buf)?;
+                let packet = decode_packet(decoded)?;
                 Ok(packet)
             }
             Err(e) => {

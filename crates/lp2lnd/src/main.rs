@@ -4,7 +4,6 @@ use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
 use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
-use lp2ln_core_v2::transport::{tcp::TcpTransport, udp::UdpTransport};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         Some(args.options_path.clone())
     };
 
-    let options = if let Some(path) = options_path.as_ref() {
+    let mut options = if let Some(path) = options_path.as_ref() {
         match NodeOptions::from_file(path) {
             Ok(opts) => {
                 lp2ln_core_v2::info!("[Main] Loaded options from {}", path);
@@ -102,13 +101,20 @@ async fn main() -> anyhow::Result<()> {
         developer_options()
     };
 
+    if options.database_dir.is_none() {
+        let default_db_dir = PathBuf::from("./db");
+        lp2ln_core_v2::info!(
+            "[Main] database_dir is not set, using default: {}",
+            default_db_dir.display()
+        );
+        options.database_dir = Some(default_db_dir);
+    }
+
     if let Some(path) = options_path.as_ref() {
         let _ = options.save(path);
     }
 
-    let mut builder = NodeBuilder::new()
-        .add_transport(Arc::new(TcpTransport::new()))
-        .add_transport(Arc::new(UdpTransport::new()));
+    let mut builder = NodeBuilder::new().add_default_transports_from_options(&options);
     if let Some(ref dir) = options.database_dir {
         let dir_s = dir.to_string_lossy();
         match P2PDatabase::new(dir_s.as_ref()) {

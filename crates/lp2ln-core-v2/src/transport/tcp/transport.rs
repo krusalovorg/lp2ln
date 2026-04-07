@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use async_trait::async_trait;
 use crate::transport::{Transport, bind_with_port_fallback};
 use crate::transport::transport::TransportContext;
+use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
 use crate::transport::tcp::session::TcpSession;
@@ -14,6 +15,7 @@ pub struct TcpTransport {
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     is_listener: bool,
+    obfuscator: Arc<Obfuscator>,
 }
 
 impl TcpTransport {
@@ -22,6 +24,7 @@ impl TcpTransport {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             is_listener: true,
+            obfuscator: Arc::new(Obfuscator::plain()),
         }
     }
 
@@ -30,6 +33,7 @@ impl TcpTransport {
             listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
             shutdown_tx: Arc::new(Mutex::new(None)),
             is_listener: true,
+            obfuscator: Arc::new(Obfuscator::plain()),
         }
     }
 
@@ -38,6 +42,28 @@ impl TcpTransport {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             is_listener: false,
+            obfuscator: Arc::new(Obfuscator::plain()),
+        }
+    }
+
+    pub fn new_listener_with_obfuscation(
+        listen_addr: Option<SocketAddr>,
+        config: ObfuscationConfig,
+    ) -> Self {
+        Self {
+            listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
+            shutdown_tx: Arc::new(Mutex::new(None)),
+            is_listener: true,
+            obfuscator: Arc::new(Obfuscator::from_config(config)),
+        }
+    }
+
+    pub fn new_dial_with_obfuscation(config: ObfuscationConfig) -> Self {
+        Self {
+            listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
+            shutdown_tx: Arc::new(Mutex::new(None)),
+            is_listener: false,
+            obfuscator: Arc::new(Obfuscator::from_config(config)),
         }
     }
 }
@@ -78,6 +104,7 @@ impl Transport for TcpTransport {
         let listener = Arc::new(listener);
         let listener_clone = listener.clone();
         let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
+        let obfuscator = self.obfuscator.clone();
         
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         
@@ -98,7 +125,7 @@ impl Transport for TcpTransport {
                             Ok((mut stream, peer_addr)) => {
                                 crate::info!("[TcpTransport] New incoming connection from {}", peer_addr);
                                 
-                                let peer_id = match TcpSession::perform_handshake_on_stream(&mut stream).await {
+                                let peer_id = match TcpSession::perform_handshake_on_stream(&mut stream, obfuscator.as_ref()).await {
                                     Ok(peer_id) => {
                                         crate::info!("[TcpTransport] Handshake successful, peer_id: {}", peer_id);
                                         Some(peer_id)
@@ -109,7 +136,7 @@ impl Transport for TcpTransport {
                                     }
                                 };
                                 
-                                match TcpSession::new_from_stream(stream, peer_id, LinkKind::DirectTcp) {
+                                match TcpSession::new_from_stream(stream, peer_id, LinkKind::DirectTcp, obfuscator.clone()) {
                                     Ok(session) => {
                                         match incoming_sessions_tx
                                             .send(session.clone() as Arc<dyn Session>)
@@ -159,12 +186,19 @@ impl Transport for TcpTransport {
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>> {
         crate::info!("[TcpTransport] Dialing {}", addr);
         
+        if self.obfuscator.is_enabled() {
+            crate::info!(
+                "[TcpTransport] Obfuscation enabled: {:?}",
+                self.obfuscator.config().mode
+            );
+        }
+
         let stream = TcpStream::connect(addr).await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", addr, e))?;
         
         crate::info!("[TcpTransport] Connected to {}", addr);
         
-        let session = TcpSession::new_from_stream(stream, None, LinkKind::DirectTcp)?;
+        let session = TcpSession::new_from_stream(stream, None, LinkKind::DirectTcp, self.obfuscator.clone())?;
         
         Ok(session as Arc<dyn Session>)
     }
