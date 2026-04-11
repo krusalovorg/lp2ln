@@ -171,6 +171,7 @@ pub async fn send_discovery_redirect_and_close(
                 sender: our_peer_id.to_string(),
                 receiver: newcomer.as_str().to_string(),
                 max_hops: 2,
+                request_id: None,
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,

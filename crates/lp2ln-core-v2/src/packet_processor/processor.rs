@@ -63,7 +63,7 @@ impl PacketProcessor for DefaultPacketProcessor {
 
         if receiver == self.our_peer_id || receiver.is_empty() {
             if super::control::try_handle_control_packet(
-                &incoming_packet.packet.data,
+                &incoming_packet.packet,
                 &self.our_peer_id,
                 from,
                 &peer_id,
@@ -77,6 +77,7 @@ impl PacketProcessor for DefaultPacketProcessor {
             }
             super::local::handle_local_packet(
                 &incoming_packet.packet.data,
+                incoming_packet.packet.request_id,
                 &self.our_peer_id,
                 from,
                 &peer_id,

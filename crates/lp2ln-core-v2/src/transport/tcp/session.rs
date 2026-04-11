@@ -147,6 +147,7 @@ impl TcpSession {
             sender: our_peer_id,
             receiver: String::new(),
             max_hops: 8,
+            request_id: None,
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,

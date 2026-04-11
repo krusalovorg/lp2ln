@@ -25,6 +25,7 @@ struct ChunkBuffer {
     receiver: String,
     nodes: Vec<String>,
     max_hops: u8,
+    request_id: Option<u64>,
 }
 
 pub struct ChunkAssembler {
@@ -88,6 +89,7 @@ impl ChunkAssembler {
                     receiver: packet.receiver.clone(),
                     nodes: packet.nodes.clone(),
                     max_hops: packet.max_hops,
+                    request_id: packet.request_id,
                 });
 
             if entry.total_chunks != total {
@@ -113,6 +115,7 @@ impl ChunkAssembler {
                 sender: entry.sender.clone(),
                 receiver: entry.receiver.clone(),
                 max_hops: entry.max_hops,
+                request_id: entry.request_id,
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,

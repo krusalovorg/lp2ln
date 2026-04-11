@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use rand::Rng;
 use k256::ecdsa::SigningKey;
 use tokio::sync::{broadcast, mpsc};
 
@@ -27,6 +29,7 @@ pub struct Router {
     chunk_assembler: Arc<ChunkAssembler>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     incoming_broadcast_tx: broadcast::Sender<IncomingPacket>,
+    next_request_id: AtomicU64,
 }
 
 impl Router {
@@ -39,6 +42,7 @@ impl Router {
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
         let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
 
+        let start_id: u64 = rand::rng().random();
         (
             Self {
                 session_manager,
@@ -47,12 +51,17 @@ impl Router {
                 chunk_assembler: Arc::new(ChunkAssembler::new(our_peer_id)),
                 incoming_tx,
                 incoming_broadcast_tx,
+                next_request_id: AtomicU64::new(start_id),
             },
             incoming_rx,
         )
     }
 
     fn prepare_outgoing(&self, mut packet: Packet) -> Result<Packet> {
+        if packet.request_id.is_none() {
+            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            packet.request_id = Some(id);
+        }
         if let Some(ref key) = self.signing_key {
             sign_packet(&mut packet, key).map_err(anyhow::Error::msg)?;
         }
@@ -67,16 +76,19 @@ impl Router {
         self.incoming_broadcast_tx.subscribe()
     }
 
-    pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<()> {
+    pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
         let Some(session) = self.session_manager.get(&session_id) else {
             return Err(anyhow::anyhow!("Session '{}' not found", session_id));
         };
         let packet = self.prepare_outgoing(packet)?;
+        let request_id = packet
+            .request_id
+            .ok_or_else(|| anyhow::anyhow!("internal: request_id missing after prepare_outgoing"))?;
         match session.send(packet).await {
             Ok(bytes) => {
                 self.session_manager
                     .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
-                Ok(())
+                Ok(request_id)
             }
             Err(e) => {
                 self.session_manager
@@ -92,8 +104,11 @@ impl Router {
         peer_id: PeerId,
         packet: Packet,
         exclude_from: Option<PeerId>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let packet = self.prepare_outgoing(packet)?;
+        let request_id = packet
+            .request_id
+            .ok_or_else(|| anyhow::anyhow!("internal: request_id missing after prepare_outgoing"))?;
         let is_control_packet = NetworkControlPayload::decode(&packet.data).is_ok();
         let in_nodes = packet.nodes.iter().any(|n| n == peer_id.as_str());
         if in_nodes || exclude_from.as_ref() == Some(&peer_id) {
@@ -108,7 +123,7 @@ impl Router {
                 Ok(bytes) => {
                     self.session_manager
                         .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
-                    return Ok(());
+                    return Ok(request_id);
                 }
                 Err(e) => {
                     self.session_manager
@@ -168,7 +183,7 @@ impl Router {
             }
         }
         if any_ok {
-            Ok(())
+            Ok(request_id)
         } else {
             last_err.map_or_else(
                 || Err(anyhow::anyhow!("No sessions for peer '{}'", peer_id)),

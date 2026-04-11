@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,11 +18,12 @@ use crate::node::connection_strategy::{
     send_discovery_redirect_and_close, should_reseed_bootstrap, should_skip_for_bootstrap_quota,
     BOOTSTRAP_INCOMING_HEADROOM, INCOMING_ROTATION_INTERVAL_MS,
 };
-use crate::node::options::{BootstrapNode, NodeOptions, NodeRole};
+use crate::node::options::{BootstrapNode, NodeOptions, NodeRole, TopologyTuning};
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
 use crate::peer_score::{total_score, PeerScore, PeerScoreStore, PeerScoreWeights};
 use crate::protocol::control::NetworkControlPayload;
+use crate::protocol::handshake;
 use crate::router::{Router, ROUTER_INCOMING_QUEUE_CAP};
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
@@ -37,17 +38,10 @@ use crate::logger;
 use crate::metrics::MetricsAggregator;
 use crate::peer_score::PeerConnectionPolicy;
 
-const DIAL_RETRY_COOLDOWN_MS: u64 = 30_000;
-const PRUNE_REDIAL_COOLDOWN_MS: u64 = 45_000;
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const MAINTENANCE_START_JITTER_MS: u64 = 3_000;
-const REGULAR_AUTO_TARGET_MIN: usize = 4;
-const REGULAR_AUTO_TARGET_MAX: usize = 8;
 const REGULAR_MAX_HEADROOM: usize = 2;
-const REGULAR_BOOTSTRAP_MIN_KEEP: usize = 1;
-const REGULAR_BOOTSTRAP_REJOIN_INTERVAL_MS: u64 = 20_000;
 const REGULAR_SELF_HEAL_FLOOR: usize = 3;
-const REGULAR_EXPLORATION_INTERVAL_MS: u64 = 20_000;
 const DIAL_HUB_SOFT_CAP_EXTRA: usize = 2;
 const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = 4;
 const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
@@ -56,6 +50,7 @@ const DIAL_ENDPOINT_ATTEMPTS_PER_PEER_MAX: usize = 1;
 pub struct NodeRuntime {
     _db: Option<Arc<P2PDatabase>>,
     _options: NodeOptions,
+    peer_connection_policy_live: Arc<RwLock<PeerConnectionPolicy>>,
     keypair: NodeKeypair,
     transports: Vec<Arc<dyn Transport>>,
     packet_processor: Arc<dyn PacketProcessor>,
@@ -73,6 +68,7 @@ async fn dial_bootstrap_address(
     incoming_packets_tx: &mpsc::Sender<IncomingPacket>,
     our_peer_id: &str,
     target: &BootstrapNode,
+    handshake_payload: &[u8],
 ) {
     for transport in transports {
         if !transport.is_listener() {
@@ -98,11 +94,12 @@ async fn dial_bootstrap_address(
                 session.spawn_reader(incoming_packets_tx.clone());
                 let handshake = Packet {
                     signature: None,
-                    data: vec![],
+                    data: handshake_payload.to_vec(),
                     nodes: vec![],
                     sender: our_peer_id.to_string(),
                     receiver: String::new(),
                     max_hops: 8,
+                    request_id: None,
                     chunk_stream_id: None,
                     chunk_index: None,
                     total_chunks: None,
@@ -152,6 +149,7 @@ impl NodeRuntime {
             peer_scores,
             options.peer_score_weights.clone(),
         ));
+        let peer_policy_init = options.peer_connection_policy.normalized();
         Self {
             _db: db,
             _options: NodeOptions {
@@ -171,7 +169,11 @@ impl NodeRuntime {
                 catalog_max_peers: options.catalog_max_peers,
                 peer_discovery_random_fraction: options.peer_discovery_random_fraction,
                 transport_obfuscation: options.transport_obfuscation,
+                topology_tuning: options.topology_tuning,
+                flow_trace: options.flow_trace,
+                debug_server: options.debug_server,
             },
+            peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,
             transports: vec![],
             packet_processor,
@@ -235,13 +237,22 @@ impl NodeRuntime {
         router.register_session_only(session_id.clone(), session.clone());
         session.spawn_reader(router.incoming_sender());
 
+        let mut obf_protocols: Vec<String> = self
+            ._options
+            .transport_obfuscation
+            .keys()
+            .cloned()
+            .collect();
+        obf_protocols.sort();
+        let handshake_payload = handshake::encode_hello(obf_protocols);
         let handshake = Packet {
             signature: None,
-            data: vec![],
+            data: handshake_payload,
             nodes: vec![],
             sender: self.keypair.peer_id().to_string(),
             receiver: String::new(),
             max_hops: 8,
+            request_id: None,
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
@@ -251,30 +262,147 @@ impl NodeRuntime {
         Ok(session_id)
     }
 
-    pub async fn send(&self, peer_id: PeerId, data: Vec<u8>) -> Result<()> {
+    pub async fn send_with_options(
+        &self,
+        route_peer_id: PeerId,
+        data: Vec<u8>,
+        receiver: Option<String>,
+        max_hops: Option<u8>,
+        nodes: Option<Vec<String>>,
+    ) -> Result<u64> {
         let router = self
             .router
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Node is not started, call start() first"))?;
 
         let sender = self.keypair.peer_id();
+        let receiver_str = receiver
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| route_peer_id.as_str().to_string());
 
         let packet = Packet {
             signature: None,
             data,
-            nodes: vec![],
+            nodes: nodes.unwrap_or_default(),
             sender: sender.to_string(),
-            receiver: peer_id.as_str().to_string(),
-            max_hops: 8,
+            receiver: receiver_str,
+            max_hops: max_hops.unwrap_or(8),
+            request_id: None,
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
         };
 
-        router.send_to_peer(peer_id, packet, None).await
+        router.send_to_peer(route_peer_id, packet, None).await
     }
 
-    pub async fn send_to_session(&self, session_id: SessionId, data: Vec<u8>) -> Result<()> {
+    pub async fn send(&self, peer_id: PeerId, data: Vec<u8>) -> Result<u64> {
+        self.send_with_options(peer_id, data, None, None, None).await
+    }
+
+    async fn recv_reply_matching(
+        &self,
+        sub: &mut tokio::sync::broadcast::Receiver<IncomingPacket>,
+        route_peer_id: &PeerId,
+        request_id: u64,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let our_id = self.keypair.peer_id().to_string();
+        let peer_str = route_peer_id.as_str().to_string();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow::anyhow!(
+                    "recv_reply_matching: timeout waiting for request_id {}",
+                    request_id
+                ));
+            }
+            let incoming = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "recv_reply_matching: timeout waiting for request_id {}",
+                        request_id
+                    )
+                })?;
+            let incoming = match incoming {
+                Ok(p) => p,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => {
+                    return Err(anyhow::anyhow!(
+                        "recv_reply_matching: incoming channel closed"
+                    ));
+                }
+            };
+            let packet = incoming.packet;
+            if packet.request_id != Some(request_id) {
+                continue;
+            }
+            let via = incoming
+                .from_node
+                .as_deref()
+                .unwrap_or_else(|| packet.sender.as_str());
+            if via != peer_str {
+                continue;
+            }
+            if !packet.receiver.is_empty() && packet.receiver != our_id {
+                continue;
+            }
+            return Ok(packet.data);
+        }
+    }
+
+    pub async fn send_with_options_and_wait_reply(
+        &self,
+        route_peer_id: PeerId,
+        data: Vec<u8>,
+        receiver: Option<String>,
+        max_hops: Option<u8>,
+        nodes: Option<Vec<String>>,
+        timeout: Duration,
+    ) -> Result<(u64, Vec<u8>)> {
+        let router = self
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node is not started, call start() first"))?;
+        let mut sub = router.subscribe();
+        let request_id = self
+            .send_with_options(
+                route_peer_id.clone(),
+                data,
+                receiver,
+                max_hops,
+                nodes,
+            )
+            .await?;
+        let reply = self
+            .recv_reply_matching(&mut sub, &route_peer_id, request_id, timeout)
+            .await?;
+        Ok((request_id, reply))
+    }
+
+    pub async fn send_and_wait_reply(
+        &self,
+        peer_id: PeerId,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let router = self
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node is not started, call start() first"))?;
+        let mut sub = router.subscribe();
+        let request_id = self
+            .send_with_options(peer_id.clone(), data, None, None, None)
+            .await?;
+        self.recv_reply_matching(&mut sub, &peer_id, request_id, timeout)
+            .await
+    }
+
+    pub async fn send_to_session(&self, session_id: SessionId, data: Vec<u8>) -> Result<u64> {
         let router = self
             .router
             .as_ref()
@@ -288,11 +416,22 @@ impl NodeRuntime {
             sender: sender.to_string(),
             receiver: sender.to_string(),
             max_hops: 8,
+            request_id: None,
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
         };
         router.send_to_session(session_id, packet).await
+    }
+
+    pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
+        let pid = PeerId::from(peer_id);
+        self.session_manager.close_all_sessions_for_peer(&pid).await
+    }
+
+    pub async fn disconnect_session(&self, session_id: &str) -> Result<()> {
+        let sid = SessionId::from(session_id);
+        self.session_manager.close_session(&sid).await
     }
 
     pub fn router(&self) -> Option<Arc<Router>> {
@@ -311,12 +450,23 @@ impl NodeRuntime {
         self.session_manager.get_metrics_by_protocol()
     }
 
-    pub fn peer_connection_policy(&self) -> &PeerConnectionPolicy {
-        &self._options.peer_connection_policy
+    pub fn debug_sessions(&self) -> Vec<crate::sessions::manager::SessionDebugEntry> {
+        self.session_manager.debug_sessions()
+    }
+
+    pub fn peer_connection_policy(&self) -> PeerConnectionPolicy {
+        self.peer_connection_policy_live.read().unwrap().clone()
     }
 
     pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {
-        self._options.effective_peer_connection_policy()
+        let base = self.peer_connection_policy_live.read().unwrap().clone();
+        NodeOptions::effective_peer_connection_policy_for(base, self._options.node_role)
+    }
+
+    pub fn set_peer_connection_policy(&self, policy: PeerConnectionPolicy) -> PeerConnectionPolicy {
+        let n = policy.normalized();
+        *self.peer_connection_policy_live.write().unwrap() = n.clone();
+        n
     }
 
     pub fn node_role(&self) -> NodeRole {
@@ -325,6 +475,13 @@ impl NodeRuntime {
 
     pub fn active_peer_count(&self) -> usize {
         self.session_manager.distinct_peer_count()
+    }
+
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        if let Some(router) = self.router.as_ref() {
+            return router.connected_peers();
+        }
+        vec![]
     }
 
     pub fn peer_score_weights(&self) -> &PeerScoreWeights {
@@ -347,15 +504,18 @@ impl NodeRuntime {
             router
         };
         self.router = Some(router.clone());
-        let flow_trace_enabled = std::env::var("LP2LN_TRACE_FLOW")
+        let flow_trace_enabled_from_env = std::env::var("LP2LN_TRACE_FLOW")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
                 matches!(v.as_str(), "1" | "true" | "yes" | "on")
             })
             .unwrap_or(false);
+        let flow_trace_enabled = flow_trace_enabled_from_env || self._options.flow_trace.enabled;
+        let flow_trace_json_packets = self._options.flow_trace.json_packets;
+        let flow_trace_payload_preview_bytes = self._options.flow_trace.payload_preview_bytes.min(256);
         let node_role_for_trace = self._options.node_role;
         let our_peer_for_trace = self.keypair.peer_id().to_string();
-        if flow_trace_enabled && !matches!(node_role_for_trace, NodeRole::Regular) {
+        if flow_trace_enabled {
             let mut trace_rx = router.subscribe();
             crate::info!(
                 "[NodeRuntime] flow-trace enabled on {:?}; reporting every 10s",
@@ -384,6 +544,8 @@ impl NodeRuntime {
                                     let is_forward = !packet.receiver.is_empty() && packet.receiver != our_peer_for_trace;
                                     let payload_kind = if packet.data.is_empty() {
                                         "local:handshake".to_string()
+                                    } else if crate::protocol::handshake::decode_hello(&packet.data).is_some() {
+                                        "local:handshake_hello".to_string()
                                     } else if packet.data.as_slice() == b"hs_ack" {
                                         "local:handshake_ack".to_string()
                                     } else if packet.data.as_slice() == b"ping" {
@@ -409,6 +571,35 @@ impl NodeRuntime {
                                     } else {
                                         "data:opaque".to_string()
                                     };
+                                    if flow_trace_json_packets {
+                                        let preview = packet
+                                            .data
+                                            .iter()
+                                            .take(flow_trace_payload_preview_bytes)
+                                            .map(|b| format!("{:02x}", b))
+                                            .collect::<Vec<_>>()
+                                            .join("");
+                                        let row = serde_json::json!({
+                                            "sender": packet.sender.clone(),
+                                            "receiver": packet.receiver.clone(),
+                                            "via": via.clone(),
+                                            "payload_kind": payload_kind.clone(),
+                                            "payload_len": packet.data.len(),
+                                            "payload_preview_hex": preview,
+                                            "payload_preview_truncated": packet.data.len() > flow_trace_payload_preview_bytes,
+                                            "path_len": hops_len,
+                                            "hops_left": packet.max_hops,
+                                            "is_forward": is_forward,
+                                        });
+                                        match serde_json::to_string_pretty(&row) {
+                                            Ok(pretty) => {
+                                                crate::info!("[FLOWTRACE]\n{}", pretty);
+                                            }
+                                            Err(_) => {
+                                                crate::info!("[FLOWTRACE] packet {}", row);
+                                            }
+                                        }
+                                    }
                                     let key = (
                                         packet.sender,
                                         packet.receiver,
@@ -501,7 +692,7 @@ impl NodeRuntime {
         let incoming_packets_tx_for_sessions = router.incoming_sender();
         let router_for_incoming = router.clone();
         let our_peer_id_for_incoming = self.keypair.peer_id().to_string();
-        let incoming_policy = self._options.effective_peer_connection_policy().normalized();
+        let policy_live_incoming = self.peer_connection_policy_live.clone();
         let incoming_catalog = self.peer_catalog.clone();
         let incoming_peer_store = self.session_manager.peer_score_store();
         let incoming_weights = self._options.peer_score_weights.clone();
@@ -510,6 +701,11 @@ impl NodeRuntime {
         tokio::spawn(async move {
             let mut last_rotation_ms = 0u64;
             while let Some(session) = incoming_sessions_rx.recv().await {
+                let incoming_policy = NodeOptions::effective_peer_connection_policy_for(
+                    policy_live_incoming.read().unwrap().clone(),
+                    incoming_node_role,
+                )
+                .normalized();
                 crate::session!(
                     "[NodeRuntime] New session: {} (kind: {:?})",
                     session.id(),
@@ -657,6 +853,7 @@ impl NodeRuntime {
                         sender: our_peer_id_for_incoming.clone(),
                         receiver: peer_id_str,
                         max_hops: 1,
+                        request_id: None,
                         chunk_stream_id: None,
                         chunk_index: None,
                         total_chunks: None,
@@ -688,6 +885,14 @@ impl NodeRuntime {
         let router_outgoing = router.clone();
         let incoming_packets_tx_outgoing = router.incoming_sender();
         let our_peer_id = self.keypair.peer_id().to_string();
+        let mut obf_protocols: Vec<String> = self
+            ._options
+            .transport_obfuscation
+            .keys()
+            .cloned()
+            .collect();
+        obf_protocols.sort();
+        let handshake_payload = handshake::encode_hello(obf_protocols);
         tokio::spawn(async move {
             for target in bootstrap_targets {
                 dial_bootstrap_address(
@@ -696,6 +901,7 @@ impl NodeRuntime {
                     &incoming_packets_tx_outgoing,
                     &our_peer_id,
                     &target,
+                    &handshake_payload,
                 )
                 .await;
             }
@@ -715,7 +921,7 @@ impl NodeRuntime {
             }
         }
 
-        let policy = self._options.effective_peer_connection_policy().normalized();
+        let policy_live_maint = self.peer_connection_policy_live.clone();
         let node_role = self._options.node_role;
         let weights = self._options.peer_score_weights.clone();
         let sm = self.session_manager.clone();
@@ -735,6 +941,15 @@ impl NodeRuntime {
         let mut last_publish = now_ms().saturating_sub(descriptor_interval.as_millis() as u64);
         let signing_key = self.keypair.signing_key().clone();
         let log_peer_scores = self._options.log_peer_score_snapshot;
+        let topology_tuning: TopologyTuning = self._options.topology_tuning.clone();
+        let mut maint_obf_protocols: Vec<String> = self
+            ._options
+            .transport_obfuscation
+            .keys()
+            .cloned()
+            .collect();
+        maint_obf_protocols.sort();
+        let maintenance_handshake_payload = handshake::encode_hello(maint_obf_protocols);
 
         tokio::spawn(async move {
             let initial_jitter =
@@ -748,6 +963,11 @@ impl NodeRuntime {
             let mut last_exploration_ms = 0u64;
             loop {
                 interval.tick().await;
+                let policy = NodeOptions::effective_peer_connection_policy_for(
+                    policy_live_maint.read().unwrap().clone(),
+                    node_role,
+                )
+                .normalized();
                 catalog.decay(Duration::from_secs(180));
                 catalog.cleanup_expired();
                 for (pid, score) in catalog.recalc_scores(&weights) {
@@ -831,7 +1051,10 @@ impl NodeRuntime {
                 let now = now_ms();
                 let known_peers = catalog.known_peer_ids().len().max(1);
                 let auto_target_regular = ((known_peers as f32).sqrt().round() as usize)
-                    .clamp(REGULAR_AUTO_TARGET_MIN, REGULAR_AUTO_TARGET_MAX);
+                    .clamp(
+                        topology_tuning.regular_auto_target_min,
+                        topology_tuning.regular_auto_target_max.max(topology_tuning.regular_auto_target_min),
+                    );
                 if n > adaptive.max_active_peers {
                     let drop_n = n.saturating_sub(adaptive.max_active_peers);
                     let connected = router_maint.connected_peers();
@@ -846,7 +1069,7 @@ impl NodeRuntime {
                     for pid in to_drop {
                         catalog.observe_failure(&pid);
                         dial_cooldown_until
-                            .insert(pid.clone(), now.saturating_add(PRUNE_REDIAL_COOLDOWN_MS));
+                            .insert(pid.clone(), now.saturating_add(topology_tuning.prune_redial_cooldown_ms));
                         let _ = sm.close_all_sessions_for_peer(&pid).await;
                     }
                     n = sm.distinct_peer_count();
@@ -874,12 +1097,23 @@ impl NodeRuntime {
                     now,
                     last_bootstrap_reseed_ms,
                 );
+                let only_seed_known_mode = matches!(node_role, NodeRole::Regular)
+                    && n > 0
+                    && !bootstrap_targets_maint.is_empty()
+                    && known_peers <= bootstrap_targets_maint.len().saturating_add(1);
+                let stable_bootstrap_guard = topology_tuning.avoid_reseed_when_stable_bootstrap
+                    && (only_seed_known_mode
+                        || (matches!(node_role, NodeRole::Regular)
+                            && connected_bootstrap_now > 0
+                            && known_peers < topology_tuning.bootstrap_stable_peer_threshold));
                 let missing_bootstrap_bridge = matches!(node_role, NodeRole::Regular)
                     && connected_bootstrap_now == 0
                     && n >= adaptive.min_active_peers
                     && now.saturating_sub(last_bootstrap_reseed_ms)
-                        >= REGULAR_BOOTSTRAP_REJOIN_INTERVAL_MS;
-                if !bootstrap_targets_maint.is_empty() && (low_connectivity_reseed || missing_bootstrap_bridge)
+                        >= topology_tuning.regular_bootstrap_rejoin_interval_ms;
+                if !stable_bootstrap_guard
+                    && !bootstrap_targets_maint.is_empty()
+                    && (low_connectivity_reseed || missing_bootstrap_bridge)
                 {
                     crate::debug!(
                         "[NodeRuntime] bootstrap reseed: active={} min={} boot-connected={} targets={} reason={}",
@@ -905,6 +1139,7 @@ impl NodeRuntime {
                             &incoming_maint,
                             &our_peer_maint,
                             target,
+                            &maintenance_handshake_payload,
                         )
                         .await;
                     }
@@ -929,7 +1164,7 @@ impl NodeRuntime {
                     for pid in to_drop {
                         catalog.observe_failure(&pid);
                         dial_cooldown_until
-                            .insert(pid.clone(), now.saturating_add(PRUNE_REDIAL_COOLDOWN_MS));
+                            .insert(pid.clone(), now.saturating_add(topology_tuning.prune_redial_cooldown_ms));
                         let _ = sm.close_all_sessions_for_peer(&pid).await;
                     }
                     n = sm.distinct_peer_count();
@@ -956,7 +1191,7 @@ impl NodeRuntime {
                     for pid in to_drop {
                         catalog.observe_failure(&pid);
                         dial_cooldown_until
-                            .insert(pid.clone(), now.saturating_add(PRUNE_REDIAL_COOLDOWN_MS));
+                            .insert(pid.clone(), now.saturating_add(topology_tuning.prune_redial_cooldown_ms));
                         let _ = sm.close_all_sessions_for_peer(&pid).await;
                     }
                     n = sm.distinct_peer_count();
@@ -964,7 +1199,7 @@ impl NodeRuntime {
                 let should_explore = matches!(node_role, NodeRole::Regular)
                     && n >= dial_target
                     && n < adaptive.max_active_peers
-                    && now.saturating_sub(last_exploration_ms) >= REGULAR_EXPLORATION_INTERVAL_MS;
+                    && now.saturating_sub(last_exploration_ms) >= topology_tuning.regular_exploration_interval_ms;
                 if n < dial_target || should_explore {
                     let req = NetworkControlPayload::RequestPeers { limit: 32 };
                     if let Ok(data) = req.encode() {
@@ -976,6 +1211,7 @@ impl NodeRuntime {
                                 sender: our_peer_maint.clone(),
                                 receiver: p.as_str().to_string(),
                                 max_hops: 2,
+                                request_id: None,
                                 chunk_stream_id: None,
                                 chunk_index: None,
                                 total_chunks: None,
@@ -1099,11 +1335,12 @@ impl NodeRuntime {
                                         session.spawn_reader(incoming_maint.clone());
                                         let handshake = Packet {
                                             signature: None,
-                                            data: vec![],
+                                            data: maintenance_handshake_payload.clone(),
                                             nodes: vec![],
                                             sender: our_peer_maint.clone(),
                                             receiver: String::new(),
                                             max_hops: 8,
+                                            request_id: None,
                                             chunk_stream_id: None,
                                             chunk_index: None,
                                             total_chunks: None,
@@ -1127,7 +1364,7 @@ impl NodeRuntime {
                                         catalog.observe_failure(&pid);
                                         dial_cooldown_until.insert(
                                             pid.clone(),
-                                            now.saturating_add(DIAL_RETRY_COOLDOWN_MS),
+                                            now.saturating_add(topology_tuning.dial_retry_cooldown_ms),
                                         );
                                         break;
                                     }
@@ -1153,7 +1390,7 @@ impl NodeRuntime {
                             .filter(|p| catalog.peer_is_bootstrap_entry(&p))
                             .collect();
                         let connected_bootstrap = boot_peers.len();
-                        if connected_bootstrap > REGULAR_BOOTSTRAP_MIN_KEEP {
+                        if connected_bootstrap > topology_tuning.regular_bootstrap_min_keep {
                             boot_peers.sort_by(|a, b| {
                                 let ta = total_score(&peer_store.get(a), &weights);
                                 let tb = total_score(&peer_store.get(b), &weights);
@@ -1161,7 +1398,7 @@ impl NodeRuntime {
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
                             let max_bootstrap_drop =
-                                connected_bootstrap.saturating_sub(REGULAR_BOOTSTRAP_MIN_KEEP);
+                                connected_bootstrap.saturating_sub(topology_tuning.regular_bootstrap_min_keep);
                             let drop_n = n.saturating_sub(desired_keep).min(max_bootstrap_drop);
                             if drop_n > 0 {
                                 crate::info!(
@@ -1170,7 +1407,7 @@ impl NodeRuntime {
                                     non_boot,
                                     min_keep,
                                     desired_keep,
-                                    REGULAR_BOOTSTRAP_MIN_KEEP
+                                    topology_tuning.regular_bootstrap_min_keep
                                 );
                             }
                             for pid in boot_peers.into_iter().take(drop_n) {
@@ -1234,6 +1471,7 @@ impl NodeRuntime {
                                     sender: our_peer_maint.clone(),
                                     receiver: p.as_str().to_string(),
                                     max_hops: 2,
+                                    request_id: None,
                                     chunk_stream_id: None,
                                     chunk_index: None,
                                     total_chunks: None,

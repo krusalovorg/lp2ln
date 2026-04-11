@@ -18,6 +18,23 @@ pub struct SessionManager {
     peer_weights: PeerScoreWeights,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionDebugEntry {
+    pub session_id: String,
+    pub peer_id: Option<String>,
+    pub protocol: String,
+    pub is_active: bool,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub send_errors: u64,
+    pub receive_errors: u64,
+    pub reconnections: u64,
+    pub uptime_secs: u64,
+    pub last_activity_secs_ago: u64,
+}
+
 impl SessionManager {
     fn prune_stale_peer_index(&self) {
         let peers: Vec<PeerId> = self.by_peer.iter().map(|r| r.key().clone()).collect();
@@ -215,6 +232,36 @@ impl SessionManager {
 
     pub fn total_sessions_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    pub fn debug_sessions(&self) -> Vec<SessionDebugEntry> {
+        self.sessions
+            .iter()
+            .filter_map(|entry| {
+                let session_id = entry.key().clone();
+                let session = entry.value().clone();
+                let metrics = self.metrics.get(&session_id).map(|m| m.clone())?;
+                let peer_id = self
+                    .session_to_peer
+                    .get(&session_id)
+                    .map(|pid| pid.as_str().to_string());
+                Some(SessionDebugEntry {
+                    session_id: session_id.as_str().to_string(),
+                    peer_id,
+                    protocol: session.kind().to_string(),
+                    is_active: metrics.is_active,
+                    packets_sent: metrics.packets_sent,
+                    packets_received: metrics.packets_received,
+                    bytes_sent: metrics.bytes_sent,
+                    bytes_received: metrics.bytes_received,
+                    send_errors: metrics.send_errors,
+                    receive_errors: metrics.receive_errors,
+                    reconnections: metrics.reconnections,
+                    uptime_secs: metrics.uptime().as_secs(),
+                    last_activity_secs_ago: metrics.time_since_last_activity().as_secs(),
+                })
+            })
+            .collect()
     }
 
     /// Distinct remote peers with at least one registered session.

@@ -45,6 +45,84 @@ impl BootstrapNode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyTuning {
+    #[serde(default = "default_regular_auto_target_min")]
+    pub regular_auto_target_min: usize,
+    #[serde(default = "default_regular_auto_target_max")]
+    pub regular_auto_target_max: usize,
+    #[serde(default = "default_regular_bootstrap_min_keep")]
+    pub regular_bootstrap_min_keep: usize,
+    #[serde(default = "default_regular_bootstrap_rejoin_interval_ms")]
+    pub regular_bootstrap_rejoin_interval_ms: u64,
+    #[serde(default = "default_regular_exploration_interval_ms")]
+    pub regular_exploration_interval_ms: u64,
+    #[serde(default = "default_dial_retry_cooldown_ms")]
+    pub dial_retry_cooldown_ms: u64,
+    #[serde(default = "default_prune_redial_cooldown_ms")]
+    pub prune_redial_cooldown_ms: u64,
+    #[serde(default = "default_bootstrap_stable_peer_threshold")]
+    pub bootstrap_stable_peer_threshold: usize,
+    #[serde(default = "default_true")]
+    pub avoid_reseed_when_stable_bootstrap: bool,
+}
+
+impl Default for TopologyTuning {
+    fn default() -> Self {
+        Self {
+            regular_auto_target_min: default_regular_auto_target_min(),
+            regular_auto_target_max: default_regular_auto_target_max(),
+            regular_bootstrap_min_keep: default_regular_bootstrap_min_keep(),
+            regular_bootstrap_rejoin_interval_ms: default_regular_bootstrap_rejoin_interval_ms(),
+            regular_exploration_interval_ms: default_regular_exploration_interval_ms(),
+            dial_retry_cooldown_ms: default_dial_retry_cooldown_ms(),
+            prune_redial_cooldown_ms: default_prune_redial_cooldown_ms(),
+            bootstrap_stable_peer_threshold: default_bootstrap_stable_peer_threshold(),
+            avoid_reseed_when_stable_bootstrap: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowTraceOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub json_packets: bool,
+    #[serde(default = "default_flow_trace_payload_preview_bytes")]
+    pub payload_preview_bytes: usize,
+}
+
+impl Default for FlowTraceOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            json_packets: false,
+            payload_preview_bytes: default_flow_trace_payload_preview_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugServerOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_debug_server_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_debug_server_push_interval_ms")]
+    pub push_interval_ms: u64,
+}
+
+impl Default for DebugServerOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_debug_server_bind_addr(),
+            push_interval_ms: default_debug_server_push_interval_ms(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeOptions {
     pub listens: DashMap<String, SocketAddr>,
@@ -63,6 +141,9 @@ pub struct NodeOptions {
     pub catalog_max_peers: Option<usize>,
     pub peer_discovery_random_fraction: f32,
     pub transport_obfuscation: HashMap<String, ObfuscationConfig>,
+    pub topology_tuning: TopologyTuning,
+    pub flow_trace: FlowTraceOptions,
+    pub debug_server: DebugServerOptions,
 }
 
 impl NodeOptions {
@@ -83,6 +164,9 @@ impl NodeOptions {
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
             transport_obfuscation: default_transport_obfuscation(),
+            topology_tuning: TopologyTuning::default(),
+            flow_trace: FlowTraceOptions::default(),
+            debug_server: DebugServerOptions::default(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -113,13 +197,19 @@ impl NodeOptions {
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
             transport_obfuscation: HashMap::new(),
+            topology_tuning: TopologyTuning::default(),
+            flow_trace: FlowTraceOptions::default(),
+            debug_server: DebugServerOptions::default(),
             logger_options: Some(LoggerOptions::default()),
         }
     }
 
-    pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {
-        let p = self.peer_connection_policy.normalized();
-        match self.node_role {
+    pub fn effective_peer_connection_policy_for(
+        peer_connection_policy: PeerConnectionPolicy,
+        role: NodeRole,
+    ) -> PeerConnectionPolicy {
+        let p = peer_connection_policy.normalized();
+        match role {
             NodeRole::Regular => p,
             NodeRole::BootstrapJoin => {
                 let target = p.target_active_peers.min(8).max(1);
@@ -132,6 +222,10 @@ impl NodeOptions {
                 .normalized()
             }
         }
+    }
+
+    pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {
+        Self::effective_peer_connection_policy_for(self.peer_connection_policy.clone(), self.node_role)
     }
 
     pub fn with_peer_connection_policy(mut self, policy: PeerConnectionPolicy) -> Self {
@@ -342,10 +436,60 @@ struct NodeOptionsFile {
     transport_obfuscation: HashMap<String, ObfuscationConfig>,
     #[serde(default)]
     transport_obfuscation_enabled: HashMap<String, bool>,
+    #[serde(default)]
+    topology_tuning: TopologyTuning,
+    #[serde(default)]
+    flow_trace: FlowTraceOptions,
+    #[serde(default)]
+    debug_server: DebugServerOptions,
 }
 
 fn default_peer_discovery_random_fraction() -> f32 {
     0.33
+}
+
+fn default_regular_auto_target_min() -> usize {
+    4
+}
+
+fn default_regular_auto_target_max() -> usize {
+    8
+}
+
+fn default_regular_bootstrap_min_keep() -> usize {
+    1
+}
+
+fn default_regular_bootstrap_rejoin_interval_ms() -> u64 {
+    20_000
+}
+
+fn default_regular_exploration_interval_ms() -> u64 {
+    20_000
+}
+
+fn default_dial_retry_cooldown_ms() -> u64 {
+    30_000
+}
+
+fn default_prune_redial_cooldown_ms() -> u64 {
+    45_000
+}
+
+fn default_bootstrap_stable_peer_threshold() -> usize {
+    4
+}
+
+fn default_flow_trace_payload_preview_bytes() -> usize {
+    32
+}
+
+fn default_debug_server_bind_addr() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+fn default_debug_server_push_interval_ms() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,6 +577,9 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
                 }
                 map
             },
+            topology_tuning: file.topology_tuning,
+            flow_trace: file.flow_trace,
+            debug_server: file.debug_server,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -581,6 +728,9 @@ impl From<&NodeOptions> for NodeOptionsFile {
                 .keys()
                 .map(|k| (k.clone(), true))
                 .collect(),
+            topology_tuning: opts.topology_tuning.clone(),
+            flow_trace: opts.flow_trace.clone(),
+            debug_server: opts.debug_server.clone(),
         }
     }
 }
