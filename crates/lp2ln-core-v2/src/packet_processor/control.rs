@@ -6,7 +6,12 @@ use crate::router::Router;
 use crate::topology::{now_ms, select_peers_for_discovery_response, PeerCatalog};
 use crate::types::PeerId;
 
-fn make_control_packet(our_peer_id: &str, receiver: &str, data: Vec<u8>) -> Packet {
+fn make_control_packet(
+    our_peer_id: &str,
+    receiver: &str,
+    data: Vec<u8>,
+    reply_to_request_id: Option<u64>,
+) -> Packet {
     Packet {
         signature: None,
         data,
@@ -14,6 +19,7 @@ fn make_control_packet(our_peer_id: &str, receiver: &str, data: Vec<u8>) -> Pack
         sender: our_peer_id.to_string(),
         receiver: receiver.to_string(),
         max_hops: 2,
+        request_id: reply_to_request_id,
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
@@ -21,7 +27,7 @@ fn make_control_packet(our_peer_id: &str, receiver: &str, data: Vec<u8>) -> Pack
 }
 
 pub async fn try_handle_control_packet(
-    data: &[u8],
+    packet: &Packet,
     our_peer_id: &str,
     from: &str,
     peer_id: &PeerId,
@@ -29,6 +35,8 @@ pub async fn try_handle_control_packet(
     router: Arc<Router>,
     peer_discovery_random_fraction: f32,
 ) -> bool {
+    let data = packet.data.as_slice();
+    let reply_to_request_id = packet.request_id;
     let Ok(ctrl) = NetworkControlPayload::decode(data) else {
         return false;
     };
@@ -57,7 +65,7 @@ pub async fn try_handle_control_packet(
                 .collect();
             let response = NetworkControlPayload::AdjacencyResponse { neighbors };
             if let Ok(encoded) = response.encode() {
-                let packet = make_control_packet(our_peer_id, from, encoded);
+                let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
                 let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
@@ -77,7 +85,7 @@ pub async fn try_handle_control_packet(
             );
             let response = NetworkControlPayload::PeersResponse { descriptors };
             if let Ok(encoded) = response.encode() {
-                let packet = make_control_packet(our_peer_id, from, encoded);
+                let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
                 let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
@@ -94,7 +102,7 @@ pub async fn try_handle_control_packet(
                 observed_rtt_ms: elapsed,
             };
             if let Ok(encoded) = resp.encode() {
-                let packet = make_control_packet(our_peer_id, from, encoded);
+                let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
                 let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }

@@ -8,6 +8,10 @@ pub struct Packet {
     pub sender: String,
     pub receiver: String,
     pub max_hops: u8,
+    /// Корреляция запрос/ответ: роутер назначает уникальный id;
+    /// ответы должны повторять id входящего запроса.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
     /// Идентификатор потока чанков (один на всё сообщение).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_stream_id: Option<u64>,
@@ -23,7 +27,15 @@ impl Packet {
     pub fn wire_size_estimate(&self) -> u64 {
         let sig = self.signature.as_ref().map(|s| s.len()).unwrap_or(0);
         let nodes: usize = self.nodes.iter().map(|s| s.len()).sum();
-        (sig + self.data.len() + self.nodes.len() * 4 + nodes + self.sender.len() + self.receiver.len() + self.max_hops as usize) as u64
+        let rid = self.request_id.map(|_| 8).unwrap_or(0);
+        (sig
+            + self.data.len()
+            + self.nodes.len() * 4
+            + nodes
+            + self.sender.len()
+            + self.receiver.len()
+            + self.max_hops as usize
+            + rid) as u64
     }
 
     pub fn is_chunk(&self) -> bool {
@@ -76,6 +88,7 @@ impl Packet {
                     sender: sender.clone(),
                     receiver: receiver.clone(),
                     max_hops: max_hops.unwrap_or(8),
+                    request_id: Some(chunk_stream_id),
                     chunk_stream_id: Some(chunk_stream_id),
                     chunk_index: Some(i as u32),
                     total_chunks: Some(total_chunks),

@@ -163,7 +163,7 @@ impl Obfuscator {
 
     fn encode_http_mimic_datagram(&self, payload: &[u8]) -> Result<Vec<u8>> {
         let mut rng = rand::rng();
-        let pad_len = bounded_usize(self.config.padding_min, self.config.padding_max);
+        let pad_len = smart_padding_len(payload.len(), &self.config);
         let mut body = Vec::with_capacity(payload.len() + pad_len);
         body.extend_from_slice(payload);
         if pad_len > 0 {
@@ -203,9 +203,29 @@ impl Obfuscator {
 }
 
 fn build_http_request(host: &str, path: &str, content_len: usize, padding_len: usize) -> String {
+    let methods = ["POST", "PUT", "PATCH"];
+    let user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    ];
+    let accept_values = ["*/*", "application/json, text/plain, */*"];
+    let content_types = [
+        "application/octet-stream",
+        "application/json",
+        "application/x-www-form-urlencoded",
+    ];
+
+    let method = methods[bounded_usize(0, methods.len() - 1)];
+    let ua = user_agents[bounded_usize(0, user_agents.len() - 1)];
+    let accept = accept_values[bounded_usize(0, accept_values.len() - 1)];
+    let content_type = content_types[bounded_usize(0, content_types.len() - 1)];
+    let request_id = random_token_hex(16);
+    let trace_id = random_token_hex(16);
+    let path = build_http_path(path);
+
     format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: keep-alive\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nX-Padding-Len: {}\r\n\r\n",
-        path, host, content_len, padding_len
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\nAccept: {accept}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: keep-alive\r\nContent-Type: {content_type}\r\nContent-Length: {content_len}\r\nX-Padding-Len: {padding_len}\r\nX-Request-Id: {request_id}\r\nX-Amzn-Trace-Id: Root=1-{trace_id}\r\n\r\n"
     )
 }
 
@@ -219,7 +239,22 @@ async fn write_chunked<W: AsyncWriteExt + Unpin>(
     let mut offset = 0usize;
 
     while offset < data.len() {
-        let requested = bounded_usize(min_chunk, max_chunk);
+        let remaining = data.len().saturating_sub(offset);
+        let requested = if remaining <= min_chunk.saturating_mul(2) {
+            remaining
+        } else {
+            let roll = bounded_usize(0, 99);
+            if roll < 15 {
+                bounded_usize(min_chunk, (min_chunk.saturating_mul(2)).min(max_chunk))
+            } else if roll < 85 {
+                bounded_usize(
+                    ((min_chunk + max_chunk) / 3).max(min_chunk),
+                    ((min_chunk + max_chunk) * 2 / 3).max(min_chunk).min(max_chunk),
+                )
+            } else {
+                bounded_usize((max_chunk / 2).max(min_chunk), max_chunk)
+            }
+        };
         let end = (offset + requested).min(data.len());
         writer.write_all(&data[offset..end]).await?;
         offset = end;
@@ -340,6 +375,55 @@ fn pick_or_default(values: &[String], fallback: &str) -> String {
     }
     let idx = rand::rng().random_range(0..values.len());
     values[idx].clone()
+}
+
+fn random_token_hex(len: usize) -> String {
+    let mut rng = rand::rng();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        let idx = rng.random_range(0..HEX.len());
+        out.push(HEX[idx] as char);
+    }
+    out
+}
+
+fn smart_padding_len(payload_len: usize, cfg: &ObfuscationConfig) -> usize {
+    let min_cfg = cfg.padding_min.min(cfg.padding_max);
+    let max_cfg = cfg.padding_max.max(cfg.padding_min);
+    if max_cfg == 0 {
+        return 0;
+    }
+    if min_cfg == max_cfg {
+        return min_cfg;
+    }
+
+    let mut rng = rand::rng();
+    let target_total = match payload_len {
+        0..=120 => rng.random_range(220..=520),
+        121..=700 => rng.random_range(700..=1400),
+        701..=1800 => rng.random_range(1200..=2500),
+        _ => payload_len + rng.random_range(96..=420),
+    };
+
+    let target_pad = target_total.saturating_sub(payload_len);
+    target_pad.clamp(min_cfg, max_cfg)
+}
+
+fn build_http_path(base_path: &str) -> String {
+    let path = if base_path.trim().is_empty() {
+        "/api/v1/ping".to_string()
+    } else {
+        base_path.to_string()
+    };
+    let sep = if path.contains('?') { "&" } else { "?" };
+    format!(
+        "{}{}v={}&r={}",
+        path,
+        sep,
+        bounded_u64(1, 9),
+        random_token_hex(8)
+    )
 }
 
 fn bounded_usize(min: usize, max: usize) -> usize {

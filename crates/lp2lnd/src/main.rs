@@ -1,4 +1,5 @@
 use core::fmt;
+mod debug_server;
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::logger::LoggerOptions;
@@ -115,11 +116,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut builder = NodeBuilder::new().add_default_transports_from_options(&options);
+    let mut db_handle: Option<Arc<P2PDatabase>> = None;
     if let Some(ref dir) = options.database_dir {
         let dir_s = dir.to_string_lossy();
         match P2PDatabase::new(dir_s.as_ref()) {
             Ok(db) => {
-                builder = builder.db(Arc::new(db));
+                let db = Arc::new(db);
+                builder = builder.db(db.clone());
+                db_handle = Some(db);
                 lp2ln_core_v2::info!("[Main] database_dir = {}", dir.display());
             }
             Err(e) => {
@@ -131,8 +135,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    let dbg_cfg = options.debug_server.clone();
     let mut node = builder.build(options)?;
     node.start().await?;
+    let node = Arc::new(node);
 
     info("[Main] Node started");
     let eff = node.effective_peer_connection_policy();
@@ -143,6 +149,16 @@ async fn main() -> anyhow::Result<()> {
         eff.max_active_peers,
         node.node_role()
     ));
+
+    let _debug_server_task = debug_server::spawn_debug_server(
+        debug_server::DebugServerConfig {
+            enabled: dbg_cfg.enabled,
+            bind_addr: dbg_cfg.bind_addr,
+            push_interval_ms: dbg_cfg.push_interval_ms,
+        },
+        node.clone(),
+        db_handle,
+    );
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

@@ -13,6 +13,9 @@ lp2ln-core-v2 = { path = "../lp2ln-core-v2" }
 tokio = { version = "1.28", features = ["full"] }
 anyhow = "1.0.89"
 serde_json = "1.0"
+base64 = "0.22"
+futures-util = "0.3"
+tokio-tungstenite = "0.23"
 console-subscriber = { version = "0.2", optional = true }
 
 [[bin]]
