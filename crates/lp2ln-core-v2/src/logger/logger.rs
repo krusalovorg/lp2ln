@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -144,6 +145,45 @@ pub fn is_error_enabled() -> bool {
     SHOW_ERROR.load(Ordering::SeqCst)
 }
 
+/// English I/O summary (avoids localized OS `Display`), plus `os error` code when present.
+pub fn format_io_error(io: &std::io::Error) -> String {
+    let label = match io.kind() {
+        ErrorKind::ConnectionRefused => "connection refused",
+        ErrorKind::ConnectionReset => "connection reset",
+        ErrorKind::ConnectionAborted => "connection aborted",
+        ErrorKind::TimedOut => "timed out",
+        ErrorKind::HostUnreachable => "host unreachable",
+        ErrorKind::NetworkUnreachable => "network unreachable",
+        ErrorKind::AddrNotAvailable => "address not available",
+        ErrorKind::AddrInUse => "address in use",
+        ErrorKind::NotConnected => "not connected",
+        ErrorKind::BrokenPipe => "broken pipe",
+        ErrorKind::UnexpectedEof => "unexpected end of stream",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::PermissionDenied => "permission denied",
+        ErrorKind::WouldBlock => "would block",
+        ErrorKind::AlreadyExists => "already exists",
+        ErrorKind::NotFound => "not found",
+        _ => "other I/O error",
+    };
+    match io.raw_os_error() {
+        Some(code) if label == "other I/O error" => format!("{:?} (os error {code})", io.kind()),
+        Some(code) => format!("{label} (os error {code})"),
+        None if label == "other I/O error" => format!("{:?}", io.kind()),
+        None => label.to_string(),
+    }
+}
+
+/// Prefer the first `std::io::Error` in an `anyhow` chain (e.g. after `.context(...)`).
+pub fn describe_anyhow_io_error(err: &anyhow::Error) -> String {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return format_io_error(io);
+        }
+    }
+    err.to_string()
+}
+
 pub fn debug(message: &str) {
     let timestamp = get_timestamp();
     let log_message = format!("[{}] [DEBUG] {}", timestamp, message);
@@ -198,6 +238,26 @@ pub fn processor(message: &str) {
     tokio::spawn(write_to_file(log_message));
 }
 
+/// Expected peer / TCP session teardown (colored on stderr).
+pub fn net_disconnect(message: &str) {
+    let timestamp = get_timestamp();
+    let log_message = format!("[{}] [NET] {}", timestamp, message);
+    if SHOW_INFO.load(Ordering::SeqCst) {
+        println!("{}", log_message.cyan().bold());
+    }
+    tokio::spawn(write_to_file(log_message));
+}
+
+/// Failed outbound dial / reachability (colored on stderr).
+pub fn net_dial(message: &str) {
+    let timestamp = get_timestamp();
+    let log_message = format!("[{}] [DIAL] {}", timestamp, message);
+    if SHOW_INFO.load(Ordering::SeqCst) {
+        println!("{}", log_message.yellow().bold());
+    }
+    tokio::spawn(write_to_file(log_message));
+}
+
 #[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => {
@@ -237,5 +297,19 @@ macro_rules! session {
 macro_rules! processor {
     ($($arg:tt)*) => {
         $crate::logger::processor(&format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! net_disconnect {
+    ($($arg:tt)*) => {
+        $crate::logger::net_disconnect(&format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! net_dial {
+    ($($arg:tt)*) => {
+        $crate::logger::net_dial(&format!($($arg)*))
     };
 }

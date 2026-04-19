@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
 import socket
+import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from queue import Empty, Queue
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import client, wire
 
 logger = logging.getLogger(__name__)
+
+_tls_asyncio_loop = threading.local()
+
+
+def _asyncio_run_on_thread_loop(coro):
+    loop = getattr(_tls_asyncio_loop, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _tls_asyncio_loop.loop = loop
+    return loop.run_until_complete(coro)
 
 
 _TCP_ADDR = re.compile(r"^tcp:\s*(.+)$", re.I)
@@ -51,6 +69,8 @@ class TopologyGraph:
     unreachable: Dict[str, str] = field(default_factory=dict)
     # (host, port), на котором реально ответил seed после опционального сканирования портов
     seed_tcp: Optional[Tuple[str, int]] = None
+    # Последний набор ws://… для debug-ws (после скана или из fixed_urls) — для повторных опросов без скана
+    debug_ws_urls: Optional[List[str]] = None
 
     def merge_descriptor(self, desc: dict[str, Any]) -> str:
         pid = str(desc.get("peer_id", ""))
@@ -85,6 +105,7 @@ def snapshot_topology_graph(g: TopologyGraph) -> TopologyGraph:
         seeds=list(g.seeds),
         unreachable=dict(g.unreachable),
         seed_tcp=g.seed_tcp,
+        debug_ws_urls=list(g.debug_ws_urls) if g.debug_ws_urls else None,
     )
 
 
@@ -108,6 +129,7 @@ def ego_session_topology(g: TopologyGraph, focus: str) -> TopologyGraph:
         seeds=seeds,
         unreachable={},
         seed_tcp=g.seed_tcp,
+        debug_ws_urls=list(g.debug_ws_urls) if g.debug_ws_urls else None,
     )
 
 
@@ -120,14 +142,23 @@ def find_lp2ln_tcp_port(
     our_peer_id: str = client.VIEWER_PEER_ID,
     connect_retries: int = 1,
     retry_backoff_s: float = 0.15,
+    scan_workers: int = 1,
 ) -> Optional[int]:
-    """Перебор портов port_lo..port_hi (включительно): первый успешный handshake LP2LN."""
+    """Перебор портов port_lo..port_hi (включительно): успешный handshake LP2LN.
+
+    При scan_workers>1 порты проверяются параллельно; возвращается минимальный открытый порт в диапазоне.
+    """
     lo = max(1, min(int(port_lo), 65535))
     hi = max(1, min(int(port_hi), 65535))
     if hi < lo:
         lo, hi = hi, lo
     retries = max(1, int(connect_retries))
-    for port in range(lo, hi + 1):
+    n_ports = hi - lo + 1
+    # На Windows параллельный скан портов легко упирается в WSAENOBUFS (10055).
+    scan_cap = 8 if sys.platform == "win32" else 32
+    workers = max(1, min(int(scan_workers), n_ports, scan_cap))
+
+    def try_one(port: int) -> Optional[int]:
         last_err: Optional[BaseException] = None
         for attempt in range(1, retries + 1):
             try:
@@ -138,7 +169,6 @@ def find_lp2ln_tcp_port(
                     sock.close()
                 except OSError:
                     pass
-                logger.info("Seed: найден ответ LP2LN на %s:%s (диапазон %s–%s)", host, port, lo, hi)
                 return port
             except (OSError, ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
                 last_err = e
@@ -150,8 +180,49 @@ def find_lp2ln_tcp_port(
             port,
             type(last_err).__name__ if last_err else "?",
         )
-    logger.warning("Seed: в диапазоне %s:%s–%s ответа LP2LN не найдено", host, lo, hi)
-    return None
+        return None
+
+    if workers == 1:
+        for port in range(lo, hi + 1):
+            r = try_one(port)
+            if r is not None:
+                logger.info("Seed: найден ответ LP2LN на %s:%s (диапазон %s–%s)", host, port, lo, hi)
+                return port
+        logger.warning("Seed: в диапазоне %s:%s–%s ответа LP2LN не найдено", host, lo, hi)
+        return None
+
+    best_lock = threading.Lock()
+    best: List[Optional[int]] = [None]
+
+    def worker() -> None:
+        while True:
+            try:
+                port = work_q.get_nowait()
+            except Empty:
+                return
+            found = try_one(port)
+            if found is None:
+                continue
+            with best_lock:
+                if best[0] is None or found < best[0]:
+                    best[0] = found
+
+    work_q: Queue[int] = Queue()
+    for p in range(lo, hi + 1):
+        work_q.put(p)
+
+    threads = [threading.Thread(target=worker, name=f"lp2ln-port-scan-{i}", daemon=True) for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    result = best[0]
+    if result is not None:
+        logger.info("Seed: найден ответ LP2LN на %s:%s (диапазон %s–%s, workers=%s)", host, result, lo, hi, workers)
+    else:
+        logger.warning("Seed: в диапазоне %s:%s–%s ответа LP2LN не найдено", host, lo, hi)
+    return result
 
 
 def fetch_topology_from_node(
@@ -341,6 +412,522 @@ def fetch_topology_from_node(
             pass
 
 
+def _debug_ws_connect_kwargs(timeout_s: float) -> Dict[str, Any]:
+    """websockets>=16 по умолчанию proxy=True → LAN ws:// часто ломается через системный HTTP-прокси."""
+    ws_timeout = max(0.2, float(timeout_s))
+    return {
+        "open_timeout": ws_timeout,
+        "close_timeout": ws_timeout,
+        "proxy": None,
+    }
+
+
+async def _debug_ws_handshake_error(url: str, timeout_s: float) -> Optional[str]:
+    """None — успешный WebSocket-handshake; иначе краткая строка ошибки."""
+    try:
+        import websockets
+    except ImportError as e:
+        raise RuntimeError(
+            "Для режима debug-ws нужен пакет 'websockets' (pip install -r requirements.txt)"
+        ) from e
+    try:
+        kw = _debug_ws_connect_kwargs(timeout_s)
+        ws_timeout = float(kw["open_timeout"])
+        async with websockets.connect(url, **kw) as ws:
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=ws_timeout)
+            except Exception:
+                pass
+        return None
+    except Exception as e:
+        logger.debug("debug-ws probe %s: %s: %s", url, type(e).__name__, e)
+        return f"{type(e).__name__}: {e}"
+
+
+async def _probe_debug_ws_url(url: str, timeout_s: float) -> bool:
+    return await _debug_ws_handshake_error(url, timeout_s) is None
+
+
+async def _scan_debug_ws_urls(
+    host: str,
+    port_lo: int,
+    port_hi: int,
+    *,
+    timeout_s: float,
+    workers: int,
+) -> List[str]:
+    lo = max(1, min(int(port_lo), 65535))
+    hi = max(1, min(int(port_hi), 65535))
+    if hi < lo:
+        lo, hi = hi, lo
+    ports = list(range(lo, hi + 1))
+    if not ports:
+        return []
+    total = len(ports)
+    sem = asyncio.Semaphore(max(1, min(int(workers), len(ports), 64)))
+    found: List[str] = []
+    scan_lock = asyncio.Lock()
+    state = {"done": 0, "hits": 0, "zero_hint": False}
+    step = max(50, min(500, total // 20 or 1))
+    w_eff = max(1, min(int(workers), total, 64))
+    logger.info(
+        "debug-ws: старт скана %s портов %s..%s (parallel=%s, probe_timeout=%.2fs, proxy=off)",
+        total,
+        lo,
+        hi,
+        w_eff,
+        max(0.25, float(timeout_s)),
+    )
+
+    async def run_one(p: int) -> None:
+        url = f"ws://{host}:{p}"
+        async with sem:
+            ok = await _probe_debug_ws_url(url, timeout_s)
+        async with scan_lock:
+            state["done"] += 1
+            d = state["done"]
+            if ok:
+                found.append(url)
+                state["hits"] += 1
+                logger.info("debug-ws: найден endpoint %s (всего найдено: %s)", url, state["hits"])
+            elif d == total or (d % step == 0):
+                logger.info(
+                    "debug-ws: прогресс скана %s/%s портов, открытых WebSocket: %s",
+                    d,
+                    total,
+                    state["hits"],
+                )
+                if (
+                    state["hits"] == 0
+                    and not state["zero_hint"]
+                    and d >= min(step, 50)
+                ):
+                    state["zero_hint"] = True
+                    logger.warning(
+                        "debug-ws: пока ни одного WS. У lp2lnd-scale debug обычно с порта 9100 "
+                        "(peer_N → 9100+N); диапазон 9090–9099 часто пуст. Сверьте --host с bind_ip "
+                        "в логах scale (127.0.0.1 vs LAN), файрвол; узко: --port 9100 --port-end 9149."
+                    )
+
+    await asyncio.gather(*(run_one(p) for p in ports))
+    found.sort(key=lambda u: int(u.rsplit(":", 1)[1]))
+    logger.info(
+        "debug-ws: скан завершён: проверено %s, найдено ws-endpoint(s): %s",
+        total,
+        len(found),
+    )
+    if found:
+        ports_preview = ", ".join(u.rsplit(":", 1)[1] for u in found[:12])
+        suffix = " …" if len(found) > 12 else ""
+        logger.info("debug-ws: порты (первые): %s%s", ports_preview, suffix)
+    else:
+        sample_p = 9100 if lo <= 9100 <= hi else lo
+        u = f"ws://{host}:{sample_p}"
+        err = await _debug_ws_handshake_error(u, timeout_s)
+        if err:
+            logger.warning("debug-ws: скан %s..%s — 0 endpoint; пример %s: %s", lo, hi, u, err)
+        else:
+            logger.warning(
+                "debug-ws: скан %s..%s — 0 endpoint, но %s подключается (несовпадение probe/сервера — редкий случай).",
+                lo,
+                hi,
+                u,
+            )
+        if lo < 9100 <= hi:
+            logger.warning(
+                "debug-ws: в диапазон включены порты <9100; у scale по умолчанию база 9100 — задайте --port 9100."
+            )
+    return found
+
+
+async def _fetch_debug_snapshot(url: str, *, timeout_s: float, request_refresh: bool) -> Dict[str, Any]:
+    try:
+        import websockets
+    except ImportError as e:
+        raise RuntimeError(
+            "Для режима debug-ws нужен пакет 'websockets' (pip install -r requirements.txt)"
+        ) from e
+
+    ws_timeout = max(0.3, float(timeout_s))
+    kw = _debug_ws_connect_kwargs(ws_timeout)
+    logger.info(
+        "debug-ws snapshot: подключение к %s (refresh_cmd=%s)",
+        url,
+        request_refresh,
+    )
+    async with websockets.connect(url, **kw) as ws:
+        if request_refresh:
+            await ws.send(json.dumps({"cmd": "refresh_snapshot"}))
+            logger.debug("debug-ws snapshot: отправлен refresh_snapshot → %s", url)
+        # Первое сообщение — hello; затем snapshot (или ответ refresh). Дайте запас > open_timeout.
+        recv_deadline_s = max(15.0, ws_timeout * 4.0)
+        deadline = time.monotonic() + recv_deadline_s
+        n_msg = 0
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"{url}: snapshot timeout")
+            msg = await asyncio.wait_for(ws.recv(), timeout=left)
+            n_msg += 1
+            if not isinstance(msg, str):
+                logger.debug("debug-ws snapshot: %s сообщение #%s не текст, пропуск", url, n_msg)
+                continue
+            try:
+                payload = json.loads(msg)
+            except json.JSONDecodeError:
+                logger.debug("debug-ws snapshot: %s сообщение #%s не JSON", url, n_msg)
+                continue
+            if not isinstance(payload, dict):
+                continue
+            ev = payload.get("event")
+            if ev == "snapshot":
+                node = payload.get("node") or {}
+                topo = payload.get("topology") or {}
+                pid = str(topo.get("self_peer_id") or node.get("peer_id") or "")[:20]
+                n_nei = len(topo.get("neighbors") or []) if isinstance(topo.get("neighbors"), list) else 0
+                logger.info(
+                    "debug-ws snapshot: %s получен snapshot (peer_id=%s…, neighbors=%s)",
+                    url,
+                    pid,
+                    n_nei,
+                )
+                return payload
+            logger.debug("debug-ws snapshot: %s сообщение #%s event=%r", url, n_msg, ev)
+
+
+def _merge_debug_snapshot_to_graph(
+    g: TopologyGraph,
+    snapshot: Dict[str, Any],
+    endpoint: str,
+    *,
+    include_catalog_edges: bool,
+) -> None:
+    node = snapshot.get("node") or {}
+    topo = snapshot.get("topology") or {}
+    self_peer = str(topo.get("self_peer_id") or node.get("peer_id") or "").strip()
+    role = str(node.get("role") or "")
+    self_bootstrap = "bootstrap" in role.lower()
+    if self_peer:
+        g.nodes[self_peer] = {
+            "peer_id": self_peer,
+            "observed_addrs": [f"debug_ws:{endpoint}"],
+            "capabilities": {"bootstrap_entry": self_bootstrap},
+            "dynamic_status": {
+                "active_connections": int(node.get("active_peers") or 0),
+                "accepts_new_sessions": True,
+            },
+        }
+        if self_bootstrap and self_peer not in g.seeds:
+            g.seeds.append(self_peer)
+
+    neighbors = topo.get("neighbors") or []
+    if isinstance(neighbors, list):
+        for n in neighbors:
+            if not isinstance(n, dict):
+                continue
+            pid = str(n.get("peer_id") or "").strip()
+            if not pid:
+                continue
+            desc = {
+                "peer_id": pid,
+                "observed_addrs": list(n.get("observed_addrs") or []),
+                "capabilities": {"bootstrap_entry": bool(n.get("bootstrap_entry", False))},
+                "dynamic_status": {
+                    "active_connections": int(n.get("active_connections") or 0),
+                    "accepts_new_sessions": bool(n.get("accepts_new_sessions", True)),
+                },
+            }
+            g.merge_descriptor(desc)
+            if bool(n.get("bootstrap_entry", False)) and pid not in g.seeds:
+                g.seeds.append(pid)
+            if include_catalog_edges and self_peer and pid != self_peer:
+                g.catalog_edges.add((self_peer, pid))
+
+    edges = topo.get("edges") or []
+    if isinstance(edges, list):
+        for e in edges:
+            if not isinstance(e, dict):
+                continue
+            if e.get("connected", True) is False:
+                continue
+            a = str(e.get("source") or "").strip()
+            b = str(e.get("target") or "").strip()
+            if not a or not b or a == b:
+                continue
+            _ensure_node_stub(g, a)
+            _ensure_node_stub(g, b)
+            g.edges.add((a, b))
+
+
+def _endpoint_from_ws_url(url: str) -> str:
+    u = (url or "").strip()
+    if "://" in u:
+        u = u.split("://", 1)[1]
+    return u
+
+
+async def _debug_ws_stream_one_url(
+    url: str,
+    g: TopologyGraph,
+    lock: asyncio.Lock,
+    *,
+    include_catalog_edges: bool,
+    request_refresh: bool,
+    timeout_s: float,
+    emit_interval_s: float,
+    stop: threading.Event,
+    progress_callback: Callable[[TopologyGraph], None],
+    emit_state: Dict[str, float],
+) -> None:
+    try:
+        import websockets
+    except ImportError:
+        logger.error("debug-ws stream: нужен пакет websockets")
+        return
+
+    backoff = 1.0
+    ep = _endpoint_from_ws_url(url)
+    while not stop.is_set():
+        try:
+            kw = _debug_ws_connect_kwargs(timeout_s)
+            async with websockets.connect(url, **kw) as ws:
+                backoff = 1.0
+                if request_refresh:
+                    await ws.send(json.dumps({"cmd": "refresh_snapshot"}))
+                while not stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict) or payload.get("event") != "snapshot":
+                        continue
+                    snap_for_ui: Optional[TopologyGraph] = None
+                    async with lock:
+                        _merge_debug_snapshot_to_graph(
+                            g, payload, ep, include_catalog_edges=include_catalog_edges
+                        )
+                        now = time.monotonic()
+                        last = float(emit_state.get("t", 0.0))
+                        if now - last >= emit_interval_s:
+                            emit_state["t"] = now
+                            snap_for_ui = snapshot_topology_graph(g)
+                    if snap_for_ui is not None:
+                        progress_callback(snap_for_ui)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if stop.is_set():
+                break
+            logger.warning("debug-ws stream %s: %s — повтор через %.1fs", url, e, backoff)
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                break
+            backoff = min(backoff * 2.0, 30.0)
+
+
+async def _debug_ws_live_streams_async(
+    urls: List[str],
+    *,
+    seed_tcp: Tuple[str, int],
+    include_catalog_edges: bool,
+    request_refresh: bool,
+    timeout_s: float,
+    emit_interval_s: float,
+    stop: threading.Event,
+    progress_callback: Callable[[TopologyGraph], None],
+) -> None:
+    urls = [u.strip() for u in urls if u and str(u).strip()]
+    if not urls:
+        return
+    g = TopologyGraph()
+    g.seed_tcp = seed_tcp
+    g.debug_ws_urls = list(urls)
+    lock = asyncio.Lock()
+    emit_state: Dict[str, float] = {"t": 0.0}
+    tasks = [
+        asyncio.create_task(
+            _debug_ws_stream_one_url(
+                url,
+                g,
+                lock,
+                include_catalog_edges=include_catalog_edges,
+                request_refresh=request_refresh,
+                timeout_s=timeout_s,
+                emit_interval_s=emit_interval_s,
+                stop=stop,
+                progress_callback=progress_callback,
+                emit_state=emit_state,
+            )
+        )
+        for url in urls
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def run_debug_ws_live_streams_blocking(
+    urls: List[str],
+    *,
+    seed_tcp: Tuple[str, int],
+    include_catalog_edges: bool,
+    request_refresh: bool,
+    timeout_s: float,
+    emit_interval_s: float,
+    stop: threading.Event,
+    progress_callback: Callable[[TopologyGraph], None],
+) -> None:
+    """Держит WebSocket на каждый endpoint: сервер пушит snapshot — мержим и зовём progress_callback."""
+    _asyncio_run_on_thread_loop(
+        _debug_ws_live_streams_async(
+            urls,
+            seed_tcp=seed_tcp,
+            include_catalog_edges=include_catalog_edges,
+            request_refresh=request_refresh,
+            timeout_s=timeout_s,
+            emit_interval_s=emit_interval_s,
+            stop=stop,
+            progress_callback=progress_callback,
+        )
+    )
+
+
+def crawl_network_debug_ws(
+    seed_host: str,
+    seed_port: int,
+    *,
+    include_catalog_edges: bool = False,
+    seed_port_end: Optional[int] = None,
+    fixed_debug_ws_urls: Optional[List[str]] = None,
+    timeout: float = 2.0,
+    scan_workers: int = 16,
+    crawl_workers: int = 8,
+    request_refresh: bool = True,
+    on_progress: Optional[Callable[[TopologyGraph], None]] = None,
+) -> TopologyGraph:
+    logger.info(
+        "Обход debug-ws: host=%s, port=%s%s, timeout=%ss, scan_workers=%s, crawl_workers=%s",
+        seed_host,
+        seed_port,
+        f"..{seed_port_end}" if seed_port_end is not None else "",
+        timeout,
+        scan_workers,
+        crawl_workers,
+    )
+    g = TopologyGraph()
+    g.seed_tcp = (seed_host, seed_port)
+
+    async def run_collect() -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+        fixed = [u.strip() for u in (fixed_debug_ws_urls or []) if u and str(u).strip()]
+        if fixed:
+            urls = fixed
+            logger.info(
+                "debug-ws: скан порта пропущен, используем %s заданных endpoint(s)",
+                len(urls),
+            )
+        elif seed_port_end is None:
+            urls = [f"ws://{seed_host}:{seed_port}"]
+        else:
+            urls = await _scan_debug_ws_urls(
+                seed_host,
+                seed_port,
+                int(seed_port_end),
+                timeout_s=max(0.25, float(timeout)),
+                workers=max(1, int(scan_workers)),
+            )
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        errors: Dict[str, str] = {}
+        if not urls:
+            return urls, snapshots, errors
+
+        w_snap = max(1, min(int(crawl_workers), len(urls), 64))
+        logger.info(
+            "debug-ws: загрузка snapshot с %s endpoint(s), parallel=%s, refresh_cmd=%s",
+            len(urls),
+            w_snap,
+            request_refresh,
+        )
+        sem = asyncio.Semaphore(w_snap)
+        lock = asyncio.Lock()
+
+        async def one(url: str) -> None:
+            try:
+                async with sem:
+                    snap = await _fetch_debug_snapshot(
+                        url,
+                        timeout_s=max(0.25, float(timeout)),
+                        request_refresh=request_refresh,
+                    )
+                async with lock:
+                    snapshots[url] = snap
+            except Exception as e:
+                logger.debug("debug-ws snapshot: ошибка %s → %s: %s", url, type(e).__name__, e)
+                async with lock:
+                    errors[url] = f"{type(e).__name__}: {e}"
+
+        await asyncio.gather(*(one(u) for u in urls))
+        if errors:
+            sample = list(errors.items())[:8]
+            logger.warning(
+                "debug-ws: не удалось получить snapshot с %s/%s endpoint(s); примеры: %s",
+                len(errors),
+                len(urls),
+                sample,
+            )
+        return urls, snapshots, errors
+
+    urls, snapshots, errors = _asyncio_run_on_thread_loop(run_collect())
+    if not urls:
+        logger.warning(
+            "debug-ws: в диапазоне %s:%s..%s ни один порт не ответил WebSocket. "
+            "Проверьте: запущен lp2lnd-scale с debug, --host совпадает с bind_ip в логах scale, "
+            "файрвол; при websockets 16+ отключён системный HTTP-прокси (proxy=None). "
+            "Широкий скан с 9090 долго даёт «0» — для N пиров: --port 9100 --port-end <9100+N−1> (50 пиров → 9149).",
+            seed_host,
+            seed_port,
+            seed_port_end,
+        )
+        g.unreachable[f"ws://{seed_host}:{seed_port}..{seed_port_end}"] = "no debug websocket in range"
+        if on_progress is not None:
+            on_progress(snapshot_topology_graph(g))
+        return g
+
+    for u, reason in sorted(errors.items()):
+        g.unreachable[u] = reason
+
+    for u, snap in snapshots.items():
+        endpoint = u.removeprefix("ws://")
+        try:
+            _merge_debug_snapshot_to_graph(g, snap, endpoint, include_catalog_edges=include_catalog_edges)
+        except Exception as e:
+            g.unreachable[u] = f"BadSnapshot: {e}"
+
+    if on_progress is not None:
+        on_progress(snapshot_topology_graph(g))
+
+    logger.info(
+        "debug-ws готово: endpoints=%s ok=%s fail=%s узлов=%s рёбер=%s",
+        len(urls),
+        len(snapshots),
+        len(errors),
+        len(g.nodes),
+        len(g.edges),
+    )
+    g.debug_ws_urls = list(urls)
+    return g
+
+
 def crawl_network(
     seed_host: str,
     seed_port: int,
@@ -357,8 +944,37 @@ def crawl_network(
     retry_backoff_s: float = 0.2,
     seed_port_end: Optional[int] = None,
     scan_probe_timeout: float = 2.0,
+    scan_workers: int = 16,
+    crawl_workers: int = 8,
+    progress_min_interval_s: float = 0.12,
     on_progress: Optional[Callable[[TopologyGraph], None]] = None,
+    source: str = "tcp",
+    debug_ws_timeout: float = 2.0,
+    debug_request_refresh: bool = True,
+    debug_ws_urls: Optional[List[str]] = None,
 ) -> TopologyGraph:
+    source_norm = (source or "tcp").strip().lower()
+    if source_norm in {"debug-ws", "debug_ws", "ws", "debug"}:
+        return crawl_network_debug_ws(
+            seed_host,
+            seed_port,
+            include_catalog_edges=include_catalog_edges,
+            seed_port_end=seed_port_end,
+            fixed_debug_ws_urls=debug_ws_urls,
+            timeout=debug_ws_timeout,
+            scan_workers=scan_workers,
+            crawl_workers=crawl_workers,
+            request_refresh=debug_request_refresh,
+            on_progress=on_progress,
+        )
+
+    # Сильный параллелизм + десятки узлов на одной машине → исчерпание ephemeral-портов / WSAENOBUFS.
+    crawl_workers_eff = max(1, min(int(crawl_workers), 16))
+    scan_workers_eff = max(1, min(int(scan_workers), 32))
+    if sys.platform == "win32":
+        crawl_workers_eff = min(crawl_workers_eff, 3)
+        scan_workers_eff = min(scan_workers_eff, 8)
+
     seed_port_hi = seed_port
     if seed_port_end is not None:
         seed_port_hi = int(seed_port_end)
@@ -380,6 +996,7 @@ def crawl_network(
             our_peer_id=our_peer_id,
             connect_retries=min(2, max(1, connect_retries)),
             retry_backoff_s=retry_backoff_s,
+            scan_workers=scan_workers_eff,
         )
         if found is None:
             g = TopologyGraph()
@@ -411,48 +1028,44 @@ def crawl_network(
     g = TopologyGraph()
     g.seed_tcp = (seed_host, seed_port)
 
-    def emit() -> None:
-        if on_progress is not None:
-            on_progress(snapshot_topology_graph(g))
+    last_progress_t = 0.0
+    progress_iv = max(0.0, float(progress_min_interval_s))
 
-    queue: List[Tuple[str, int, int]] = [(seed_host, seed_port, 0)]
+    def emit(*, force: bool = False) -> None:
+        nonlocal last_progress_t
+        if on_progress is None:
+            return
+        now = time.monotonic()
+        if not force and progress_iv > 0 and (now - last_progress_t) < progress_iv:
+            return
+        last_progress_t = now
+        on_progress(snapshot_topology_graph(g))
+
+    q: deque[Tuple[str, int, int]] = deque([(seed_host, seed_port, 0)])
     visited_addr: Set[Tuple[str, int]] = set()
     queued_addr: Set[Tuple[str, int]] = {(seed_host, seed_port)}
     crawled_peer: Set[str] = set()
     scheduled_peer: Set[str] = set()
 
-    while queue:
-        host, port, depth = queue.pop(0)
-        key = (host, port)
-        if key in visited_addr:
-            logger.debug("пропуск уже посещённого адреса %s:%s", host, port)
-            continue
-        visited_addr.add(key)
+    fetch_kw = dict(
+        limit=limit,
+        peer_rounds=peer_rounds,
+        timeout=timeout,
+        our_peer_id=our_peer_id,
+        use_descriptors=use_descriptors,
+        connect_retries=connect_retries,
+        retry_backoff_s=retry_backoff_s,
+    )
+    workers_n = max(1, min(crawl_workers_eff, 16))
 
-        try:
-            peer_id, neighbors, descs = fetch_topology_from_node(
-                host,
-                port,
-                limit=limit,
-                peer_rounds=peer_rounds,
-                timeout=timeout,
-                our_peer_id=our_peer_id,
-                use_descriptors=use_descriptors,
-                connect_retries=connect_retries,
-                retry_backoff_s=retry_backoff_s,
-            )
-        except (OSError, ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
-            logger.warning(
-                "%s:%s — ошибка: %s (%s)",
-                host,
-                port,
-                type(e).__name__,
-                e,
-            )
-            g.unreachable[f"{host}:{port}"] = f"{type(e).__name__}: {e}"
-            emit()
-            continue
-
+    def merge_fetch(
+        host: str,
+        port: int,
+        depth: int,
+        peer_id: str,
+        neighbors: List[str],
+        descs: List[Dict[str, Any]],
+    ) -> None:
         if not peer_id or peer_id in crawled_peer:
             if peer_id and peer_id in crawled_peer:
                 logger.info("%s:%s — peer уже обойден, данные сливаем в граф", host, port)
@@ -469,7 +1082,7 @@ def crawl_network(
                     else:
                         g.merge_descriptor(d)
             emit()
-            continue
+            return
         crawled_peer.add(peer_id)
         if peer_id not in g.nodes:
             g.nodes[peer_id] = {
@@ -506,10 +1119,78 @@ def crawl_network(
                 if akey in visited_addr or akey in queued_addr:
                     continue
                 queued_addr.add(akey)
-                queue.append((nh, np, depth + 1))
+                q.append((nh, np, depth + 1))
                 logger.debug("в очередь depth=%s: %s:%s (peer %s…)", depth + 1, nh, np, pid[:12])
 
         emit()
+
+    def run_one(host: str, port: int, depth: int) -> None:
+        try:
+            peer_id, neighbors, descs = fetch_topology_from_node(host, port, **fetch_kw)
+        except (OSError, ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
+            logger.warning(
+                "%s:%s — ошибка: %s (%s)",
+                host,
+                port,
+                type(e).__name__,
+                e,
+            )
+            g.unreachable[f"{host}:{port}"] = f"{type(e).__name__}: {e}"
+            emit()
+            return
+        merge_fetch(host, port, depth, peer_id, neighbors, descs)
+
+    if workers_n == 1:
+        while q:
+            host, port, depth = q.popleft()
+            key = (host, port)
+            if key in visited_addr:
+                logger.debug("пропуск уже посещённого адреса %s:%s", host, port)
+                continue
+            visited_addr.add(key)
+            run_one(host, port, depth)
+    else:
+        with ThreadPoolExecutor(max_workers=workers_n, thread_name_prefix="lp2ln-crawl") as ex:
+            while q:
+                batch: List[Tuple[str, int, int]] = []
+                while q and len(batch) < workers_n:
+                    host, port, depth = q.popleft()
+                    key = (host, port)
+                    if key in visited_addr:
+                        logger.debug("пропуск уже посещённого адреса %s:%s", host, port)
+                        continue
+                    visited_addr.add(key)
+                    batch.append((host, port, depth))
+                if not batch:
+                    if not q:
+                        break
+                    continue
+                if len(batch) == 1:
+                    h, p, d = batch[0]
+                    run_one(h, p, d)
+                    continue
+                futures = {ex.submit(fetch_topology_from_node, h, p, **fetch_kw): (h, p, d) for h, p, d in batch}
+                for fut in as_completed(futures):
+                    h, p, d = futures[fut]
+                    try:
+                        peer_id, neighbors, descs = fut.result()
+                    except (OSError, ConnectionError, TimeoutError, RuntimeError, ValueError) as e:
+                        logger.warning(
+                            "%s:%s — ошибка: %s (%s)",
+                            h,
+                            p,
+                            type(e).__name__,
+                            e,
+                        )
+                        g.unreachable[f"{h}:{p}"] = f"{type(e).__name__}: {e}"
+                        emit()
+                        continue
+                    merge_fetch(h, p, d, peer_id, neighbors, descs)
+                # Дать стеку TCP освободить очереди/TIME_WAIT между батчами.
+                if len(batch) > 1:
+                    time.sleep(0.04 * len(batch))
+
+    emit(force=True)
 
     logger.info(
         "Готово: узлов=%s, рёбер сессий=%s, рёбер каталога=%s, seeds=%s",

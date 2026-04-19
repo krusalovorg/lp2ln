@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::io::ErrorKind;
+
 use anyhow::Result;
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -8,6 +10,46 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::session::Session;
 use crate::transport::obfuscation::Obfuscator;
 use crate::transport::tcp::codec::{decode_packet, encode_packet};
+
+fn tcp_peer_display(peer_id: &Option<String>, session_id: &str) -> String {
+    match peer_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => {
+            let short: String = session_id.chars().take(8).collect();
+            format!("unknown peer, session {short}")
+        }
+    }
+}
+
+fn is_benign_tcp_disconnect(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    if msg.contains("Connection closed by peer")
+        || msg.contains("Connection closed while reading")
+        || msg.contains("Connection closed while writing")
+    {
+        return true;
+    }
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::NotConnected
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn log_tcp_session_disconnect(kind: LinkKind, peer_id: &Option<String>, session_id: &str, when: &str) {
+    let peer = tcp_peer_display(peer_id, session_id);
+    crate::net_disconnect!("[TcpSession] Node {peer} disconnected (link={kind}, {when})");
+}
 
 pub struct TcpSession {
     id: String,
@@ -50,6 +92,7 @@ impl Session for TcpSession {
     fn spawn_reader(self: Arc<Self>, incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>) {
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
+        let link_kind = self.kind();
         
         tokio::spawn(async move {
             loop {
@@ -73,7 +116,20 @@ impl Session for TcpSession {
                         }
                     }
                     Err(e) => {
-                        crate::error!("[TcpSession] Error reading packet: {}", e);
+                        if is_benign_tcp_disconnect(&e) {
+                            log_tcp_session_disconnect(
+                                link_kind,
+                                &peer_id,
+                                &session_id,
+                                "on read",
+                            );
+                        } else {
+                            crate::error!(
+                                "[TcpSession] Read error for {}: {}",
+                                tcp_peer_display(&peer_id, &session_id),
+                                e
+                            );
+                        }
                         let _ = self.close().await;
                         break;
                     }
@@ -108,13 +164,29 @@ impl TcpSession {
         let write_half_arc = Arc::new(tokio::sync::Mutex::new(write_half));
         let write_half_clone = write_half_arc.clone();
         let obfuscator_clone = obfuscator.clone();
+        let writer_peer_id = session.peer_id.clone();
+        let writer_session_id = session.id.clone();
+        let writer_kind = session.kind;
         
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 let mut writer = write_half_clone.lock().await;
                 
                 if let Err(e) = obfuscator_clone.write_frame(&mut *writer, &data).await {
-                    crate::error!("[TcpSession] Error writing frame: {}", e);
+                    if is_benign_tcp_disconnect(&e) {
+                        log_tcp_session_disconnect(
+                            writer_kind,
+                            &writer_peer_id,
+                            &writer_session_id,
+                            "on write",
+                        );
+                    } else {
+                        crate::error!(
+                            "[TcpSession] Write error for {}: {}",
+                            tcp_peer_display(&writer_peer_id, &writer_session_id),
+                            e
+                        );
+                    }
                     break;
                 }
             }

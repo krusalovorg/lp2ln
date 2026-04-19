@@ -1,48 +1,43 @@
-FROM debian:latest
+# syntax=docker/dockerfile:1
+# Образ рантайма: бинарник lp2lnd (daemon из crates/lp2lnd).
+# Конфиг: смонтируйте JSON с опциями узла в /app/options.json или передайте аргументы после имени образа.
 
-RUN apt-get update && apt-get install -y \
-    libssl-dev \
-    ca-certificates \
-    software-properties-common \
-    wget \
-    build-essential \
-    zlib1g-dev \
-    libncurses5-dev \
-    libgdbm-dev \
-    libnss3-dev \
-    libreadline-dev \
-    libffi-dev \
-    libsqlite3-dev \
-    libbz2-dev \
+FROM rust:1.85-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpcap-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем Python 3.10
-RUN wget https://www.python.org/ftp/python/3.10.13/Python-3.10.13.tgz && \
-    tar xzf Python-3.10.13.tgz && \
-    cd Python-3.10.13 && \
-    ./configure --enable-optimizations --enable-shared LDFLAGS="-Wl,-rpath /usr/local/lib" && \
-    make -j $(nproc) && \
-    make install && \
-    cd .. && \
-    rm -rf Python-3.10.13 Python-3.10.13.tgz && \
-    ldconfig
+WORKDIR /build
+
+COPY Cargo.toml ./
+COPY crates/lp2ln-core-v2 ./crates/lp2ln-core-v2
+COPY crates/lp2lnd ./crates/lp2lnd
+COPY crates/lp2ln-db-export ./crates/lp2ln-db-export
+
+RUN cargo build --release -p lp2lnd
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libpcap0.8 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/lp2lnd /usr/local/bin/lp2lnd
+
+RUN mkdir -p /app/db /app/logs \
+    && useradd --system --home-dir /app --shell /usr/sbin/nologin lp2ln \
+    && chown -R lp2ln:lp2ln /app
 
 WORKDIR /app
+USER lp2ln
 
-COPY P2P-Server .
-COPY config.toml .
-COPY signal_servers.json .
+VOLUME ["/app/db", "/app/logs"]
 
-# Устанавливаем права на выполнение
-RUN chmod +x P2P-Server
+# Порты и адреса бинда задаются в options.json (listens, debug_server).
+EXPOSE 8080/tcp 8080/udp
 
-EXPOSE 8081 8080 3031 80
-
-# Создаем директорию для хранения данных пира
-RUN mkdir -p /app/storage-peer
-
-# Используем скрипт для запуска разных конфигураций
-COPY start.sh .
-RUN chmod +x start.sh
-
-CMD ["./start.sh"]
+ENTRYPOINT ["lp2lnd"]
+CMD ["-o", "/app/options.json"]

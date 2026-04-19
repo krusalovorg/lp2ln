@@ -193,8 +193,9 @@ impl Transport for TcpTransport {
             );
         }
 
-        let stream = TcpStream::connect(addr).await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", addr, e))?;
+        let stream = TcpStream::connect(addr).await.map_err(|e| {
+            anyhow::Error::new(e).context(format!("tcp connect {}", addr))
+        })?;
         
         crate::info!("[TcpTransport] Connected to {}", addr);
         

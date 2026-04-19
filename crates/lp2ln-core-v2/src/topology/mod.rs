@@ -444,6 +444,12 @@ impl PeerCatalog {
             .is_some_and(|d| d.capabilities.bootstrap_entry)
     }
 
+    pub fn descriptor_of(&self, peer_id: &PeerId) -> Option<NodeDescriptor> {
+        self.peers
+            .get(peer_id)
+            .and_then(|r| r.descriptor.clone())
+    }
+
     pub fn upsert_descriptor(&self, descriptor: NodeDescriptor) -> Result<bool, String> {
         verify_descriptor(&descriptor)?;
         if descriptor.expires_at_ms() <= now_ms() {
@@ -637,6 +643,18 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Подходит ли пир для подсказки при перегрузке / редиректе (не только по флагу `accepts_new_sessions`).
+pub fn descriptor_ok_for_discovery_redirect(desc: &NodeDescriptor) -> bool {
+    if desc.capabilities.bootstrap_entry {
+        return true;
+    }
+    if desc.dynamic_status.accepts_new_sessions {
+        return true;
+    }
+    let cap = desc.capabilities.base_session_limit.max(1) as u32;
+    (desc.dynamic_status.active_connections as u32) < cap.saturating_sub(1)
+}
+
 pub fn select_peers_for_discovery_response(
     mut descriptors: Vec<NodeDescriptor>,
     exclude_peer_id: Option<&str>,
@@ -665,8 +683,39 @@ pub fn select_peers_for_discovery_response(
             .then_with(|| b.timestamp_ms.cmp(&a.timestamp_ms))
     });
 
-    let mut out: Vec<NodeDescriptor> = descriptors.iter().take(n_sorted).cloned().collect();
-    let mut picked: HashSet<String> = out.iter().map(|d| d.peer_id.clone()).collect();
+    let max_bootstrap_in_sorted = (n_sorted / 3).clamp(1, 3);
+    let mut out: Vec<NodeDescriptor> = Vec::with_capacity(lim);
+    let mut picked: HashSet<String> = HashSet::new();
+    let mut bootstrap_picked = 0usize;
+
+    for d in descriptors.iter().cloned() {
+        if out.len() >= n_sorted {
+            break;
+        }
+        if picked.contains(&d.peer_id) {
+            continue;
+        }
+        if d.capabilities.bootstrap_entry {
+            if bootstrap_picked >= max_bootstrap_in_sorted {
+                continue;
+            }
+            bootstrap_picked += 1;
+        }
+        picked.insert(d.peer_id.clone());
+        out.push(d);
+    }
+    if out.len() < n_sorted {
+        for d in descriptors.iter().cloned() {
+            if out.len() >= n_sorted {
+                break;
+            }
+            if picked.contains(&d.peer_id) {
+                continue;
+            }
+            picked.insert(d.peer_id.clone());
+            out.push(d);
+        }
+    }
 
     let mut rest: Vec<NodeDescriptor> = descriptors
         .into_iter()
@@ -692,13 +741,19 @@ fn discovery_descriptor_score(desc: &NodeDescriptor, requester_peer_id: &str) ->
     if desc.dynamic_status.accepts_new_sessions {
         score += 1.0;
     }
-    score += (1.0 - util.min(1.0)) * 1.4;
-    if desc.capabilities.bootstrap_entry {
-        score += 0.15;
+    score += (1.0 - util.min(1.0)) * 1.55;
+    if !desc.capabilities.bootstrap_entry {
+        score += 0.5;
     }
-    let hub_excess = (desc.dynamic_status.active_connections as f32 - 8.0).max(0.0);
-    score -= hub_excess * 0.06;
-    score + discovery_jitter(requester_peer_id, &desc.peer_id, 0.25)
+    if desc.capabilities.bootstrap_entry {
+        score += 0.08;
+    }
+    let hub_excess = (desc.dynamic_status.active_connections as f32 - 6.0).max(0.0);
+    score -= hub_excess * 0.11;
+    if desc.capabilities.bootstrap_entry && desc.dynamic_status.active_connections >= 14 {
+        score -= 0.35;
+    }
+    score + discovery_jitter(requester_peer_id, &desc.peer_id, 0.28)
 }
 
 fn discovery_jitter(requester_peer_id: &str, candidate_peer_id: &str, amplitude: f32) -> f32 {

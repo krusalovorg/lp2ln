@@ -17,7 +17,7 @@
   "peer_connection_policy": {
     "min_active_peers": 2,
     "target_active_peers": 6,
-    "max_active_peers": 16
+    "max_active_peers": 14
   },
   "peer_score_weights": {
     "w_uptime": 1.0,
@@ -59,5 +59,27 @@
   "log_peer_score_snapshot": true,
   "node_role": "regular",
   "catalog_max_peers": 4096,
-  "peer_discovery_random_fraction": 0.35
+  "peer_discovery_random_fraction": 0.35,
+  "topology_tuning": {
+    "regular_auto_target_min": 3,
+    "regular_auto_target_max": 12,
+    "regular_bootstrap_min_keep": 0,
+    "regular_bootstrap_rejoin_interval_ms": 30000,
+    "regular_exploration_interval_ms": 20000,
+    "dial_retry_cooldown_ms": 45000,
+    "prune_redial_cooldown_ms": 60000,
+    "bootstrap_stable_peer_threshold": 6,
+    "avoid_reseed_when_stable_bootstrap": true,
+    "adaptive_topology_enabled": true,
+    "adaptive_profile": "balanced",
+    "adaptive_target_min_floor": 3,
+    "adaptive_target_max_ceil": 14,
+    "adaptive_bootstrap_hard_max": 8,
+    "adaptive_exploration_interval_min_ms": 8000,
+    "adaptive_exploration_interval_max_ms": 120000,
+    "adaptive_rejoin_cooldown_min_ms": 20000,
+    "adaptive_rejoin_cooldown_max_ms": 180000,
+    "adaptive_redirect_memory_ms": 12000,
+    "adaptive_bootstrap_top_k": 2
+  }
 }

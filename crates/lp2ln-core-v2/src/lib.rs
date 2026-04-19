@@ -22,8 +22,9 @@ pub use peer_score::{
     select_storage_replicas, select_top_k,
 };
 pub use topology::{
-    now_ms, parse_observed_addr_line, select_peers_for_discovery_response, sign_descriptor,
-    sign_evidence, verify_descriptor, verify_evidence, CapacityBudget, NeighborSet, NodeCapabilities,
-    NodeDescriptor, NodeDynamicStatus, PeerCatalog, PeerEvidence, PeerView, TrustClass,
+    descriptor_ok_for_discovery_redirect, now_ms, parse_observed_addr_line,
+    select_peers_for_discovery_response, sign_descriptor, sign_evidence, verify_descriptor, verify_evidence,
+    CapacityBudget, NeighborSet, NodeCapabilities, NodeDescriptor, NodeDynamicStatus, PeerCatalog, PeerEvidence,
+    PeerView, TrustClass,
 };
 pub use metrics::{AggregatedMetricsSnapshot, MetricsAggregator, NodeHealthSnapshot, PeerHealthSnapshot};
