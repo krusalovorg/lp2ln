@@ -1,6 +1,0 @@
-# signal_server_ip = "212.109.220.163"
-signal_server_ip = "127.0.0.1"
-signal_server_port = 3031
-storage_size = 2147483648 # 2 ГБ в байтах
-proxy_ip = "127.0.0.1"
-proxy_port = 80
