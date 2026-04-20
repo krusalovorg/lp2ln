@@ -7,6 +7,16 @@ import json
 import logging
 import sys
 from collections import Counter
+from typing import Iterable, Set, Tuple
+
+
+def normalize_undirected_edges(edges: Iterable[Tuple[str, str]]) -> Set[Tuple[str, str]]:
+    out: Set[Tuple[str, str]] = set()
+    for a, b in edges:
+        if not a or not b or a == b:
+            continue
+        out.add((a, b) if a <= b else (b, a))
+    return out
 
 
 def main() -> int:
@@ -16,9 +26,35 @@ def main() -> int:
     )
     p.add_argument("--host", default="127.0.0.1", help="Адрес ноды (bootstrap или любая)")
     p.add_argument("--port", type=int, default=8080, help="TCP порт")
+    p.add_argument(
+        "--source",
+        choices=["tcp", "debug-ws"],
+        default="tcp",
+        help="Источник топологии: tcp (протокол) или debug-ws (snapshot через debug_server)",
+    )
+    p.add_argument(
+        "--port-end",
+        type=int,
+        default=None,
+        nargs="?",
+        const=18200,
+        metavar="PORT",
+        help="Верхняя граница сканирования портов seed/debug-ws (без числа: до 18200)",
+    )
     p.add_argument("--depth", type=int, default=1, help="Глубина обхода (1 = только соседи seed)")
     p.add_argument("--limit", type=int, default=64, help="Лимит дескрипторов в запросе")
     p.add_argument("--timeout", type=float, default=10.0, help="Таймаут сокета, сек")
+    p.add_argument(
+        "--debug-timeout",
+        type=float,
+        default=2.0,
+        help="Таймаут ws-подключения/snapshot в режиме --source debug-ws, сек",
+    )
+    p.add_argument(
+        "--debug-no-refresh-cmd",
+        action="store_true",
+        help="Не отправлять refresh_snapshot, ждать периодический push.",
+    )
     p.add_argument("--connect-retries", type=int, default=2, help="Повторы connect/handshake для одного адреса")
     p.add_argument("--retry-backoff", type=float, default=0.2, help="Базовая пауза между повторами, сек")
     p.add_argument(
@@ -76,6 +112,7 @@ def main() -> int:
         return crawl_network(
             args.host,
             args.port,
+            source=args.source,
             max_depth=max(1, args.depth),
             limit=max(1, min(args.limit, 256)),
             timeout=args.timeout,
@@ -84,36 +121,43 @@ def main() -> int:
             connect_retries=max(1, args.connect_retries),
             retry_backoff_s=max(0.0, args.retry_backoff),
             max_addrs_per_peer=max(1, args.max_addrs_per_peer),
+            seed_port_end=args.port_end,
+            crawl_workers=8,
+            scan_workers=16,
+            progress_min_interval_s=0.15,
+            debug_ws_timeout=max(0.25, float(args.debug_timeout)),
+            debug_request_refresh=not args.debug_no_refresh_cmd,
         )
 
     def compute_stats(g) -> dict:
         nodes = set(g.nodes.keys())
-        out = Counter(a for a, _ in g.edges)
-        inn = Counter(b for _, b in g.edges)
+        und_edges = normalize_undirected_edges(g.edges)
+        deg = Counter()
+        for a, b in und_edges:
+            deg[a] += 1
+            deg[b] += 1
         n = len(nodes)
-        m = len(g.edges)
+        m = len(und_edges)
         if n == 0:
             return {"nodes": 0, "edges": 0}
-        out_vals = [out.get(pid, 0) for pid in nodes]
-        in_vals = [inn.get(pid, 0) for pid in nodes]
+        deg_vals = [deg.get(pid, 0) for pid in nodes]
         return {
             "nodes": n,
             "edges_sessions": m,
-            "avg_out": round(sum(out_vals) / n, 3),
-            "avg_in": round(sum(in_vals) / n, 3),
-            "max_out": max(out_vals),
-            "max_in": max(in_vals),
+            "avg_degree": round(sum(deg_vals) / n, 3),
+            "max_degree": max(deg_vals),
             "unreachable": len(getattr(g, "unreachable", {})),
         }
 
     def save_json_snapshot(g) -> None:
         if not args.json_out:
             return
+        und_edges = normalize_undirected_edges(g.edges)
         snap = {
             "seeds": g.seeds,
             "nodes": g.nodes,
-            "edges": [{"from": a, "to": b} for a, b in sorted(g.edges)],
-            "edges_note": "from→to: у from активная сессия к to (AdjacencyResponse)",
+            "edges": [{"from": a, "to": b} for a, b in sorted(und_edges)],
+            "edges_note": "from-to: ненаправленное ребро сессии между двумя peer_id",
             "stats": compute_stats(g),
             "unreachable": dict(sorted(getattr(g, "unreachable", {}).items())),
         }
@@ -126,10 +170,11 @@ def main() -> int:
     if out or args.once:
         g = take_snapshot()
         save_json_snapshot(g)
+        mode_label = "debug-ws" if args.source == "debug-ws" else "TCP"
         render_topology(
             g,
             out_path=out,
-            title=f"LP2LN TCP-сессии @ {args.host}:{args.port} (depth={args.depth}, nodes={len(g.nodes)})",
+            title=f"LP2LN сессии ({mode_label}) @ {args.host}:{args.port} (depth={args.depth}, nodes={len(g.nodes)})",
         )
         return 0 if g.nodes else 2
 
@@ -143,7 +188,8 @@ def main() -> int:
             draw_topology_on_axes(
                 ax,
                 g,
-                title=f"LP2LN TCP-сессии @ {args.host}:{args.port} (depth={args.depth}, nodes={len(g.nodes)})",
+                title=f"LP2LN сессии ({'debug-ws' if args.source == 'debug-ws' else 'TCP'}) @ {args.host}:{args.port} "
+                f"(depth={args.depth}, nodes={len(g.nodes)})",
             )
             fig.tight_layout()
             fig.canvas.draw_idle()
