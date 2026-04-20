@@ -4,7 +4,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/krusalovorg/lp2ln)
 
-Decentralized P2P networking stack in Rust. The **current direction** is **`lp2ln-core-v2`**: a flat network where **peers are equal** (no special coordinator role) and **no signal servers are required**—bootstrap and discovery follow the new node model. The older **`lp2ln-core`** + **`lp2ln-gateway`** stack lives under **`archive/`** (not part of the default workspace build); it assumed a **signal server** and the classic peer architecture. **`lp2ln-gateway` is frozen for now**—active development is on finishing **v2** first; the gateway will be revisited afterward.
+Decentralized P2P networking stack in Rust. The **current direction** is **`lp2ln-core-v2`**: a flat network where **peers are equal** (no special coordinator role) and **no signal servers are required**—bootstrap and discovery follow the new node model. Legacy components were moved out to dedicated repositories (see [Related repositories](#related-repositories)).
 
 **Wiki:** [https://deepwiki.com/krusalovorg/lp2ln](https://deepwiki.com/krusalovorg/lp2ln)
 
@@ -21,7 +21,7 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
 - [Using `lp2ln-core-v2` as a library](#using-lp2ln-core-v2-as-a-library)
 - [Run](#run)
   - [`lp2lnd` (v2 node)](#lp2lnd-v2-node)
-  - [`lp2ln-gateway` (HTTP + legacy core)](#lp2ln-gateway-http--legacy-core)
+  - [`debug-ui` (web debug interface)](#debug-ui-web-debug-interface)
   - [`lp2ln-db-export`](#lp2ln-db-export)
 - [Configuration](#configuration)
 - [Development](#development)
@@ -37,15 +37,24 @@ Architecture and deeper explanations for this project are on DeepWiki:
 
 ---
 
+## Related repositories
+
+- Browser wallet extension (moved from this repo): [https://github.com/krusalovorg/lp2ln-browser-extension](https://github.com/krusalovorg/lp2ln-browser-extension)
+- Legacy code and historical stack: [https://github.com/krusalovorg/lp2ln-legacy](https://github.com/krusalovorg/lp2ln-legacy)
+- VS Code extension (moved from this repo): [https://github.com/krusalovorg/lp2ln-vscode](https://github.com/krusalovorg/lp2ln-vscode)
+
+---
+
 ## Overview
 
 | Area | Notes |
 |------|--------|
-| **Stacks** | **v2 (`lp2ln-core-v2`):** egalitarian peers, no signal server—**main focus**. **Legacy (`archive/lp2ln-core` + `archive/lp2ln-gateway`):** signal server + classic model; **frozen** until v2 is further along—not built by `cargo build --workspace`. |
+| **Stacks** | **v2 (`lp2ln-core-v2`):** egalitarian peers, no signal server—**main focus**. Legacy stack has been moved to a dedicated repository: [lp2ln-legacy](https://github.com/krusalovorg/lp2ln-legacy). |
 | **Networking** | Async I/O (Tokio), TCP/UDP transports in v2; STUN client usage in core crates |
 | **Crypto** | ECDH/ECDSA (k256), ChaCha20-Poly1305, SHA-256 |
 | **Storage** | Embedded [redb](https://github.com/cberner/redb) databases where enabled |
-| **Contracts** | WASM build target for on-chain-style modules (see `contracts/readme.md`) |
+| **Contracts** | WASM contract modules were moved to a dedicated repository; this workspace is focused on core/node crates |
+| **Debug tooling** | `debug-ui/` provides a React + Vite interface for packet/debug workflows |
 
 This repository is a **Cargo workspace**. There is no single root `src/main.rs`; binaries live under `crates/`.
 
@@ -57,18 +66,13 @@ This repository is a **Cargo workspace**. There is no single root `src/main.rs`;
 P2P-Server/
 ├── Cargo.toml              # workspace manifest
 ├── rust-toolchain.toml     # pins stable (needed for lp2ln-core-v2 edition 2024)
-├── config.toml             # legacy gateway only: signal server, storage, proxy
 ├── LICENSE
 ├── crates/
 │   ├── lp2ln-core-v2/      # current core: equal peers, no signal server, node runtime, …
 │   ├── lp2lnd/             # binary: v2 node daemon (lp2ln-core-v2)
 │   └── lp2ln-db-export/    # binary: export redb / node DB to JSON
-├── archive/                # legacy stack (excluded from workspace; optional standalone build)
-│   ├── lp2ln-core/
-│   └── lp2ln-gateway/
-├── contracts/              # WASM contract build notes
-├── tools/                  # e.g. topology-viewer (Python)
-└── vscode-extension/       # editor extension (see vscode-extension/README.md)
+├── debug-ui/               # React + Vite debug interface
+└── tools/                  # e.g. topology-viewer (Python)
 ```
 
 ---
@@ -79,8 +83,6 @@ P2P-Server/
 |-------|------|
 | **lp2ln-core-v2** | **Current** library: flat topology—**all peers are equal**; **no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, logging, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.85** (edition **2024**; see `crates/lp2ln-core-v2/Cargo.toml`). |
 | **lp2lnd** | Default entry point for the v2 stack. Loads `options.json` (or path from CLI), starts the node, waits for Ctrl+C. Optional binary: `lp2lnd-scale` (`scale_daemon.rs`). Optional feature: `tokio-console` (needs `RUSTFLAGS="--cfg tokio_unstable"`). |
-| **lp2ln-core** (archive) | **Legacy** core under `archive/lp2ln-core/`: signal-server-oriented peer stack, connection manager, tunnels, WASM runtime, etc. Not built with the main workspace. |
-| **lp2ln-gateway** (archive) | Legacy daemon under `archive/lp2ln-gateway/` on **`lp2ln-core`** (`config.toml`, `./gateway_storage`, HTTP proxy/API). **Frozen**—build only if needed via `--manifest-path` (see [Run](#run)). |
 | **lp2ln-db-export** | CLI to dump node `redb` data to JSON (`-h` for usage). Default build includes file-picker support via the `pick` feature. |
 
 ---
@@ -88,8 +90,8 @@ P2P-Server/
 ## Requirements
 
 - **Rust** toolchain **1.85+** for the workspace (`lp2ln-core-v2` uses **edition 2024**). The repo includes **`rust-toolchain.toml`** pinning **stable** so `rustup` selects a new enough toolchain in this directory.
-- **Gateway only (legacy stack in `archive/`, frozen):** if you still run it, build with `--manifest-path archive/lp2ln-gateway/Cargo.toml` and use `config.toml` in the working directory (signal server settings; repository root has an example). **v2 nodes** use `options.json` and no signal server.
-- **WASM contracts:** `rustup target add wasm32-unknown-unknown` (see `contracts/readme.md`).
+- **Node.js + pnpm** for `debug-ui` (frontend debug interface).
+- **Legacy stack and contracts:** moved to dedicated repositories (see [Related repositories](#related-repositories)).
 
 ---
 
@@ -195,17 +197,22 @@ Secondary binary (same package):
 cargo run -p lp2lnd --bin lp2lnd-scale --release
 ```
 
-### `lp2ln-gateway` (HTTP + **legacy** core)
+### `debug-ui` (web debug interface)
 
-**Status: frozen.** Maintenance and feature work on the gateway are on hold while **v2** (`lp2ln-core-v2` / `lp2lnd`) is the priority. The code may still build and run as-is.
-
-Uses **`lp2ln-core`** (signal-server model), not v2. Not a workspace member; run from a directory that contains `config.toml` (e.g. clone root):
+Runs the local React/Vite UI used for debugging and packet-building workflows.
 
 ```bash
-cargo run --manifest-path archive/lp2ln-gateway/Cargo.toml --release
+cd debug-ui
+pnpm install
+pnpm run dev
 ```
 
-`config.toml` keys include `signal_server_ip`, `signal_server_port`, `storage_size`, `proxy_ip`, and `proxy_port`.
+Optional:
+
+```bash
+pnpm run build
+pnpm run preview
+```
 
 ### `lp2ln-db-export`
 
@@ -222,15 +229,14 @@ Point it at a redb `db` file or a node data directory that contains `db`.
 | Component | File | Format |
 |-----------|------|--------|
 | **lp2lnd** / v2 node | `options.json` (or path via `-o`/`--options`) | JSON — no signal server |
-| **lp2ln-gateway** (legacy, frozen) | `config.toml` | TOML — includes `signal_server_*` |
 
 ---
 
 ## Development
 
 - **New work / v2:** `crates/lp2ln-core-v2/src/` (`node/`, `transport/`, `db/`, …)—equal peers, no signal server.
-- **Legacy gateway stack (frozen):** `archive/lp2ln-core/src/` and `archive/lp2ln-gateway/src/`—no active development until v2 matures.
-- **Docker:** a `Dockerfile` exists at the repository root but targets an older single-binary layout (`P2P-Server`, `start.sh`). Expect to adapt it if you want container builds for the current workspace outputs (`target/release/lp2lnd`, etc.).
+- **Debug UI:** `debug-ui/src/` (React + TypeScript + Vite).
+- **Docker:** a `Dockerfile` exists at the repository root but may require adaptation for current workspace outputs (`target/release/lp2lnd`, etc.).
 
 ---
 
