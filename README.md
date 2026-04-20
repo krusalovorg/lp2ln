@@ -252,4 +252,8 @@ Point it at a redb `db` file or a node data directory that contains `db`.
 
 ## License
 
-See the [`LICENSE`](LICENSE) file in this repository.
+This project is licensed under the GNU AGPLv3.
+
+Commercial licenses are available for proprietary use.
+
+Contact: krusalovorg@gmail.com
