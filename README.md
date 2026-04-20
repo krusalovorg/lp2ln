@@ -35,6 +35,11 @@ Architecture and deeper explanations for this project are on DeepWiki:
 
 [https://deepwiki.com/krusalovorg/lp2ln](https://deepwiki.com/krusalovorg/lp2ln)
 
+Additional local docs:
+
+- `lp2lnd` usage: [`crates/lp2lnd/README.md`](crates/lp2lnd/README.md)
+- `lp2lnd` configuration guide: [`crates/lp2lnd/CONFIGURATION.md`](crates/lp2lnd/CONFIGURATION.md)
+
 ---
 
 ## Related repositories
@@ -173,6 +178,11 @@ async fn main() -> anyhow::Result<()> {
 ### `lp2lnd` (v2 node)
 
 Runs on **`lp2ln-core-v2`**: **egalitarian peers**, **no signal server**—configure bootstrap / discovery via `options.json` (see `bootstrap_nodes`, `default_nodes`, etc.).
+
+Detailed docs:
+
+- runtime usage: [`crates/lp2lnd/README.md`](crates/lp2lnd/README.md)
+- config reference: [`crates/lp2lnd/CONFIGURATION.md`](crates/lp2lnd/CONFIGURATION.md)
 
 ```bash
 cargo run -p lp2lnd --release
