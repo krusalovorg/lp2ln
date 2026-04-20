@@ -1,89 +1,89 @@
-# Коммерческая лицензия LP2LN
+# LP2LN Commercial License
 
-## Обзор
+## Overview
 
-Этот документ описывает условия, на которых LP2LN может использоваться по коммерческой лицензии.
+This document outlines the terms under which LP2LN can be used under a commercial license.
 
-LP2LN распространяется по двойной лицензии:
+LP2LN is dual-licensed:
 
-* Лицензия с открытым исходным кодом: GNU AGPLv3
-* Коммерческая лицензия: проприетарные условия (данный документ)
+* Open Source License: GNU AGPLv3
+* Commercial License: Proprietary terms (this document)
 
-Если вы не можете или не хотите соблюдать условия AGPLv3, вы обязаны получить коммерческую лицензию.
-
----
-
-## Когда требуется коммерческая лицензия
-
-Вы обязаны получить коммерческую лицензию, если вы:
-
-* Используете LP2LN в проприетарном (закрытом) продукте
-* Встраиваете LP2LN в коммерческое программное решение
-* Модифицируете LP2LN и не хотите публиковать изменения на условиях AGPLv3
-* Предоставляете LP2LN как часть SaaS / хостингового сервиса без раскрытия исходного кода
-* Распространяете LP2LN как часть платного продукта или услуги
+If you are unable or unwilling to comply with the AGPLv3 terms, you must obtain a commercial license.
 
 ---
 
-## Права по коммерческой лицензии
+## When a Commercial License is Required
 
-Действующая коммерческая лицензия предоставляет вам право:
+You must obtain a commercial license if you:
 
-* Использовать LP2LN в проприетарных приложениях
-* Модифицировать исходный код без обязательства открывать ваши изменения
-* Распространять LP2LN как часть коммерческого продукта
-* Использовать LP2LN в SaaS / облачных окружениях без ограничений AGPL
-
----
-
-## Ограничения
-
-Без действующей коммерческой лицензии вы НЕ можете:
-
-* Использовать LP2LN в закрытом программном обеспечении
-* Скрывать изменения в LP2LN, если их раскрытие требуется AGPLv3
-* Предлагать сервисы на базе LP2LN без соблюдения AGPLv3
+* Use LP2LN in a proprietary (closed-source) product
+* Embed LP2LN into a commercial software solution
+* Modify LP2LN and do not want to release your modifications under AGPLv3
+* Provide LP2LN as part of a SaaS / hosted service without disclosing source code
+* Distribute LP2LN as part of a paid product or service
 
 ---
 
-## Модели лицензирования
+## Rights Granted Under Commercial License
 
-Коммерческие лицензии предлагаются по следующим моделям:
+A valid commercial license grants you the right to:
 
-* Лицензия на проект
-* Лицензия на компанию
-* SaaS-лицензия
-* Индивидуальные корпоративные соглашения
-
-Стоимость определяется индивидуально в зависимости от сценария использования, масштаба и уровня интеграции.
+* Use LP2LN in proprietary applications
+* Modify the source code without the obligation to open source your changes
+* Distribute LP2LN as part of a commercial product
+* Use LP2LN in SaaS / cloud environments without AGPL restrictions
 
 ---
 
-## Поддержка и корпоративные возможности
+## Restrictions
 
-Коммерческие клиенты могут получить:
+Without a valid commercial license, you may NOT:
 
-* Приоритетную поддержку
-* Кастомные интеграции
-* Оптимизацию производительности
-* Консалтинг по безопасности
-* Разработку функций по запросу
+* Use LP2LN in closed-source software
+* Hide modifications to LP2LN when required by AGPLv3
+* Offer LP2LN-based services without complying with AGPLv3
 
 ---
 
-## Контакты
+## Licensing Models
 
-По вопросам коммерческого лицензирования:
+Commercial licenses are offered under the following models:
+
+* Per-project license
+* Per-company license
+* SaaS license
+* Custom enterprise agreements
+
+Pricing is determined individually based on use case, scale, and integration.
+
+---
+
+## Support & Enterprise Features
+
+Commercial customers may receive:
+
+* Priority support
+* Custom integrations
+* Performance optimizations
+* Security consulting
+* Feature development on request
+
+---
+
+## Contact
+
+For commercial licensing inquiries:
 
 Email: [krusalovorg@gmail.com](mailto:krusalovorg@gmail.com)
 
 ---
 
-## Юридическое уведомление
+## Legal Notice
 
-Этот документ не является полным юридическим соглашением.
-Полный договор коммерческой лицензии предоставляется по запросу и должен быть подписан до начала использования.
+This document is not a complete legal agreement.
+A full commercial license agreement will be provided upon request and must be signed before usage.
 
 ---
 
-© 2026 Egor Dudkin. Все права защищены.
+© 2026 Egor Dudkin. All rights reserved.
