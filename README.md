@@ -1,5 +1,9 @@
 # LP2LN — Layered Peer-to-Peer Network
 
+[![MSRV](https://img.shields.io/badge/Rust-1.85%2B-93450a?logo=rust)](https://www.rust-lang.org/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/krusalovorg/lp2ln)
+
 Decentralized P2P networking stack in Rust. The **current direction** is **`lp2ln-core-v2`**: a flat network where **peers are equal** (no special coordinator role) and **no signal servers are required**—bootstrap and discovery follow the new node model. The older **`lp2ln-core`** + **`lp2ln-gateway`** stack lives under **`archive/`** (not part of the default workspace build); it assumed a **signal server** and the classic peer architecture. **`lp2ln-gateway` is frozen for now**—active development is on finishing **v2** first; the gateway will be revisited afterward.
 
 **Wiki:** [https://deepwiki.com/krusalovorg/lp2ln](https://deepwiki.com/krusalovorg/lp2ln)
