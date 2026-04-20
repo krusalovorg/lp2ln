@@ -25,6 +25,7 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
   - [`lp2ln-db-export`](#lp2ln-db-export)
 - [Configuration](#configuration)
 - [Development](#development)
+- [Why AGPL + Commercial Licensing?](#why-agpl--commercial-licensing)
 - [License](#license)
 
 ---
@@ -247,6 +248,18 @@ Point it at a redb `db` file or a node data directory that contains `db`.
 - **New work / v2:** `crates/lp2ln-core-v2/src/` (`node/`, `transport/`, `db/`, …)—equal peers, no signal server.
 - **Debug UI:** `debug-ui/src/` (React + TypeScript + Vite).
 - **Docker:** a `Dockerfile` exists at the repository root but may require adaptation for current workspace outputs (`target/release/lp2lnd`, etc.).
+
+---
+
+## Why AGPL + Commercial Licensing?
+
+LP2LN is built to support an open, decentralized internet.
+
+We want developers, researchers, and open-source communities to use, study, and improve the technology openly.
+
+At the same time, if a company wants to build a proprietary commercial product on top of LP2LN without contributing changes back, a commercial license is required.
+
+This model helps keep the core technology open while ensuring the project can be sustainably developed long-term.
 
 ---
 
