@@ -251,7 +251,10 @@ impl Router {
         self.session_manager.get_all_peers()
     }
 
-    pub async fn run(self: Arc<Self>, mut incoming_rx: mpsc::Receiver<IncomingPacket>) {
+    pub async fn run(
+        self: Arc<Self>,
+        incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
+    ) -> Result<()> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(ROUTER_PROCESS_SEMAPHORE_PERMITS));
 
         while let Some(incoming) = incoming_rx.recv().await {
@@ -289,5 +292,8 @@ impl Router {
                 processor.process(incoming, router).await;
             });
         }
+        Err(anyhow::anyhow!(
+            "router incoming channel closed; router loop stopped"
+        ))
     }
 }

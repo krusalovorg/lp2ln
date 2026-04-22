@@ -261,7 +261,7 @@ pub(crate) async fn dial_bootstrap_address(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_topology_maintenance_loop(
+pub(crate) async fn run_topology_maintenance_loop(
     policy_live_maint: Arc<RwLock<PeerConnectionPolicy>>,
     node_role: NodeRole,
     weights: PeerScoreWeights,
@@ -284,26 +284,24 @@ pub(crate) fn spawn_topology_maintenance_loop(
     maintenance_handshake_payload: Vec<u8>,
     bootstrap_targets_maint: Vec<BootstrapNode>,
     nat_state: Arc<NatTraversalState>,
-) {
-    tokio::spawn(async move {
-        let initial_jitter = (our_peer_maint.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-            % MAINTENANCE_START_JITTER_MS)
-            + 1;
-        tokio::time::sleep(Duration::from_millis(initial_jitter)).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
-        let mut dial_cooldown_until: HashMap<PeerId, u64> = HashMap::new();
-        let mut last_bootstrap_reseed_ms = 0u64;
-        let mut last_exploration_ms = 0u64;
-        let mut last_shepherd_sweep_ms = 0u64;
-        let mut bootstrap_deny_until: HashMap<SocketAddr, u64> = HashMap::new();
-        // Момент первого наблюдения peer'а на этом узле — точка отсчёта grace.
-        let mut peer_admission_ms: HashMap<PeerId, u64> = HashMap::new();
-        let descriptor_ttl_secs = 120u64;
-        let descriptor_interval = Duration::from_secs(30);
-        let mut last_publish = now_ms().saturating_sub(descriptor_interval.as_millis() as u64);
-        let mut last_policy_log_ms = 0u64;
+) -> anyhow::Result<()> {
+    let initial_jitter = (our_peer_maint.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
+        % MAINTENANCE_START_JITTER_MS)
+        + 1;
+    tokio::time::sleep(Duration::from_millis(initial_jitter)).await;
+    let mut interval = tokio::time::interval(Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
+    let mut dial_cooldown_until: HashMap<PeerId, u64> = HashMap::new();
+    let mut last_bootstrap_reseed_ms = 0u64;
+    let mut last_exploration_ms = 0u64;
+    let mut last_shepherd_sweep_ms = 0u64;
+    let mut bootstrap_deny_until: HashMap<SocketAddr, u64> = HashMap::new();
+    let mut peer_admission_ms: HashMap<PeerId, u64> = HashMap::new();
+    let descriptor_ttl_secs = 120u64;
+    let descriptor_interval = Duration::from_secs(30);
+    let mut last_publish = now_ms().saturating_sub(descriptor_interval.as_millis() as u64);
+    let mut last_policy_log_ms = 0u64;
 
-        loop {
+    loop {
             interval.tick().await;
             for nat_job in nat_state.take_punch_jobs() {
                 let mut success = false;
@@ -1150,5 +1148,4 @@ pub(crate) fn spawn_topology_maintenance_loop(
                 last_publish = now;
             }
         }
-    });
 }

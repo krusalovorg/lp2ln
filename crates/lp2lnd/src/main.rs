@@ -4,10 +4,12 @@ use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
-use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
+use lp2ln_core_v2::node::{
+    ConfigAutonomy, NodeBuilder, NodeOptions, StartupConfigSource, health_server,
+};
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 struct Args {
     options_path: String,
@@ -87,20 +89,23 @@ async fn main() -> anyhow::Result<()> {
         Some(args.options_path.clone())
     };
 
-    let mut options = if let Some(path) = options_path.as_ref() {
-        match NodeOptions::from_file(path) {
-            Ok(opts) => {
-                lp2ln_core_v2::info!("[Main] Loaded options from {}", path);
-                opts
-            }
-            Err(err) => {
-                lp2ln_core_v2::error!("[Main] Error reading options '{}': {}", path, err);
-                developer_options()
-            }
+    let config_engine = ConfigAutonomy::new(options_path.as_ref().map(PathBuf::from));
+    let startup = config_engine.load_startup(developer_options)?;
+    let mut options = startup.options;
+    if let Some(reason) = startup.degraded_reason.as_ref() {
+        lp2ln_core_v2::warn!("[Main] startup in degraded mode: {}", reason);
+    }
+    match startup.source {
+        StartupConfigSource::PrimaryConfig => {
+            lp2ln_core_v2::info!("[Main] Config loaded transactionally");
         }
-    } else {
-        developer_options()
-    };
+        StartupConfigSource::LastKnownGood => {
+            lp2ln_core_v2::warn!("[Main] Rolled back to last-known-good config");
+        }
+        StartupConfigSource::DeveloperDefaults => {
+            lp2ln_core_v2::warn!("[Main] Running with developer defaults");
+        }
+    }
 
     if options.database_dir.is_none() {
         let default_db_dir = PathBuf::from("./db");
@@ -109,10 +114,6 @@ async fn main() -> anyhow::Result<()> {
             default_db_dir.display()
         );
         options.database_dir = Some(default_db_dir);
-    }
-
-    if let Some(path) = options_path.as_ref() {
-        let _ = options.save(path);
     }
 
     let mut builder = NodeBuilder::new().add_default_transports_from_options(&options);
@@ -136,9 +137,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let dbg_cfg = options.debug_server.clone();
-    let mut node = builder.build(options)?;
+    let mut node = builder.build(options.clone())?;
     node.start().await?;
     let node = Arc::new(node);
+    let applied_options = Arc::new(RwLock::new(options.clone()));
 
     info("[Main] Node started");
     let eff = node.effective_peer_connection_policy();
@@ -159,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         node.clone(),
         db_handle,
     );
+    let _health_task = health_server::spawn_health_server(node.clone(), None);
+    let _config_watcher_task = config_engine.spawn_runtime_config_watcher(node.clone(), applied_options);
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

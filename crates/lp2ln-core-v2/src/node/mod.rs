@@ -6,6 +6,8 @@ pub mod distribution;
 pub mod incoming_sessions;
 pub mod nat_traversal;
 pub mod topology_maintenance;
+pub mod autonomy;
+pub mod health_server;
 
 pub mod connection_strategy {
     pub use super::distribution::*;
@@ -14,4 +16,5 @@ pub mod connection_strategy {
 
 pub use builder::NodeBuilder;
 pub use options::{NodeOptions, NodeRole};
-pub use runtime::NodeRuntime;
+pub use runtime::{NodeRuntime, RuntimeHealthSnapshot, RuntimeMode};
+pub use autonomy::{ConfigAutonomy, StartupConfigResult, StartupConfigSource, ValidationReport};

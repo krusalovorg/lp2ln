@@ -162,8 +162,8 @@ pub async fn send_discovery_redirect_and_close_with_preamble(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_incoming_session_handler(
-    mut incoming_sessions_rx: tokio::sync::mpsc::Receiver<Arc<dyn Session>>,
+pub(crate) async fn run_incoming_session_handler(
+    incoming_sessions_rx: &mut tokio::sync::mpsc::Receiver<Arc<dyn Session>>,
     session_manager: Arc<SessionManager>,
     router_for_incoming: Arc<Router>,
     our_peer_id_for_incoming: String,
@@ -175,15 +175,14 @@ pub(crate) fn spawn_incoming_session_handler(
     incoming_topology_tuning: TopologyTuning,
     incoming_discovery_random_fraction: f32,
     incoming_packets_tx_for_sessions: tokio::sync::mpsc::Sender<IncomingPacket>,
-) {
-    tokio::spawn(async move {
-        let mut last_rotation_ms = 0u64;
-        let mut recent_redirect_until: std::collections::HashMap<PeerId, u64> =
-            std::collections::HashMap::new();
-        let mut recent_bootstrap_hints: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        let mut fairness_window_started_ms = now_ms();
-        while let Some(session) = incoming_sessions_rx.recv().await {
+) -> anyhow::Result<()> {
+    let mut last_rotation_ms = 0u64;
+    let mut recent_redirect_until: std::collections::HashMap<PeerId, u64> =
+        std::collections::HashMap::new();
+    let mut recent_bootstrap_hints: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut fairness_window_started_ms = now_ms();
+    while let Some(session) = incoming_sessions_rx.recv().await {
             let incoming_policy = NodeOptions::effective_peer_connection_policy_for(
                 policy_live_incoming.read().unwrap().clone(),
                 incoming_node_role,
@@ -484,6 +483,8 @@ pub(crate) fn spawn_incoming_session_handler(
                     }
                 }
             }
-        }
-    });
+    }
+    Err(anyhow::anyhow!(
+        "incoming sessions channel closed; incoming loop stopped"
+    ))
 }

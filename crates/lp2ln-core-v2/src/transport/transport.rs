@@ -34,6 +34,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct TransportContext {
     pub incoming_sessions_tx: mpsc::Sender<Arc<dyn Session>>,
     pub incoming_packets_tx: mpsc::Sender<IncomingPacket>,

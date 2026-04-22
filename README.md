@@ -247,7 +247,37 @@ Point it at a redb `db` file or a node data directory that contains `db`.
 
 - **New work / v2:** `crates/lp2ln-core-v2/src/` (`node/`, `transport/`, `db/`, …)—equal peers, no signal server.
 - **Debug UI:** `debug-ui/src/` (React + TypeScript + Vite).
-- **Docker:** a `Dockerfile` exists at the repository root but may require adaptation for current workspace outputs (`target/release/lp2lnd`, etc.).
+- **Docker:** two production Dockerfiles are available at repo root:
+  - `Dockerfile` — full multi-stage build from source.
+  - `Dockerfile.binary` — runtime-only image from a prebuilt `lp2lnd` binary.
+
+### Docker
+
+Build from source (multi-stage):
+
+```bash
+docker build -f Dockerfile -t lp2lnd:source .
+```
+
+Build from prebuilt binary:
+
+```bash
+cargo build --release -p lp2lnd
+mkdir -p dist
+cp target/release/lp2lnd dist/lp2lnd
+docker build -f Dockerfile.binary --build-arg BIN_PATH=dist/lp2lnd -t lp2lnd:binary .
+```
+
+Run example:
+
+```bash
+docker run --rm \
+  -p 8080:8080/tcp -p 8080:8080/udp -p 9088:9088 \
+  -v "$(pwd)/crates/lp2lnd/options-client.json:/app/options.json:ro" \
+  -v "$(pwd)/data/db:/app/db" \
+  -v "$(pwd)/data/logs:/app/logs" \
+  lp2lnd:binary
+```
 
 ---
 

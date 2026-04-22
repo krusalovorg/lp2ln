@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1.7
+# Runtime-only image: expects prebuilt lp2lnd binary in build context.
+# Build example:
+#   cargo build --release -p lp2lnd
+#   cp target/release/lp2lnd dist/lp2lnd
+#   docker build -f Dockerfile.binary --build-arg BIN_PATH=dist/lp2lnd -t lp2lnd:binary .
+
+FROM debian:bookworm-slim
+
+ARG BIN_PATH=dist/lp2lnd
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libpcap0.8 \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${BIN_PATH} /usr/local/bin/lp2lnd
+
+RUN mkdir -p /app/db /app/logs \
+    && useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin lp2ln \
+    && chown -R lp2ln:lp2ln /app \
+    && chmod +x /usr/local/bin/lp2lnd
+
+WORKDIR /app
+USER lp2ln
+
+ENV RUST_BACKTRACE=0 \
+    LP2LND_HEALTH_ADDR=127.0.0.1:9088
+
+VOLUME ["/app/db", "/app/logs"]
+
+EXPOSE 8080/tcp 8080/udp 9088/tcp
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=5 \
+  CMD curl -fsS "http://${LP2LND_HEALTH_ADDR}/readyz" || exit 1
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["tini", "--", "lp2lnd"]
+CMD ["-o", "/app/options.json"]

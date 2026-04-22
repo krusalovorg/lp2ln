@@ -1,20 +1,22 @@
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use dashmap::DashMap;
+use futures::FutureExt;
 use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
 use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
-use crate::node::incoming_sessions::spawn_incoming_session_handler;
+use crate::node::incoming_sessions::run_incoming_session_handler;
 use crate::node::nat_traversal::NatTraversalState;
 use crate::node::options::{NodeOptions, NodeRole};
-use crate::node::topology_maintenance::{dial_bootstrap_address, spawn_topology_maintenance_loop};
+use crate::node::topology_maintenance::{dial_bootstrap_address, run_topology_maintenance_loop};
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
@@ -30,6 +32,67 @@ use crate::types::{PeerId, SessionId};
 use crate::logger;
 use crate::peer_score::PeerConnectionPolicy;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Normal,
+    Degraded,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeHealthSnapshot {
+    pub mode: RuntimeMode,
+    pub router_restarts: u64,
+    pub transport_restarts: u64,
+    pub incoming_restarts: u64,
+    pub topology_restarts: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct RuntimeHealthState {
+    router_restarts: AtomicU64,
+    transport_restarts: AtomicU64,
+    incoming_restarts: AtomicU64,
+    topology_restarts: AtomicU64,
+    degraded: AtomicBool,
+    last_error: RwLock<Option<String>>,
+}
+
+impl RuntimeHealthState {
+    fn record_error(&self, subsystem: &str, err: impl Into<String>) {
+        let msg = format!("[{}] {}", subsystem, err.into());
+        if let Ok(mut w) = self.last_error.write() {
+            *w = Some(msg.clone());
+        }
+        self.degraded.store(true, Ordering::Relaxed);
+        crate::warn!("[NodeRuntime] subsystem degraded: {}", msg);
+    }
+
+    fn mark_healthy(&self) {
+        self.degraded.store(false, Ordering::Relaxed);
+        if let Ok(mut w) = self.last_error.write() {
+            *w = None;
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeHealthSnapshot {
+        let mode = if self.degraded.load(Ordering::Relaxed) {
+            RuntimeMode::Degraded
+        } else {
+            RuntimeMode::Normal
+        };
+        let last_error = self.last_error.read().ok().and_then(|v| v.clone());
+        RuntimeHealthSnapshot {
+            mode,
+            router_restarts: self.router_restarts.load(Ordering::Relaxed),
+            transport_restarts: self.transport_restarts.load(Ordering::Relaxed),
+            incoming_restarts: self.incoming_restarts.load(Ordering::Relaxed),
+            topology_restarts: self.topology_restarts.load(Ordering::Relaxed),
+            last_error,
+        }
+    }
+}
+
 pub struct NodeRuntime {
     _db: Option<Arc<P2PDatabase>>,
     _options: NodeOptions,
@@ -44,6 +107,7 @@ pub struct NodeRuntime {
     descriptor_version: Arc<AtomicU64>,
     router: Option<Arc<Router>>,
     incoming_sessions_tx: Option<mpsc::Sender<Arc<dyn Session>>>,
+    health: Arc<RuntimeHealthState>,
 }
 
 impl NodeRuntime {
@@ -112,6 +176,7 @@ impl NodeRuntime {
             descriptor_version: Arc::new(AtomicU64::new(1)),
             router: None,
             incoming_sessions_tx: None,
+            health: Arc::new(RuntimeHealthState::default()),
         }
     }
 
@@ -450,19 +515,50 @@ impl NodeRuntime {
         self.session_manager.debug_sessions()
     }
 
+    fn read_policy_lock(&self) -> PeerConnectionPolicy {
+        match self.peer_connection_policy_live.read() {
+            Ok(g) => g.clone(),
+            Err(poison) => {
+                self.health
+                    .record_error("policy_lock", "peer policy lock poisoned on read");
+                poison.into_inner().clone()
+            }
+        }
+    }
+
+    fn write_policy_lock(&self, policy: PeerConnectionPolicy) {
+        match self.peer_connection_policy_live.write() {
+            Ok(mut g) => *g = policy,
+            Err(poison) => {
+                self.health
+                    .record_error("policy_lock", "peer policy lock poisoned on write");
+                let mut g = poison.into_inner();
+                *g = policy;
+            }
+        }
+    }
+
     pub fn peer_connection_policy(&self) -> PeerConnectionPolicy {
-        self.peer_connection_policy_live.read().unwrap().clone()
+        self.read_policy_lock()
     }
 
     pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {
-        let base = self.peer_connection_policy_live.read().unwrap().clone();
+        let base = self.read_policy_lock();
         NodeOptions::effective_peer_connection_policy_for(base, self._options.node_role)
     }
 
     pub fn set_peer_connection_policy(&self, policy: PeerConnectionPolicy) -> PeerConnectionPolicy {
         let n = policy.normalized();
-        *self.peer_connection_policy_live.write().unwrap() = n.clone();
+        self.write_policy_lock(n.clone());
         n
+    }
+
+    pub fn health_snapshot(&self) -> RuntimeHealthSnapshot {
+        self.health.snapshot()
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.health.snapshot().mode == RuntimeMode::Degraded
     }
 
     pub fn node_role(&self) -> NodeRole {
@@ -492,17 +588,41 @@ impl NodeRuntime {
         let (incoming_sessions_tx, incoming_sessions_rx) =
             mpsc::channel(ROUTER_INCOMING_QUEUE_CAP);
         let signing_key = Some(Arc::new(self.keypair.signing_key().clone()));
-        let router = {
-            let (router, incoming_packets_rx) = Router::new(
-                self.session_manager.clone(),
-                self.packet_processor.clone(),
-                signing_key,
-                self.keypair.peer_id(),
-            );
-            let router = Arc::new(router);
-            tokio::spawn(router.clone().run(incoming_packets_rx));
-            router
-        };
+        let (router_raw, mut incoming_packets_rx) = Router::new(
+            self.session_manager.clone(),
+            self.packet_processor.clone(),
+            signing_key,
+            self.keypair.peer_id(),
+        );
+        let router = Arc::new(router_raw);
+        {
+            let router_loop = router.clone();
+            let health = self.health.clone();
+            tokio::spawn(async move {
+                let mut backoff = Duration::from_millis(500);
+                loop {
+                    let result = AssertUnwindSafe(router_loop.clone().run(&mut incoming_packets_rx))
+                        .catch_unwind()
+                        .await;
+                    match result {
+                        Ok(Ok(_)) => {
+                            health.mark_healthy();
+                            backoff = Duration::from_millis(500);
+                        }
+                        Ok(Err(err)) => {
+                            health.router_restarts.fetch_add(1, Ordering::Relaxed);
+                            health.record_error("router", err.to_string());
+                        }
+                        Err(_) => {
+                            health.router_restarts.fetch_add(1, Ordering::Relaxed);
+                            health.record_error("router", "panic in router loop");
+                        }
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(15));
+                }
+            });
+        }
         self.router = Some(router.clone());
         let flow_trace_enabled_from_env = std::env::var("LP2LN_TRACE_FLOW")
             .map(|v| {
@@ -678,16 +798,50 @@ impl NodeRuntime {
             };
             let transport_clone = transport.clone();
             let transport_name = transport.name();
+            let health = self.health.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = transport_clone.start(ctx_clone).await {
-                    crate::error!("[NodeRuntime] Failed to start transport {}: {}", transport_name, e);
-                } else {
-                    crate::info!(
-                        "[NodeRuntime] Transport {} started on {}",
-                        transport_name,
-                        listen_addr.unwrap()
-                    );
+                let mut backoff = Duration::from_millis(500);
+                loop {
+                    match transport_clone.start(ctx_clone.clone()).await {
+                        Ok(bound) => {
+                            let started_addr = bound.or(listen_addr);
+                            if let Some(addr) = started_addr {
+                                crate::info!(
+                                    "[NodeRuntime] Transport {} started on {}",
+                                    transport_name,
+                                    addr
+                                );
+                            } else {
+                                crate::info!("[NodeRuntime] Transport {} started", transport_name);
+                            }
+                            health.mark_healthy();
+                            break;
+                        }
+                        Err(e) => {
+                            health.transport_restarts.fetch_add(1, Ordering::Relaxed);
+                            health.record_error(
+                                "transport",
+                                format!("{} failed to start: {}", transport_name, e),
+                            );
+                            if let Some(addr) = listen_addr {
+                                crate::warn!(
+                                    "[NodeRuntime] restarting transport {} on {} after {:?}",
+                                    transport_name,
+                                    addr,
+                                    backoff
+                                );
+                            } else {
+                                crate::warn!(
+                                    "[NodeRuntime] restarting transport {} after {:?}",
+                                    transport_name,
+                                    backoff
+                                );
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(15));
+                        }
+                    }
                 }
             });
         }
@@ -703,20 +857,45 @@ impl NodeRuntime {
         let incoming_node_role = self._options.node_role;
         let incoming_topology_tuning = self._options.topology_tuning.clone();
         let incoming_discovery_random_fraction = self._options.peer_discovery_random_fraction;
-        spawn_incoming_session_handler(
-            incoming_sessions_rx,
-            session_manager,
-            router_for_incoming,
-            our_peer_id_for_incoming,
-            policy_live_incoming,
-            incoming_catalog,
-            incoming_peer_store,
-            incoming_weights,
-            incoming_node_role,
-            incoming_topology_tuning,
-            incoming_discovery_random_fraction,
-            incoming_packets_tx_for_sessions,
-        );
+        let health_incoming = self.health.clone();
+        tokio::spawn(async move {
+            let mut incoming_sessions_rx = incoming_sessions_rx;
+            let mut backoff = Duration::from_millis(500);
+            loop {
+                let result = AssertUnwindSafe(run_incoming_session_handler(
+                    &mut incoming_sessions_rx,
+                    session_manager.clone(),
+                    router_for_incoming.clone(),
+                    our_peer_id_for_incoming.clone(),
+                    policy_live_incoming.clone(),
+                    incoming_catalog.clone(),
+                    incoming_peer_store.clone(),
+                    incoming_weights.clone(),
+                    incoming_node_role,
+                    incoming_topology_tuning.clone(),
+                    incoming_discovery_random_fraction,
+                    incoming_packets_tx_for_sessions.clone(),
+                ))
+                .catch_unwind()
+                .await;
+                match result {
+                    Ok(Ok(_)) => {
+                        backoff = Duration::from_millis(500);
+                        health_incoming.mark_healthy();
+                    }
+                    Ok(Err(err)) => {
+                        health_incoming.incoming_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_incoming.record_error("incoming_loop", err.to_string());
+                    }
+                    Err(_) => {
+                        health_incoming.incoming_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_incoming.record_error("incoming_loop", "panic in incoming loop");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(15));
+            }
+        });
 
         let peer_scores_for_order = self.session_manager.peer_score_store();
         let bootstrap_targets = ordered_bootstrap_targets(&self._options, peer_scores_for_order.as_ref());
@@ -789,31 +968,56 @@ impl NodeRuntime {
             .collect();
         maint_obf_protocols.sort();
         let maintenance_handshake_payload = handshake::encode_hello(maint_obf_protocols);
+        let nat_state_maint = self.nat_state.clone();
 
-        spawn_topology_maintenance_loop(
-            policy_live_maint,
-            node_role,
-            weights,
-            sm,
-            dial_book,
-            peer_store,
-            catalog,
-            db,
-            listens,
-            advertise_addrs,
-            advertise_fallback_ip,
-            transports_maint,
-            router_maint,
-            incoming_maint,
-            our_peer_maint,
-            descriptor_ver,
-            signing_key,
-            log_peer_scores,
-            topology_tuning,
-            maintenance_handshake_payload,
-            bootstrap_targets_maint,
-            self.nat_state.clone(),
-        );
+        let health_maint = self.health.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(500);
+            loop {
+                let result = AssertUnwindSafe(run_topology_maintenance_loop(
+                    policy_live_maint.clone(),
+                    node_role,
+                    weights.clone(),
+                    sm.clone(),
+                    dial_book.clone(),
+                    peer_store.clone(),
+                    catalog.clone(),
+                    db.clone(),
+                    listens.clone(),
+                    advertise_addrs.clone(),
+                    advertise_fallback_ip,
+                    transports_maint.clone(),
+                    router_maint.clone(),
+                    incoming_maint.clone(),
+                    our_peer_maint.clone(),
+                    descriptor_ver.clone(),
+                    signing_key.clone(),
+                    log_peer_scores,
+                    topology_tuning.clone(),
+                    maintenance_handshake_payload.clone(),
+                    bootstrap_targets_maint.clone(),
+                    nat_state_maint.clone(),
+                ))
+                .catch_unwind()
+                .await;
+                match result {
+                    Ok(Ok(_)) => {
+                        backoff = Duration::from_millis(500);
+                        health_maint.mark_healthy();
+                    }
+                    Ok(Err(err)) => {
+                        health_maint.topology_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_maint.record_error("topology_loop", err.to_string());
+                    }
+                    Err(_) => {
+                        health_maint.topology_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_maint.record_error("topology_loop", "panic in topology loop");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(15));
+            }
+        });
 
         Ok(())
     }
