@@ -226,7 +226,11 @@ impl Transport for UdpTransport {
     async fn get_public_address(&self, local_port: u16) -> Result<PublicAddress> {
         crate::info!("[UdpTransport] Getting public address via STUN for port {}", local_port);
         
-        let (ip, port) = self.stun_client.get_public_address(local_port).await;
+        let (ip, port) = self
+            .stun_client
+            .get_public_address(local_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("STUN lookup failed: {}", e))?;
         
         Ok(PublicAddress { ip, port })
     }

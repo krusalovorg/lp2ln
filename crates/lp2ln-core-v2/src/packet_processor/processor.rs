@@ -1,7 +1,14 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
+use crate::crypto::secure_channel::{
+    decode_secure_envelope, derive_shared_key, is_secure_envelope, ReplayWindow,
+};
 use crate::crypto::signature::verify_packet;
+use crate::crypto::NodeKeypair;
+use crate::node::nat_traversal::NatTraversalState;
 use crate::router::Router;
 use crate::sessions::IncomingPacket;
 use crate::topology::PeerCatalog;
@@ -20,6 +27,9 @@ pub struct DefaultPacketProcessor {
     allow_unsigned_packets: bool,
     peer_catalog: Arc<PeerCatalog>,
     peer_discovery_random_fraction: f32,
+    nat_state: Arc<NatTraversalState>,
+    local_keypair: NodeKeypair,
+    replay_windows: Arc<DashMap<String, ReplayWindow>>,
 }
 
 impl DefaultPacketProcessor {
@@ -28,12 +38,17 @@ impl DefaultPacketProcessor {
         allow_unsigned_packets: bool,
         peer_catalog: Arc<PeerCatalog>,
         peer_discovery_random_fraction: f32,
+        nat_state: Arc<NatTraversalState>,
+        local_keypair: NodeKeypair,
     ) -> Self {
         Self {
             our_peer_id: our_peer_id.into(),
             allow_unsigned_packets,
             peer_catalog,
             peer_discovery_random_fraction: peer_discovery_random_fraction.clamp(0.0, 0.9),
+            nat_state,
+            local_keypair,
+            replay_windows: Arc::new(DashMap::new()),
         }
     }
 }
@@ -41,43 +56,97 @@ impl DefaultPacketProcessor {
 #[async_trait]
 impl PacketProcessor for DefaultPacketProcessor {
     async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>) {
+        let mut packet = incoming_packet.packet.clone();
         if !self.allow_unsigned_packets {
-            if let Err(e) = verify_packet(&incoming_packet.packet) {
+            if let Err(e) = verify_packet(&packet) {
                 crate::processor!(
                     "Invalid or missing signature, dropping packet from {}: {}",
-                    incoming_packet.packet.sender, e
+                    packet.sender, e
                 );
                 return;
             }
         }
 
         let session_id = SessionId::from(incoming_packet.session_id.clone());
+
+        if let Some(bound_peer) = incoming_packet.from_node.as_deref() {
+            if bound_peer != packet.sender {
+                crate::processor!(
+                    "Session peer_id mismatch: bound={} packet.sender={}, dropping",
+                    bound_peer,
+                    packet.sender
+                );
+                return;
+            }
+        }
+
+        if is_secure_envelope(&packet.data)
+            && (packet.receiver == self.our_peer_id || packet.receiver.is_empty())
+        {
+            let key = match derive_shared_key(self.local_keypair.signing_key(), &packet.sender) {
+                Ok(k) => k,
+                Err(e) => {
+                    crate::processor!(
+                        "Failed to derive secure key from {}: {}",
+                        packet.sender,
+                        e
+                    );
+                    return;
+                }
+            };
+            let (seq, plaintext) = match decode_secure_envelope(&packet.data, key) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::processor!(
+                        "Failed to decrypt secure envelope from {}: {}",
+                        packet.sender,
+                        e
+                    );
+                    return;
+                }
+            };
+            let mut window = self
+                .replay_windows
+                .entry(packet.sender.clone())
+                .or_default();
+            if !window.check_and_record(seq) {
+                crate::processor!(
+                    "Replay detected from {} with seq {}, dropping",
+                    packet.sender,
+                    seq
+                );
+                return;
+            }
+            packet.data = plaintext;
+        }
+
         let from = incoming_packet
             .from_node
             .as_deref()
-            .unwrap_or_else(|| incoming_packet.packet.sender.as_str());
+            .unwrap_or_else(|| packet.sender.as_str());
         let peer_id = PeerId::from_str(from);
         router.set_peer_for_session(session_id.clone(), peer_id.clone());
 
-        let receiver = incoming_packet.packet.receiver.clone();
+        let receiver = packet.receiver.clone();
 
         if receiver == self.our_peer_id || receiver.is_empty() {
             if super::control::try_handle_control_packet(
-                &incoming_packet.packet,
+                &packet,
                 &self.our_peer_id,
                 from,
                 &peer_id,
                 self.peer_catalog.as_ref(),
                 router.clone(),
                 self.peer_discovery_random_fraction,
+                self.nat_state.clone(),
             )
             .await
             {
                 return;
             }
             super::local::handle_local_packet(
-                &incoming_packet.packet.data,
-                incoming_packet.packet.request_id,
+                &packet.data,
+                packet.request_id,
                 &self.our_peer_id,
                 from,
                 &peer_id,
@@ -88,7 +157,7 @@ impl PacketProcessor for DefaultPacketProcessor {
             .await;
         } else {
             super::forwarding::forward_packet(
-                incoming_packet.packet,
+                packet,
                 incoming_packet.session_id.as_str(),
                 &self.our_peer_id,
                 &peer_id,

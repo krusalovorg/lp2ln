@@ -4,7 +4,9 @@ use std::io::ErrorKind;
 use anyhow::Result;
 use tokio::net::TcpStream;
 use uuid::Uuid;
+use crate::crypto::signature::verify_packet;
 use crate::packet::Packet;
+use crate::protocol::handshake::decode_hello;
 use crate::sessions::session::IncomingPacket;
 use crate::sessions::session::LinkKind;
 use crate::sessions::session::Session;
@@ -208,6 +210,16 @@ impl TcpSession {
     ) -> Result<String> {
         let frame_data = obfuscator.read_frame(stream).await?;
         let packet = decode_packet(frame_data)?;
+        verify_packet(&packet).map_err(anyhow::Error::msg)?;
+        if decode_hello(&packet.data).is_none() {
+            return Err(anyhow::anyhow!(
+                "Invalid handshake payload from {}",
+                packet.sender
+            ));
+        }
+        if packet.sender.is_empty() {
+            return Err(anyhow::anyhow!("Handshake sender is empty"));
+        }
         Ok(packet.sender)
     }
     

@@ -1,8 +1,9 @@
 {
   "listens": {
-    "udp": "192.168.0.16:18190",
-    "tcp": "192.168.0.16:18090"
+    "tcp": "0.0.0.0:18090",
+    "udp": "0.0.0.0:18190"
   },
+  "advertise_addrs": null,
   "default_nodes": [],
   "private_key_hex": null,
   "allow_unsigned_packets": true,
@@ -34,21 +35,21 @@
   "bootstrap_peer_hints": null,
   "bootstrap_nodes": [
     {
-      "addr": "192.168.0.16:18080",
+      "addr": "127.0.0.1:18080",
       "protocols": [
         "tcp"
       ],
       "peer_id_hint": null
     },
     {
-      "addr": "192.168.0.16:18081",
+      "addr": "127.0.0.1:18081",
       "protocols": [
         "tcp"
       ],
       "peer_id_hint": null
     },
     {
-      "addr": "192.168.0.16:18082",
+      "addr": "127.0.0.1:18082",
       "protocols": [
         "tcp"
       ],
@@ -60,6 +61,50 @@
   "node_role": "regular",
   "catalog_max_peers": 4096,
   "peer_discovery_random_fraction": 0.35,
+  "transport_obfuscation": {
+    "udp": {
+      "mode": "plain",
+      "fake_hosts": [
+        "www.google.com",
+        "www.cloudflare.com",
+        "yandex.ru"
+      ],
+      "fake_paths": [
+        "/api/v1/ping",
+        "/v2/status",
+        "/cdn-cgi/trace"
+      ],
+      "padding_min": 64,
+      "padding_max": 512,
+      "min_chunk_size": 128,
+      "max_chunk_size": 1400,
+      "min_chunk_delay_ms": 0,
+      "max_chunk_delay_ms": 12
+    },
+    "tcp": {
+      "mode": "plain",
+      "fake_hosts": [
+        "www.google.com",
+        "www.cloudflare.com",
+        "yandex.ru"
+      ],
+      "fake_paths": [
+        "/api/v1/ping",
+        "/v2/status",
+        "/cdn-cgi/trace"
+      ],
+      "padding_min": 64,
+      "padding_max": 512,
+      "min_chunk_size": 128,
+      "max_chunk_size": 1400,
+      "min_chunk_delay_ms": 0,
+      "max_chunk_delay_ms": 12
+    }
+  },
+  "transport_obfuscation_enabled": {
+    "tcp": true,
+    "udp": true
+  },
   "topology_tuning": {
     "regular_auto_target_min": 3,
     "regular_auto_target_max": 12,
@@ -75,11 +120,21 @@
     "adaptive_target_min_floor": 3,
     "adaptive_target_max_ceil": 14,
     "adaptive_bootstrap_hard_max": 8,
+    "adaptive_bootstrap_top_k": 2,
     "adaptive_exploration_interval_min_ms": 8000,
     "adaptive_exploration_interval_max_ms": 120000,
     "adaptive_rejoin_cooldown_min_ms": 20000,
     "adaptive_rejoin_cooldown_max_ms": 180000,
-    "adaptive_redirect_memory_ms": 12000,
-    "adaptive_bootstrap_top_k": 2
+    "adaptive_redirect_memory_ms": 12000
+  },
+  "flow_trace": {
+    "enabled": false,
+    "json_packets": false,
+    "payload_preview_bytes": 32
+  },
+  "debug_server": {
+    "enabled": false,
+    "bind_addr": "127.0.0.1:9090",
+    "push_interval_ms": 1000
   }
 }

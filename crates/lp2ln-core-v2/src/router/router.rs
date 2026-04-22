@@ -7,6 +7,7 @@ use k256::ecdsa::SigningKey;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
+    crypto::secure_channel::{derive_shared_key, encode_secure_envelope, is_secure_envelope},
     crypto::signature::sign_packet,
     packet::Packet,
     packet_processor::{ChunkAssembler, ChunkAssemblerResult, PacketProcessor},
@@ -30,6 +31,8 @@ pub struct Router {
     incoming_tx: mpsc::Sender<IncomingPacket>,
     incoming_broadcast_tx: broadcast::Sender<IncomingPacket>,
     next_request_id: AtomicU64,
+    next_secure_seq: AtomicU64,
+    our_peer_id: String,
 }
 
 impl Router {
@@ -39,6 +42,7 @@ impl Router {
         signing_key: Option<Arc<SigningKey>>,
         our_peer_id: impl Into<String>,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
+        let our_peer_id = our_peer_id.into();
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
         let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
 
@@ -48,10 +52,12 @@ impl Router {
                 session_manager,
                 packet_processor,
                 signing_key,
-                chunk_assembler: Arc::new(ChunkAssembler::new(our_peer_id)),
+                chunk_assembler: Arc::new(ChunkAssembler::new(our_peer_id.clone())),
                 incoming_tx,
                 incoming_broadcast_tx,
                 next_request_id: AtomicU64::new(start_id),
+                next_secure_seq: AtomicU64::new(1),
+                our_peer_id,
             },
             incoming_rx,
         )
@@ -61,6 +67,21 @@ impl Router {
         if packet.request_id.is_none() {
             let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
             packet.request_id = Some(id);
+        }
+        if !packet.data.is_empty()
+            && !packet.receiver.is_empty()
+            && packet.receiver != self.our_peer_id
+            && !is_secure_envelope(&packet.data)
+        {
+            let key = derive_shared_key(
+                self.signing_key
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Secure transport requires signing key"))?
+                    .as_ref(),
+                &packet.receiver,
+            )?;
+            let seq = self.next_secure_seq.fetch_add(1, Ordering::Relaxed);
+            packet.data = encode_secure_envelope(&packet.data, key, seq)?;
         }
         if let Some(ref key) = self.signing_key {
             sign_packet(&mut packet, key).map_err(anyhow::Error::msg)?;

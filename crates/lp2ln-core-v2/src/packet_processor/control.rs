@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::node::nat_traversal::NatTraversalState;
 use crate::packet::Packet;
-use crate::protocol::control::NetworkControlPayload;
+use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::router::Router;
-use crate::topology::{now_ms, select_peers_for_discovery_response, PeerCatalog};
+use crate::topology::{now_ms, parse_observed_addr_line, select_peers_for_discovery_response, PeerCatalog};
 use crate::types::PeerId;
 
 fn make_control_packet(
@@ -34,11 +35,32 @@ pub async fn try_handle_control_packet(
     peer_catalog: &PeerCatalog,
     router: Arc<Router>,
     peer_discovery_random_fraction: f32,
+    nat_state: Arc<NatTraversalState>,
 ) -> bool {
     let data = packet.data.as_slice();
     let reply_to_request_id = packet.request_id;
     let Ok(ctrl) = NetworkControlPayload::decode(data) else {
         return false;
+    };
+
+    nat_state.cleanup_expired();
+
+    let local_nat_candidates = || -> Vec<NatCandidate> {
+        let our_desc = peer_catalog.descriptors().into_iter().find(|d| d.peer_id == our_peer_id);
+        let Some(desc) = our_desc else {
+            return vec![];
+        };
+        desc.observed_addrs
+            .iter()
+            .filter_map(|s| parse_observed_addr_line(s))
+            .filter(|(proto, _)| proto == "udp")
+            .map(|(proto, addr)| NatCandidate {
+                protocol: proto,
+                addr: addr.to_string(),
+                kind: NatCandidateKind::Host,
+                priority: 100,
+            })
+            .collect()
     };
 
     match ctrl {
@@ -112,6 +134,42 @@ pub async fn try_handle_control_packet(
             observed_rtt_ms,
         } => {
             peer_catalog.observe_success(peer_id, observed_rtt_ms.max(1));
+        }
+        NetworkControlPayload::NatOffer { offer } => {
+            let answer = nat_state.handle_offer(from, &offer, local_nat_candidates());
+            let response = NetworkControlPayload::NatAnswer { answer };
+            if let Ok(encoded) = response.encode() {
+                let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
+                let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+            }
+        }
+        NetworkControlPayload::NatAnswer { answer } => {
+            if let Some(start_after_ms) = nat_state.handle_answer(from, &answer) {
+                nat_state.mark_punch_start(&answer.session_id, start_after_ms);
+                let response = NetworkControlPayload::NatPunchStart {
+                    session_id: answer.session_id.clone(),
+                    start_after_ms,
+                };
+                if let Ok(encoded) = response.encode() {
+                    let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
+                    let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                }
+            }
+        }
+        NetworkControlPayload::NatPunchStart {
+            session_id,
+            start_after_ms,
+        } => {
+            nat_state.mark_punch_start(&session_id, start_after_ms);
+            nat_state.mark_punching(&session_id);
+        }
+        NetworkControlPayload::NatPunchResult {
+            session_id,
+            success,
+            selected_addr,
+            reason,
+        } => {
+            nat_state.mark_result(&session_id, success, selected_addr, reason);
         }
     }
     true

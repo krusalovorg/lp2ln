@@ -9,6 +9,7 @@ use dashmap::DashMap;
 
 use crate::db::P2PDatabase;
 use crate::metrics::MetricsAggregator;
+use crate::node::nat_traversal::NatTraversalState;
 use crate::node::addressing::advertised_addr_for_protocol;
 use crate::node::distribution::{
     bootstrap_dial_quota, capacity_target_factor, connectivity_selective, descriptor_prefix24,
@@ -32,7 +33,7 @@ use crate::topology::{
     select_peers_for_discovery_response, sign_descriptor, CapacityBudget, NodeCapabilities,
     NodeDescriptor, NodeDynamicStatus, PeerCatalog,
 };
-use crate::transport::Transport;
+use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
 
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
@@ -282,6 +283,7 @@ pub(crate) fn spawn_topology_maintenance_loop(
     topology_tuning: TopologyTuning,
     maintenance_handshake_payload: Vec<u8>,
     bootstrap_targets_maint: Vec<BootstrapNode>,
+    nat_state: Arc<NatTraversalState>,
 ) {
     tokio::spawn(async move {
         let initial_jitter = (our_peer_maint.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64))
@@ -303,6 +305,89 @@ pub(crate) fn spawn_topology_maintenance_loop(
 
         loop {
             interval.tick().await;
+            for nat_job in nat_state.take_punch_jobs() {
+                let mut success = false;
+                let mut selected_addr: Option<String> = None;
+                let mut failure_reason: Option<String> = None;
+                if let Some(udp_transport) = transports_maint
+                    .iter()
+                    .find(|t| t.name().eq_ignore_ascii_case("udp") && t.supports_tunneling())
+                {
+                    let start_after = nat_job.start_after_ms.unwrap_or(0);
+                    if start_after > 0 {
+                        tokio::time::sleep(Duration::from_millis(start_after)).await;
+                    }
+                    for candidate in nat_job.remote_candidates.iter() {
+                        if !candidate.protocol.eq_ignore_ascii_case("udp") {
+                            continue;
+                        }
+                        let parsed = candidate.addr.parse::<SocketAddr>();
+                        let Ok(addr) = parsed else {
+                            continue;
+                        };
+                        let params = TunnelPunchParams {
+                            target_ip: addr.ip().to_string(),
+                            target_port: addr.port(),
+                            timeout_secs: 4,
+                        };
+                        match udp_transport.punch_tunnel(params).await {
+                            Ok(session) => {
+                                let session_id = SessionId::from(session.id().to_string());
+                                let peer_id = PeerId::from(nat_job.peer_id.as_str());
+                                router_maint.register_session(
+                                    peer_id.clone(),
+                                    session_id.clone(),
+                                    session.clone(),
+                                );
+                                session.spawn_reader(incoming_maint.clone());
+                                crate::info!(
+                                    "[NodeRuntime] NAT tunnel established: peer={} session={} target={}",
+                                    peer_id,
+                                    session_id,
+                                    candidate.addr
+                                );
+                                success = true;
+                                selected_addr = Some(candidate.addr.clone());
+                                break;
+                            }
+                            Err(e) => {
+                                failure_reason = Some(e.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    failure_reason = Some("UDP transport with tunneling is unavailable".to_string());
+                }
+                nat_state.mark_result(
+                    &nat_job.session_id,
+                    success,
+                    selected_addr.clone(),
+                    failure_reason.clone(),
+                );
+                let result = NetworkControlPayload::NatPunchResult {
+                    session_id: nat_job.session_id.clone(),
+                    success,
+                    selected_addr,
+                    reason: failure_reason,
+                };
+                if let Ok(data) = result.encode() {
+                    let packet = Packet {
+                        signature: None,
+                        data,
+                        nodes: vec![],
+                        sender: our_peer_maint.clone(),
+                        receiver: nat_job.peer_id.clone(),
+                        max_hops: 2,
+                        request_id: None,
+                        chunk_stream_id: None,
+                        chunk_index: None,
+                        total_chunks: None,
+                    };
+                    let _ = router_maint
+                        .send_to_peer(PeerId::from(nat_job.peer_id.as_str()), packet, None)
+                        .await;
+                }
+            }
             let policy = NodeOptions::effective_peer_connection_policy_for(
                 policy_live_maint.read().unwrap().clone(),
                 node_role,
@@ -359,15 +444,15 @@ pub(crate) fn spawn_topology_maintenance_loop(
                     if our_listen_addrs.contains(&addr) {
                         continue;
                     }
-                    if proto != "tcp" {
+                    if proto != "tcp" && proto != "udp" {
                         continue;
                     }
                     let mut entry = dial_book
                         .entry(PeerId::from(desc.peer_id.as_str()))
                         .or_default();
-                    let exists = entry.iter().any(|(t, a)| t == "tcp" && a == &addr);
+                    let exists = entry.iter().any(|(t, a)| t == &proto && a == &addr);
                     if !exists {
-                        entry.push(("tcp".to_string(), addr));
+                        entry.push((proto, addr));
                     }
                 }
             }
@@ -955,6 +1040,31 @@ pub(crate) fn spawn_topology_maintenance_loop(
 
             if now.saturating_sub(last_publish) >= descriptor_interval.as_millis() as u64 {
                 let version = descriptor_ver.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut srflx_by_proto: HashMap<String, SocketAddr> = HashMap::new();
+                for transport in &transports_maint {
+                    if !transport.supports_tunneling() {
+                        continue;
+                    }
+                    let proto = transport.name().to_string();
+                    let Some(listen_addr) = listens.get(&proto).map(|r| *r.value()) else {
+                        continue;
+                    };
+                    match transport.get_public_address(listen_addr.port()).await {
+                        Ok(public) => {
+                            if let Ok(ip) = public.ip.parse::<IpAddr>() {
+                                srflx_by_proto.insert(proto, SocketAddr::new(ip, public.port));
+                            }
+                        }
+                        Err(e) => {
+                            crate::debug!(
+                                "[NodeRuntime] STUN unavailable for {}:{}: {}",
+                                proto,
+                                listen_addr.port(),
+                                e
+                            );
+                        }
+                    }
+                }
                 let mut proto_list: Vec<(String, SocketAddr)> = listens
                     .iter()
                     .map(|r| {
@@ -969,10 +1079,15 @@ pub(crate) fn spawn_topology_maintenance_loop(
                     })
                     .collect();
                 proto_list.sort_by(|a, b| a.0.cmp(&b.0));
-                let observed_addrs: Vec<String> = proto_list
+                let mut observed_addrs: Vec<String> = proto_list
                     .into_iter()
                     .map(|(p, a)| format!("{}:{}", p.to_lowercase(), a))
                     .collect();
+                for (proto, addr) in srflx_by_proto {
+                    observed_addrs.push(format!("{}:{}", proto.to_lowercase(), addr));
+                }
+                observed_addrs.sort();
+                observed_addrs.dedup();
                 let mut caps = NodeCapabilities::default();
                 if matches!(node_role, NodeRole::BootstrapJoin) {
                     caps.bootstrap_entry = true;

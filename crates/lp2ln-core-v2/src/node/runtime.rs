@@ -5,18 +5,20 @@ use std::time::Duration;
 
 use anyhow::Result;
 use dashmap::DashMap;
+use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
 use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
 use crate::node::incoming_sessions::spawn_incoming_session_handler;
+use crate::node::nat_traversal::NatTraversalState;
 use crate::node::options::{NodeOptions, NodeRole};
 use crate::node::topology_maintenance::{dial_bootstrap_address, spawn_topology_maintenance_loop};
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
-use crate::protocol::control::NetworkControlPayload;
+use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::protocol::handshake;
 use crate::router::{Router, ROUTER_INCOMING_QUEUE_CAP};
 use crate::sessions::manager::SessionManager;
@@ -37,6 +39,7 @@ pub struct NodeRuntime {
     packet_processor: Arc<dyn PacketProcessor>,
     session_manager: Arc<SessionManager>,
     peer_catalog: Arc<PeerCatalog>,
+    nat_state: Arc<NatTraversalState>,
     dial_book: Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
     descriptor_version: Arc<AtomicU64>,
     router: Option<Arc<Router>>,
@@ -58,12 +61,15 @@ impl NodeRuntime {
             .keypair
             .or_else(|| db.as_ref().and_then(|db| db.get_or_create_node_keypair().ok()))
             .unwrap_or_else(NodeKeypair::generate);
+        let nat_state = NatTraversalState::new();
         let packet_processor = packet_processor.unwrap_or_else(|| {
             Arc::new(DefaultPacketProcessor::new(
                 keypair.peer_id().to_string(),
                 options.allow_unsigned_packets,
                 peer_catalog.clone(),
                 options.peer_discovery_random_fraction,
+                nat_state.clone(),
+                keypair.clone(),
             )) as Arc<dyn PacketProcessor>
         });
         let peer_scores = Arc::new(PeerScoreStore::new());
@@ -101,6 +107,7 @@ impl NodeRuntime {
             packet_processor,
             session_manager,
             peer_catalog,
+            nat_state,
             dial_book: Arc::new(DashMap::new()),
             descriptor_version: Arc::new(AtomicU64::new(1)),
             router: None,
@@ -220,6 +227,73 @@ impl NodeRuntime {
 
     pub async fn send(&self, peer_id: PeerId, data: Vec<u8>) -> Result<u64> {
         self.send_with_options(peer_id, data, None, None, None).await
+    }
+
+    async fn build_local_nat_candidates(&self) -> Vec<NatCandidate> {
+        let mut candidates = Vec::new();
+        for listen in self._options.listens.iter() {
+            let proto = listen.key().to_ascii_lowercase();
+            let addr = *listen.value();
+            candidates.push(NatCandidate {
+                protocol: proto.clone(),
+                addr: addr.to_string(),
+                kind: NatCandidateKind::Host,
+                priority: 200,
+            });
+            if proto == "udp" {
+                if let Some(transport) = self
+                    .transports
+                    .iter()
+                    .find(|t| t.name().eq_ignore_ascii_case("udp"))
+                {
+                    if let Ok(public_addr) = transport.get_public_address(addr.port()).await {
+                        candidates.push(NatCandidate {
+                            protocol: "udp".to_string(),
+                            addr: format!("{}:{}", public_addr.ip, public_addr.port),
+                            kind: NatCandidateKind::Srflx,
+                            priority: 300,
+                        });
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.dedup_by(|a, b| a.protocol == b.protocol && a.addr == b.addr && a.kind == b.kind);
+        candidates
+    }
+
+    pub async fn start_nat_traversal(&self, route_peer_id: PeerId) -> Result<String> {
+        let router = self
+            .router
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node is not started, call start() first"))?;
+        let local_candidates = self.build_local_nat_candidates().await;
+        if local_candidates.is_empty() {
+            return Err(anyhow::anyhow!("No local candidates for NAT traversal"));
+        }
+        let session_id = format!("{:016x}", rand::rng().random::<u64>());
+        let offer = self.nat_state.create_offer(
+            session_id.clone(),
+            route_peer_id.as_str().to_string(),
+            local_candidates,
+        );
+        let payload = NetworkControlPayload::NatOffer { offer }
+            .encode()
+            .map_err(anyhow::Error::msg)?;
+        let packet = Packet {
+            signature: None,
+            data: payload,
+            nodes: vec![],
+            sender: self.keypair.peer_id().to_string(),
+            receiver: route_peer_id.as_str().to_string(),
+            max_hops: 2,
+            request_id: None,
+            chunk_stream_id: None,
+            chunk_index: None,
+            total_chunks: None,
+        };
+        let _ = router.send_to_peer(route_peer_id, packet, None).await?;
+        Ok(session_id)
     }
 
     async fn recv_reply_matching(
@@ -406,6 +480,10 @@ impl NodeRuntime {
         vec![]
     }
 
+    pub fn nat_metrics(&self) -> (u64, u64, u64) {
+        self.nat_state.metrics()
+    }
+
     pub fn peer_score_weights(&self) -> &PeerScoreWeights {
         &self._options.peer_score_weights
     }
@@ -488,6 +566,10 @@ impl NodeRuntime {
                                             NetworkControlPayload::FindProviders { .. } => "control:FindProviders",
                                             NetworkControlPayload::RequestAdjacency { .. } => "control:RequestAdjacency",
                                             NetworkControlPayload::AdjacencyResponse { .. } => "control:AdjacencyResponse",
+                                            NetworkControlPayload::NatOffer { .. } => "control:NatOffer",
+                                            NetworkControlPayload::NatAnswer { .. } => "control:NatAnswer",
+                                            NetworkControlPayload::NatPunchStart { .. } => "control:NatPunchStart",
+                                            NetworkControlPayload::NatPunchResult { .. } => "control:NatPunchResult",
                                         };
                                         tag.to_string()
                                     } else {
@@ -730,6 +812,7 @@ impl NodeRuntime {
             topology_tuning,
             maintenance_handshake_payload,
             bootstrap_targets_maint,
+            self.nat_state.clone(),
         );
 
         Ok(())

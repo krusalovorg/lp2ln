@@ -11,6 +11,7 @@ struct SigningPayload {
     nodes: Vec<String>,
     sender: String,
     receiver: String,
+    max_hops: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +28,7 @@ fn packet_to_signing_payload(packet: &Packet) -> SigningPayload {
         nodes: packet.nodes.clone(),
         sender: packet.sender.clone(),
         receiver: packet.receiver.clone(),
+        max_hops: packet.max_hops,
         request_id: packet.request_id,
         chunk_stream_id: packet.chunk_stream_id,
         chunk_index: packet.chunk_index,

@@ -1,7 +1,7 @@
 {
   "listens": {
-    "udp": "192.168.0.16:18180",
-    "tcp": "192.168.0.16:18080"
+    "udp": "0.0.0.0:18180",
+    "tcp": "0.0.0.0:18080"
   },
   "advertise_addrs": null,
   "default_nodes": [],
@@ -35,14 +35,14 @@
   "bootstrap_peer_hints": null,
   "bootstrap_nodes": [
     {
-      "addr": "192.168.0.16:18081",
+      "addr": "127.0.0.1:18081",
       "protocols": [
         "tcp"
       ],
       "peer_id_hint": null
     },
     {
-      "addr": "192.168.0.16:18082",
+      "addr": "127.0.0.1:18082",
       "protocols": [
         "tcp"
       ],
@@ -55,7 +55,7 @@
   "catalog_max_peers": 4096,
   "peer_discovery_random_fraction": 0.33,
   "transport_obfuscation": {
-    "udp": {
+    "tcp": {
       "mode": "plain",
       "fake_hosts": [
         "www.google.com",
@@ -74,7 +74,7 @@
       "min_chunk_delay_ms": 0,
       "max_chunk_delay_ms": 12
     },
-    "tcp": {
+    "udp": {
       "mode": "plain",
       "fake_hosts": [
         "www.google.com",
@@ -95,8 +95,8 @@
     }
   },
   "transport_obfuscation_enabled": {
-    "udp": true,
-    "tcp": true
+    "tcp": true,
+    "udp": true
   },
   "topology_tuning": {
     "regular_auto_target_min": 3,

@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 pub struct HandshakeFeatures {
     pub obfuscation_negotiation: bool,
     pub enabled_transport_obfuscation: Vec<String>,
+    #[serde(default)]
+    pub secure_channel: bool,
+    #[serde(default)]
+    pub anti_replay: bool,
+    #[serde(default)]
+    pub peer_id_binding: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +26,9 @@ pub fn encode_hello(enabled_transport_obfuscation: Vec<String>) -> Vec<u8> {
         features: HandshakeFeatures {
             obfuscation_negotiation: true,
             enabled_transport_obfuscation,
+            secure_channel: true,
+            anti_replay: true,
+            peer_id_binding: true,
         },
     };
 

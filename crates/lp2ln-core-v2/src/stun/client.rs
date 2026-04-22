@@ -20,12 +20,10 @@ impl StunClient {
         self.config.get_servers().clone()
     }
 
-    pub async fn get_public_address(&self, port: u16) -> (String, u16) {
-        let client = Client::new(format!("0.0.0.0:{}", port), None).await;
-        if let Err(e) = client {
-            panic!("Failed to create STUN client: {:?}", e);
-        }
-        let mut client = client.unwrap();
+    pub async fn get_public_address(&self, port: u16) -> anyhow::Result<(String, u16)> {
+        let mut client = Client::new(format!("0.0.0.0:{}", port), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create STUN client: {:?}", e))?;
 
         let stun_servers = self.get_servers();
         let mut last_error = None;
@@ -46,43 +44,45 @@ impl StunClient {
             }
         }
 
-        if last_res.is_none() {
-            if let Some(e) = last_error {
-                panic!(
-                    "Failed to connect to any STUN server. Last error: {:?}",
-                    e
-                );
-            } else {
-                panic!("Failed to connect to any STUN server and no error was recorded");
+        let res = match last_res {
+            Some(v) => v,
+            None => {
+                if let Some(e) = last_error {
+                    return Err(anyhow::anyhow!(
+                        "Failed to connect to any STUN server. Last error: {:?}",
+                        e
+                    ));
+                }
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to any STUN server and no error was recorded"
+                ));
             }
-        }
-
-        let res = last_res.unwrap();
+        };
 
         let xor_mapped_addr = Attribute::get_xor_mapped_address(&res);
         if let Some(addr) = xor_mapped_addr {
-            (addr.ip().to_string(), addr.port())
+            Ok((addr.ip().to_string(), addr.port()))
         } else {
             let mapped_addr = Attribute::get_mapped_address(&res);
             if let Some(addr) = mapped_addr {
-                (addr.ip().to_string(), addr.port())
+                Ok((addr.ip().to_string(), addr.port()))
             } else {
-                panic!(
+                Err(anyhow::anyhow!(
                     "Failed to get XOR mapped address or Mapped address from STUN response: {:?}",
                     res
-                );
+                ))
             }
         }
     }
 
-    pub async fn get_public_ip(&self, port: u16) -> String {
-        let (ip, _) = self.get_public_address(port).await;
-        ip
+    pub async fn get_public_ip(&self, port: u16) -> anyhow::Result<String> {
+        let (ip, _) = self.get_public_address(port).await?;
+        Ok(ip)
     }
 
-    pub async fn get_public_port(&self, port: u16) -> u16 {
-        let (_, port) = self.get_public_address(port).await;
-        port
+    pub async fn get_public_port(&self, port: u16) -> anyhow::Result<u16> {
+        let (_, port) = self.get_public_address(port).await?;
+        Ok(port)
     }
 }
 
@@ -92,7 +92,7 @@ impl Default for StunClient {
     }
 }
 
-pub async fn get_public_address(port: u16) -> (String, u16) {
+pub async fn get_public_address(port: u16) -> anyhow::Result<(String, u16)> {
     let client = StunClient::new();
     client.get_public_address(port).await
 }
@@ -100,7 +100,7 @@ pub async fn get_public_address(port: u16) -> (String, u16) {
 pub async fn get_public_address_with_servers(
     port: u16,
     custom_servers: Vec<String>,
-) -> (String, u16) {
+) -> anyhow::Result<(String, u16)> {
     let config = StunConfig::with_servers(custom_servers);
     let client = StunClient::with_config(config);
     client.get_public_address(port).await

@@ -1,7 +1,7 @@
 {
   "listens": {
-    "udp": "192.168.0.16:18182",
-    "tcp": "192.168.0.16:18082"
+    "udp": "0.0.0.0:18182",
+    "tcp": "0.0.0.0:18082"
   },
   "advertise_addrs": null,
   "default_nodes": [],
@@ -35,14 +35,14 @@
   "bootstrap_peer_hints": null,
   "bootstrap_nodes": [
     {
-      "addr": "192.168.0.16:18080",
+      "addr": "127.0.0.1:18080",
       "protocols": [
         "tcp"
       ],
       "peer_id_hint": null
     },
     {
-      "addr": "192.168.0.16:18081",
+      "addr": "127.0.0.1:18081",
       "protocols": [
         "tcp"
       ],

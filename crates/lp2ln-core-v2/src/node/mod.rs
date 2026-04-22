@@ -4,6 +4,7 @@ pub mod builder;
 pub mod addressing;
 pub mod distribution;
 pub mod incoming_sessions;
+pub mod nat_traversal;
 pub mod topology_maintenance;
 
 pub mod connection_strategy {
