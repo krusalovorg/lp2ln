@@ -295,8 +295,16 @@ This model helps keep the core technology open while ensuring the project can be
 
 ## License
 
-This project is licensed under the GNU AGPLv3.
+LP2LN is dual-licensed:
 
-Commercial licenses are available for proprietary use.
+- Open-source use: GNU Affero General Public License v3.0 (AGPLv3)
+- Commercial/proprietary use: available under a separate commercial license
+
+If you use, modify, or provide LP2LN as part of a network service,
+you must comply with AGPLv3, including providing access to the source code
+of your modified version to users interacting with it.
+
+To use LP2LN in closed-source or proprietary environments,
+you must obtain a commercial license.
 
 Contact: krusalovorg@gmail.com
