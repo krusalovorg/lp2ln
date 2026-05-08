@@ -1,15 +1,15 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use anyhow::Result;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use async_trait::async_trait;
-use crate::transport::{Transport, bind_with_port_fallback};
-use crate::transport::transport::TransportContext;
-use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
+use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::transport::tcp::session::TcpSession;
+use crate::transport::transport::TransportContext;
+use crate::transport::{Transport, bind_with_port_fallback};
+use anyhow::Result;
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 pub struct TcpTransport {
     listen_addr: SocketAddr,
@@ -98,21 +98,25 @@ impl Transport for TcpTransport {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind TCP: {}", e))?;
         if actual_addr != bind_addr {
-            crate::info!("[TcpTransport] Port {} busy, bound to {}", bind_addr.port(), actual_addr.port());
+            crate::info!(
+                "[TcpTransport] Port {} busy, bound to {}",
+                bind_addr.port(),
+                actual_addr.port()
+            );
         }
 
         let listener = Arc::new(listener);
         let listener_clone = listener.clone();
         let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
         let obfuscator = self.obfuscator.clone();
-        
+
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        
+
         {
             let mut shutdown_tx_guard = self.shutdown_tx.lock().await;
             *shutdown_tx_guard = Some(shutdown_tx);
         }
-        
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -124,7 +128,7 @@ impl Transport for TcpTransport {
                         match result {
                             Ok((mut stream, peer_addr)) => {
                                 crate::info!("[TcpTransport] New incoming connection from {}", peer_addr);
-                                
+
                                 let peer_id = match TcpSession::perform_handshake_on_stream(&mut stream, obfuscator.as_ref()).await {
                                     Ok(peer_id) => {
                                         crate::info!("[TcpTransport] Handshake successful, peer_id: {}", peer_id);
@@ -135,7 +139,7 @@ impl Transport for TcpTransport {
                                         continue;
                                     }
                                 };
-                                
+
                                 match TcpSession::new_from_stream(stream, peer_id, LinkKind::DirectTcp, obfuscator.clone()) {
                                     Ok(session) => {
                                         match incoming_sessions_tx
@@ -163,7 +167,7 @@ impl Transport for TcpTransport {
                 }
             }
         });
-        
+
         Ok(Some(actual_addr))
     }
 
@@ -172,20 +176,20 @@ impl Transport for TcpTransport {
             let mut shutdown_tx_guard = self.shutdown_tx.lock().await;
             shutdown_tx_guard.take()
         };
-        
+
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
             crate::info!("[TcpTransport] Stopped");
         } else {
             crate::info!("[TcpTransport] Already stopped or not started");
         }
-        
+
         Ok(())
     }
 
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>> {
         crate::info!("[TcpTransport] Dialing {}", addr);
-        
+
         if self.obfuscator.is_enabled() {
             crate::info!(
                 "[TcpTransport] Obfuscation enabled: {:?}",
@@ -193,14 +197,19 @@ impl Transport for TcpTransport {
             );
         }
 
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            anyhow::Error::new(e).context(format!("tcp connect {}", addr))
-        })?;
-        
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context(format!("tcp connect {}", addr)))?;
+
         crate::info!("[TcpTransport] Connected to {}", addr);
-        
-        let session = TcpSession::new_from_stream(stream, None, LinkKind::DirectTcp, self.obfuscator.clone())?;
-        
+
+        let session = TcpSession::new_from_stream(
+            stream,
+            None,
+            LinkKind::DirectTcp,
+            self.obfuscator.clone(),
+        )?;
+
         Ok(session as Arc<dyn Session>)
     }
 }

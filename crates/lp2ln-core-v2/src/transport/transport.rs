@@ -1,9 +1,9 @@
-use async_trait::async_trait;
+use crate::{sessions::Session, sessions::session::IncomingPacket};
 use anyhow::Result;
+use async_trait::async_trait;
 use std::io::ErrorKind;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
-use crate::{sessions::Session, sessions::session::IncomingPacket};
 
 pub async fn bind_with_port_fallback<F, Fut, T>(
     addr: SocketAddr,
@@ -64,7 +64,9 @@ pub trait Transport: Send + Sync {
 
     async fn start(&self, ctx: TransportContext) -> Result<Option<SocketAddr>>;
 
-    async fn stop(&self) -> Result<()> { Ok(()) }
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
 
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>>;
 

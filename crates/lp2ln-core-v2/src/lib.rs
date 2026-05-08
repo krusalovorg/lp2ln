@@ -13,6 +13,9 @@ pub mod stun;
 pub mod packet_processor;
 pub mod router;
 pub mod logger;
+pub mod nat;
+pub mod services;
+pub mod event_core;
 
 pub use types::{PeerId, SessionId};
 pub use packet::Packet;

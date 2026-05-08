@@ -100,9 +100,8 @@ impl ChunkAssembler {
                 return ChunkAssemblerResult::Collecting;
             }
             let total_chunks = entry.total_chunks;
-            let mut data = Vec::with_capacity(
-                entry.chunks.values().map(|c| c.len()).sum::<usize>(),
-            );
+            let mut data =
+                Vec::with_capacity(entry.chunks.values().map(|c| c.len()).sum::<usize>());
             for i in 0..total_chunks {
                 if let Some(chunk) = entry.chunks.remove(&i) {
                     data.extend_from_slice(&chunk);
@@ -138,4 +137,3 @@ impl ChunkAssembler {
         packet.is_chunk()
     }
 }
-

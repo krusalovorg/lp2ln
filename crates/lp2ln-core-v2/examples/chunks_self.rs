@@ -1,8 +1,8 @@
 use lp2ln_core_v2::{
+    Packet,
     db::P2PDatabase,
     node::{NodeBuilder, NodeOptions},
     transport::{tcp::TcpTransport, udp::UdpTransport},
-    Packet,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
         lp2ln_core_v2::info!("Sent chunk {}/{}", i + 1, chunks.len());
     }
 
-    lp2ln_core_v2::info!("All chunks sent. Processor will receive one assembled packet (hello world).");
+    lp2ln_core_v2::info!(
+        "All chunks sent. Processor will receive one assembled packet (hello world)."
+    );
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     tokio::signal::ctrl_c().await?;

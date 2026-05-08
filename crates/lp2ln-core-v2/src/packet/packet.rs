@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Packet {
@@ -28,8 +28,7 @@ impl Packet {
         let sig = self.signature.as_ref().map(|s| s.len()).unwrap_or(0);
         let nodes: usize = self.nodes.iter().map(|s| s.len()).sum();
         let rid = self.request_id.map(|_| 8).unwrap_or(0);
-        (sig
-            + self.data.len()
+        (sig + self.data.len()
             + self.nodes.len() * 4
             + nodes
             + self.sender.len()
@@ -39,9 +38,7 @@ impl Packet {
     }
 
     pub fn is_chunk(&self) -> bool {
-        self.chunk_stream_id.is_some()
-            && self.chunk_index.is_some()
-            && self.total_chunks.is_some()
+        self.chunk_stream_id.is_some() && self.chunk_index.is_some() && self.total_chunks.is_some()
     }
 
     /// Разбивает данные на чанки и возвращает вектор пакетов с одинаковыми

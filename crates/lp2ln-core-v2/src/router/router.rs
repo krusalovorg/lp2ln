@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use rand::Rng;
+use async_trait::async_trait;
 use k256::ecdsa::SigningKey;
+use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
@@ -12,8 +13,9 @@ use crate::{
     packet::Packet,
     packet_processor::{ChunkAssembler, ChunkAssemblerResult, PacketProcessor},
     protocol::control::NetworkControlPayload,
+    services::{MetricsProvider, PacketPublisher, SessionRegistry, SessionSelector},
     sessions::{
-        manager::SessionManager, session::IncomingPacket, LinkKind, Session, SessionMetrics,
+        LinkKind, Session, SessionMetrics, manager::SessionManager, session::IncomingPacket,
     },
     types::{PeerId, SessionId},
 };
@@ -44,7 +46,8 @@ impl Router {
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id = our_peer_id.into();
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
-        let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
+        let (incoming_broadcast_tx, _rx) =
+            broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
 
         let start_id: u64 = rand::rng().random();
         (
@@ -98,22 +101,25 @@ impl Router {
     }
 
     pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
-        let Some(session) = self.session_manager.get(&session_id) else {
+        let Some(session) = SessionSelector::session(self.session_manager.as_ref(), &session_id)
+        else {
             return Err(anyhow::anyhow!("Session '{}' not found", session_id));
         };
         let packet = self.prepare_outgoing(packet)?;
-        let request_id = packet
-            .request_id
-            .ok_or_else(|| anyhow::anyhow!("internal: request_id missing after prepare_outgoing"))?;
+        let request_id = packet.request_id.ok_or_else(|| {
+            anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
+        })?;
         match session.send(packet).await {
             Ok(bytes) => {
-                self.session_manager
-                    .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
+                MetricsProvider::record_packets_sent(
+                    self.session_manager.as_ref(),
+                    &session_id,
+                    bytes,
+                );
                 Ok(request_id)
             }
             Err(e) => {
-                self.session_manager
-                    .update_metrics(&session_id, |m| m.increment_send_errors());
+                MetricsProvider::record_send_error(self.session_manager.as_ref(), &session_id);
                 let _ = self.session_manager.close_session(&session_id).await;
                 Err(e)
             }
@@ -127,9 +133,9 @@ impl Router {
         exclude_from: Option<PeerId>,
     ) -> Result<u64> {
         let packet = self.prepare_outgoing(packet)?;
-        let request_id = packet
-            .request_id
-            .ok_or_else(|| anyhow::anyhow!("internal: request_id missing after prepare_outgoing"))?;
+        let request_id = packet.request_id.ok_or_else(|| {
+            anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
+        })?;
         let is_control_packet = NetworkControlPayload::decode(&packet.data).is_ok();
         let in_nodes = packet.nodes.iter().any(|n| n == peer_id.as_str());
         if in_nodes || exclude_from.as_ref() == Some(&peer_id) {
@@ -138,17 +144,21 @@ impl Router {
                 peer_id
             ));
         }
-        if let Some(session) = self.session_manager.get_best_session_for_peer(&peer_id) {
+        if let Some(session) =
+            SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
+        {
             let session_id = SessionId::from(session.id().to_string());
             match session.send(packet.clone()).await {
                 Ok(bytes) => {
-                    self.session_manager
-                        .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
+                    MetricsProvider::record_packets_sent(
+                        self.session_manager.as_ref(),
+                        &session_id,
+                        bytes,
+                    );
                     return Ok(request_id);
                 }
                 Err(e) => {
-                    self.session_manager
-                        .update_metrics(&session_id, |m| m.increment_send_errors());
+                    MetricsProvider::record_send_error(self.session_manager.as_ref(), &session_id);
                     let _ = self.session_manager.close_session(&session_id).await;
                     return Err(e);
                 }
@@ -165,7 +175,7 @@ impl Router {
             ));
         }
 
-        let peers = self.session_manager.get_all_peers_sorted_by_score();
+        let peers = SessionSelector::peers_sorted_by_score(self.session_manager.as_ref());
         if peers.is_empty() {
             return Err(anyhow::anyhow!(
                 "No sessions for peer '{}' and no neighbors to broadcast",
@@ -182,12 +192,17 @@ impl Router {
             if packet.nodes.iter().any(|n| n == neighbor.as_str()) {
                 continue;
             }
-            if let Some(session) = self.session_manager.get_best_session_for_peer(&neighbor) {
+            if let Some(session) =
+                SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &neighbor)
+            {
                 let session_id = SessionId::from(session.id().to_string());
                 match session.send(packet.clone()).await {
                     Ok(bytes) => {
-                        self.session_manager
-                            .update_metrics(&session_id, |m| m.increment_packets_sent(bytes));
+                        MetricsProvider::record_packets_sent(
+                            self.session_manager.as_ref(),
+                            &session_id,
+                            bytes,
+                        );
                         any_ok = true;
                         sent_count += 1;
                         if sent_count >= ROUTER_FALLBACK_FANOUT {
@@ -195,8 +210,10 @@ impl Router {
                         }
                     }
                     Err(e) => {
-                        self.session_manager
-                            .update_metrics(&session_id, |m| m.increment_send_errors());
+                        MetricsProvider::record_send_error(
+                            self.session_manager.as_ref(),
+                            &session_id,
+                        );
                         let _ = self.session_manager.close_session(&session_id).await;
                         last_err = Some(e);
                     }
@@ -255,14 +272,18 @@ impl Router {
         self: Arc<Self>,
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
     ) -> Result<()> {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(ROUTER_PROCESS_SEMAPHORE_PERMITS));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            ROUTER_PROCESS_SEMAPHORE_PERMITS,
+        ));
 
         while let Some(incoming) = incoming_rx.recv().await {
             let session_id = SessionId::from(incoming.session_id.clone());
             let bytes_estimate = incoming.packet.wire_size_estimate();
-            self.session_manager.update_metrics(&session_id, |m| {
-                m.increment_packets_received(bytes_estimate)
-            });
+            MetricsProvider::record_packets_received(
+                self.session_manager.as_ref(),
+                &session_id,
+                bytes_estimate,
+            );
 
             let to_process = if ChunkAssembler::is_chunk_packet(&incoming.packet) {
                 match self.chunk_assembler.add(incoming) {
@@ -295,5 +316,97 @@ impl Router {
         Err(anyhow::anyhow!(
             "router incoming channel closed; router loop stopped"
         ))
+    }
+}
+
+#[async_trait]
+impl PacketPublisher for Router {
+    async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
+        Router::send_to_session(self, session_id, packet).await
+    }
+
+    async fn send_to_peer(
+        &self,
+        peer_id: PeerId,
+        packet: Packet,
+        exclude_from: Option<PeerId>,
+    ) -> Result<u64> {
+        Router::send_to_peer(self, peer_id, packet, exclude_from).await
+    }
+}
+
+#[async_trait]
+impl SessionRegistry for Router {
+    fn register_session(
+        &self,
+        peer_id: PeerId,
+        session_id: SessionId,
+        session: Arc<dyn Session + Send + Sync>,
+    ) {
+        Router::register_session(self, peer_id, session_id, session);
+    }
+
+    fn register_session_only(
+        &self,
+        session_id: SessionId,
+        session: Arc<dyn Session + Send + Sync>,
+    ) {
+        Router::register_session_only(self, session_id, session);
+    }
+
+    fn set_peer_for_session(&self, session_id: SessionId, peer_id: PeerId) {
+        Router::set_peer_for_session(self, session_id, peer_id);
+    }
+
+    async fn teardown_session(&self, session_id: &SessionId) -> Result<()> {
+        Router::teardown_session(self, session_id).await
+    }
+}
+
+impl SessionSelector for Router {
+    fn session(&self, session_id: &SessionId) -> Option<Arc<dyn Session + Send + Sync>> {
+        SessionSelector::session(self.session_manager.as_ref(), session_id)
+    }
+
+    fn best_session_for_peer(&self, peer_id: &PeerId) -> Option<Arc<dyn Session + Send + Sync>> {
+        SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id)
+    }
+
+    fn connected_peers(&self) -> Vec<PeerId> {
+        Router::connected_peers(self)
+    }
+
+    fn peers_sorted_by_score(&self) -> Vec<PeerId> {
+        SessionSelector::peers_sorted_by_score(self.session_manager.as_ref())
+    }
+}
+
+impl MetricsProvider for Router {
+    fn record_packets_sent(&self, session_id: &SessionId, bytes: u64) {
+        MetricsProvider::record_packets_sent(self.session_manager.as_ref(), session_id, bytes);
+    }
+
+    fn record_send_error(&self, session_id: &SessionId) {
+        MetricsProvider::record_send_error(self.session_manager.as_ref(), session_id);
+    }
+
+    fn record_packets_received(&self, session_id: &SessionId, bytes: u64) {
+        MetricsProvider::record_packets_received(self.session_manager.as_ref(), session_id, bytes);
+    }
+
+    fn get_metrics_for_protocol(&self, kind: LinkKind) -> Vec<SessionMetrics> {
+        Router::get_metrics_for_protocol(self, kind)
+    }
+
+    fn get_metrics_by_protocol(&self) -> Vec<(LinkKind, Vec<SessionMetrics>)> {
+        Router::get_metrics_by_protocol(self)
+    }
+
+    fn peer_metrics_rollup(&self) -> Vec<(PeerId, Vec<SessionMetrics>)> {
+        MetricsProvider::peer_metrics_rollup(self.session_manager.as_ref())
+    }
+
+    fn total_sessions_count(&self) -> usize {
+        MetricsProvider::total_sessions_count(self.session_manager.as_ref())
     }
 }

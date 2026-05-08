@@ -147,4 +147,3 @@ impl ReplayWindow {
         true
     }
 }
-

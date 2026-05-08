@@ -129,7 +129,10 @@ impl Obfuscator {
         Ok(())
     }
 
-    async fn read_http_mimic_frame<R: AsyncReadExt + Unpin>(&self, reader: &mut R) -> Result<Vec<u8>> {
+    async fn read_http_mimic_frame<R: AsyncReadExt + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> Result<Vec<u8>> {
         let header_bytes = read_http_headers(reader).await?;
         let header_text = std::str::from_utf8(&header_bytes)
             .map_err(|e| anyhow::anyhow!("Invalid UTF-8 HTTP headers: {}", e))?;
@@ -249,7 +252,9 @@ async fn write_chunked<W: AsyncWriteExt + Unpin>(
             } else if roll < 85 {
                 bounded_usize(
                     ((min_chunk + max_chunk) / 3).max(min_chunk),
-                    ((min_chunk + max_chunk) * 2 / 3).max(min_chunk).min(max_chunk),
+                    ((min_chunk + max_chunk) * 2 / 3)
+                        .max(min_chunk)
+                        .min(max_chunk),
                 )
             } else {
                 bounded_usize((max_chunk / 2).max(min_chunk), max_chunk)
@@ -323,9 +328,7 @@ async fn read_http_headers<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ve
 }
 
 fn find_http_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 async fn write_length_prefixed_frame<W: AsyncWriteExt + Unpin>(
@@ -333,15 +336,18 @@ async fn write_length_prefixed_frame<W: AsyncWriteExt + Unpin>(
     data: &[u8],
 ) -> Result<()> {
     let len = data.len() as u32;
-    writer.write_all(&len.to_be_bytes()).await.map_err(|e| {
-        anyhow::anyhow!("Failed to write plain frame length: {}", e)
-    })?;
-    writer.write_all(data).await.map_err(|e| {
-        anyhow::anyhow!("Failed to write plain frame data: {}", e)
-    })?;
-    writer.flush().await.map_err(|e| {
-        anyhow::anyhow!("Failed to flush plain frame writer: {}", e)
-    })?;
+    writer
+        .write_all(&len.to_be_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write plain frame length: {}", e))?;
+    writer
+        .write_all(data)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write plain frame data: {}", e))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to flush plain frame writer: {}", e))?;
     Ok(())
 }
 
@@ -356,7 +362,10 @@ async fn read_length_prefixed_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> 
     })?;
     let packet_len = u32::from_be_bytes(len_bytes) as usize;
     if packet_len > MAX_HTTP_BODY_BYTES {
-        return Err(anyhow::anyhow!("Packet size too large: {} bytes", packet_len));
+        return Err(anyhow::anyhow!(
+            "Packet size too large: {} bytes",
+            packet_len
+        ));
     }
     let mut packet_bytes = vec![0u8; packet_len];
     reader.read_exact(&mut packet_bytes).await.map_err(|e| {

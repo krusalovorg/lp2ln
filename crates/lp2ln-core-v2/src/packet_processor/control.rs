@@ -1,10 +1,9 @@
-use std::sync::Arc;
-
-use crate::node::nat_traversal::NatTraversalState;
 use crate::packet::Packet;
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
-use crate::router::Router;
-use crate::topology::{now_ms, parse_observed_addr_line, select_peers_for_discovery_response, PeerCatalog};
+use crate::services::{NatTraversalPort, PacketPublisher, SessionSelector};
+use crate::topology::{
+    PeerCatalog, now_ms, parse_observed_addr_line, select_peers_for_discovery_response,
+};
 use crate::types::PeerId;
 
 fn make_control_packet(
@@ -33,9 +32,10 @@ pub async fn try_handle_control_packet(
     from: &str,
     peer_id: &PeerId,
     peer_catalog: &PeerCatalog,
-    router: Arc<Router>,
+    publisher: &dyn PacketPublisher,
+    sessions: &dyn SessionSelector,
     peer_discovery_random_fraction: f32,
-    nat_state: Arc<NatTraversalState>,
+    nat_state: &dyn NatTraversalPort,
 ) -> bool {
     let data = packet.data.as_slice();
     let reply_to_request_id = packet.request_id;
@@ -46,7 +46,10 @@ pub async fn try_handle_control_packet(
     nat_state.cleanup_expired();
 
     let local_nat_candidates = || -> Vec<NatCandidate> {
-        let our_desc = peer_catalog.descriptors().into_iter().find(|d| d.peer_id == our_peer_id);
+        let our_desc = peer_catalog
+            .descriptors()
+            .into_iter()
+            .find(|d| d.peer_id == our_peer_id);
         let Some(desc) = our_desc else {
             return vec![];
         };
@@ -79,7 +82,7 @@ pub async fn try_handle_control_packet(
             let _ = peer_catalog.add_evidence(evidence);
         }
         NetworkControlPayload::RequestAdjacency {} => {
-            let neighbors: Vec<String> = router
+            let neighbors: Vec<String> = sessions
                 .connected_peers()
                 .into_iter()
                 .map(|p| p.to_string())
@@ -88,7 +91,7 @@ pub async fn try_handle_control_packet(
             let response = NetworkControlPayload::AdjacencyResponse { neighbors };
             if let Ok(encoded) = response.encode() {
                 let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
-                let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                let _ = publisher.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
         NetworkControlPayload::AdjacencyResponse { .. } => {}
@@ -108,7 +111,7 @@ pub async fn try_handle_control_packet(
             let response = NetworkControlPayload::PeersResponse { descriptors };
             if let Ok(encoded) = response.encode() {
                 let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
-                let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                let _ = publisher.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
         NetworkControlPayload::PeersResponse { descriptors } => {
@@ -116,7 +119,10 @@ pub async fn try_handle_control_packet(
                 let _ = peer_catalog.upsert_descriptor(descriptor);
             }
         }
-        NetworkControlPayload::PingPeerQuality { nonce, timestamp_ms } => {
+        NetworkControlPayload::PingPeerQuality {
+            nonce,
+            timestamp_ms,
+        } => {
             let elapsed = now_ms().saturating_sub(timestamp_ms) as u32;
             let resp = NetworkControlPayload::PongPeerQuality {
                 nonce,
@@ -125,7 +131,7 @@ pub async fn try_handle_control_packet(
             };
             if let Ok(encoded) = resp.encode() {
                 let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
-                let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                let _ = publisher.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
         NetworkControlPayload::PongPeerQuality {
@@ -140,7 +146,7 @@ pub async fn try_handle_control_packet(
             let response = NetworkControlPayload::NatAnswer { answer };
             if let Ok(encoded) = response.encode() {
                 let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
-                let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                let _ = publisher.send_to_peer(peer_id.clone(), packet, None).await;
             }
         }
         NetworkControlPayload::NatAnswer { answer } => {
@@ -151,8 +157,9 @@ pub async fn try_handle_control_packet(
                     start_after_ms,
                 };
                 if let Ok(encoded) = response.encode() {
-                    let packet = make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
-                    let _ = router.send_to_peer(peer_id.clone(), packet, None).await;
+                    let packet =
+                        make_control_packet(our_peer_id, from, encoded, reply_to_request_id);
+                    let _ = publisher.send_to_peer(peer_id.clone(), packet, None).await;
                 }
             }
         }
@@ -173,4 +180,163 @@ pub async fn try_handle_control_packet(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::protocol::control::{NatAnswerPayload, NatOfferPayload};
+    use crate::sessions::Session;
+    use crate::types::SessionId;
+
+    struct RecordingPublisher {
+        sent: Mutex<Vec<(PeerId, Packet, Option<PeerId>)>>,
+    }
+
+    impl RecordingPublisher {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PacketPublisher for RecordingPublisher {
+        async fn send_to_session(&self, _session_id: SessionId, _packet: Packet) -> Result<u64> {
+            Ok(1)
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer_id: PeerId,
+            packet: Packet,
+            exclude_from: Option<PeerId>,
+        ) -> Result<u64> {
+            self.sent
+                .lock()
+                .expect("sent lock")
+                .push((peer_id, packet, exclude_from));
+            Ok(1)
+        }
+    }
+
+    struct StaticSelector {
+        peers: Vec<PeerId>,
+    }
+
+    impl SessionSelector for StaticSelector {
+        fn session(&self, _session_id: &SessionId) -> Option<Arc<dyn Session + Send + Sync>> {
+            None
+        }
+
+        fn best_session_for_peer(
+            &self,
+            _peer_id: &PeerId,
+        ) -> Option<Arc<dyn Session + Send + Sync>> {
+            None
+        }
+
+        fn connected_peers(&self) -> Vec<PeerId> {
+            self.peers.clone()
+        }
+
+        fn peers_sorted_by_score(&self) -> Vec<PeerId> {
+            self.peers.clone()
+        }
+    }
+
+    struct NoopNat;
+
+    impl NatTraversalPort for NoopNat {
+        fn cleanup_expired(&self) {}
+
+        fn create_offer(
+            &self,
+            session_id: String,
+            _peer_id: String,
+            local_candidates: Vec<NatCandidate>,
+        ) -> NatOfferPayload {
+            NatOfferPayload {
+                session_id,
+                candidates: local_candidates,
+            }
+        }
+
+        fn handle_offer(
+            &self,
+            _from: &str,
+            offer: &NatOfferPayload,
+            local_candidates: Vec<NatCandidate>,
+        ) -> NatAnswerPayload {
+            NatAnswerPayload {
+                session_id: offer.session_id.clone(),
+                candidates: local_candidates,
+            }
+        }
+
+        fn handle_answer(&self, _from: &str, _answer: &NatAnswerPayload) -> Option<u64> {
+            None
+        }
+
+        fn mark_punch_start(&self, _session_id: &str, _start_after_ms: u64) {}
+
+        fn mark_punching(&self, _session_id: &str) {}
+
+        fn mark_result(
+            &self,
+            _session_id: &str,
+            _success: bool,
+            _selected_addr: Option<String>,
+            _reason: Option<String>,
+        ) {
+        }
+    }
+
+    #[tokio::test]
+    async fn adjacency_request_uses_service_ports_without_router() {
+        let request = NetworkControlPayload::RequestAdjacency {}
+            .encode()
+            .expect("encode control");
+        let packet = Packet {
+            signature: None,
+            data: request,
+            nodes: vec![],
+            sender: "peer-a".to_string(),
+            receiver: "self".to_string(),
+            max_hops: 2,
+            request_id: Some(42),
+            chunk_stream_id: None,
+            chunk_index: None,
+            total_chunks: None,
+        };
+        let publisher = RecordingPublisher::new();
+        let selector = StaticSelector {
+            peers: vec![PeerId::from("peer-a"), PeerId::from("peer-b")],
+        };
+        let catalog = PeerCatalog::new();
+        let peer_id = PeerId::from("peer-a");
+
+        let handled = try_handle_control_packet(
+            &packet, "self", "peer-a", &peer_id, &catalog, &publisher, &selector, 0.0, &NoopNat,
+        )
+        .await;
+
+        assert!(handled);
+        let sent = publisher.sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, peer_id);
+        assert_eq!(sent[0].1.request_id, Some(42));
+        let response =
+            NetworkControlPayload::decode(&sent[0].1.data).expect("decode adjacency response");
+        let NetworkControlPayload::AdjacencyResponse { neighbors } = response else {
+            panic!("expected adjacency response");
+        };
+        assert_eq!(neighbors, vec!["peer-b".to_string()]);
+    }
 }

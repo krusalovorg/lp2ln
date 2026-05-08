@@ -1,12 +1,12 @@
-use std::sync::Arc;
 use crate::db::P2PDatabase;
 use crate::node::options::NodeOptions;
 use crate::node::runtime::NodeRuntime;
+use crate::packet_processor::PacketProcessor;
 use crate::transport::Transport;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::udp::UdpTransport;
-use crate::packet_processor::PacketProcessor;
 use anyhow::Result;
+use std::sync::Arc;
 
 pub struct NodeBuilder {
     db: Option<Arc<P2PDatabase>>,
@@ -60,7 +60,7 @@ impl NodeBuilder {
 
     pub fn build(self, options: NodeOptions) -> Result<NodeRuntime> {
         let mut runtime = NodeRuntime::new(self.db, options, self.packet_processor);
-        
+
         for transport in self.transports {
             runtime = runtime.add_transport(transport);
         }

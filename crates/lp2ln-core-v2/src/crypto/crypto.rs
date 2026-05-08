@@ -1,14 +1,13 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
+use k256::EncodedPoint;
 use k256::elliptic_curve::ecdh::diffie_hellman;
 use k256::elliptic_curve::sec1::FromEncodedPoint;
-use k256::EncodedPoint;
 use k256::{PublicKey, SecretKey};
-use rand_core::OsRng;
 use rand::TryRngCore;
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-
 
 pub fn get_shared_secret(private: &SecretKey, peer_pub_bytes: &[u8]) -> [u8; 32] {
     let secret_scalar = private.to_nonzero_scalar();
@@ -26,7 +25,9 @@ pub fn encrypt(plaintext: &[u8], key_bytes: [u8; 32]) -> (Vec<u8>, [u8; 12]) {
     let cipher = ChaCha20Poly1305::new(key);
 
     let mut nonce_bytes = [0u8; 12];
-    OsRng.try_fill_bytes(&mut nonce_bytes).expect("failed to fill bytes");
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .expect("failed to fill bytes");
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -44,7 +45,6 @@ pub fn decrypt(ciphertext: &[u8], key_bytes: [u8; 32], nonce_bytes: [u8; 12]) ->
         .decrypt(nonce, ciphertext)
         .expect("decryption failure!")
 }
-
 
 pub fn generate_uuid() -> String {
     Uuid::new_v4().to_string()

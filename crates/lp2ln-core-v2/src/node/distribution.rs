@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use rand::seq::SliceRandom;
 
 use crate::node::options::{NodeRole, TopologyTuning};
-use crate::peer_score::{total_score, PeerScoreStore, PeerScoreWeights};
+use crate::peer_score::{PeerScoreStore, PeerScoreWeights, total_score};
 use crate::topology::{NodeDescriptor, PeerCatalog};
 use crate::types::PeerId;
 
@@ -61,7 +61,9 @@ pub fn regular_auto_dial_target(
     let min_t = tuning.regular_auto_target_min;
     let max_t = tuning.regular_auto_target_max.max(min_t);
     if tuning.adaptive_topology_enabled {
-        let floor = tuning.adaptive_target_min_floor.min(tuning.adaptive_target_max_ceil);
+        let floor = tuning
+            .adaptive_target_min_floor
+            .min(tuning.adaptive_target_max_ceil);
         let ceil = tuning.adaptive_target_max_ceil.max(floor);
         scaled.clamp(min_t.max(floor), max_t.min(ceil).max(min_t.max(floor)))
     } else {
@@ -487,12 +489,10 @@ pub fn should_skip_for_bootstrap_quota(
 ) -> bool {
     matches!(node_role, NodeRole::Regular)
         && desc.capabilities.bootstrap_entry
-        && (
-            (connected_bootstrap >= bootstrap_quota && current_peers >= min_active_peers)
+        && ((connected_bootstrap >= bootstrap_quota && current_peers >= min_active_peers)
                 // Even before reaching full target connectivity, keep only one bootstrap edge
                 // once we already have at least a couple of peers.
-                || (connected_bootstrap >= 1 && current_peers >= 2)
-        )
+                || (connected_bootstrap >= 1 && current_peers >= 2))
 }
 
 pub fn bootstrap_dial_quota(node_role: NodeRole) -> usize {
@@ -518,7 +518,8 @@ pub fn should_reseed_bootstrap(
     now_ms: u64,
     last_reseed_ms: u64,
 ) -> bool {
-    let low_connectivity = active_peers == 0 || (active_peers < min_active_peers && connected_bootstrap == 0);
+    let low_connectivity =
+        active_peers == 0 || (active_peers < min_active_peers && connected_bootstrap == 0);
     low_connectivity && now_ms.saturating_sub(last_reseed_ms) >= BOOTSTRAP_RESEED_INTERVAL_MS
 }
 
@@ -579,13 +580,11 @@ pub fn peers_to_drop_when_overloaded(
         .collect();
     match node_role {
         NodeRole::Regular => boot.sort_by(|a, b| {
-            boot_load(b)
-                .cmp(&boot_load(a))
-                .then_with(|| {
-                    score(a)
-                        .partial_cmp(&score(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            boot_load(b).cmp(&boot_load(a)).then_with(|| {
+                score(a)
+                    .partial_cmp(&score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         }),
         NodeRole::BootstrapJoin => boot.sort_by(|a, b| {
             score(a)

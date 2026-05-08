@@ -41,11 +41,9 @@ async fn main() -> anyhow::Result<()> {
                 .send_to_session(session_id.clone(), PING.to_vec())
                 .await
             {
-                Ok(rid) => lp2ln_core_v2::info!(
-                    "Sent to session: {} (request_id={})",
-                    session_id,
-                    rid
-                ),
+                Ok(rid) => {
+                    lp2ln_core_v2::info!("Sent to session: {} (request_id={})", session_id, rid)
+                }
                 Err(e) => lp2ln_core_v2::error!("Send error: {}", e),
             }
         }

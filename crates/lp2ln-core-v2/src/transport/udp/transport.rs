@@ -1,17 +1,17 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use anyhow::Result;
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
-use async_trait::async_trait;
-use crate::transport::{Transport, bind_with_port_fallback};
-use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
-use crate::transport::transport::{TransportContext, PublicAddress, TunnelPunchParams};
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
-use crate::transport::udp::session::UdpSession;
 use crate::stun::StunClient;
+use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
+use crate::transport::transport::{PublicAddress, TransportContext, TunnelPunchParams};
+use crate::transport::udp::session::UdpSession;
+use crate::transport::{Transport, bind_with_port_fallback};
+use anyhow::Result;
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 
 pub struct UdpTransport {
     listen_addr: SocketAddr,
@@ -52,7 +52,10 @@ impl UdpTransport {
         }
     }
 
-    pub fn new_listener_with_obfuscation(listen_addr: SocketAddr, config: ObfuscationConfig) -> Self {
+    pub fn new_listener_with_obfuscation(
+        listen_addr: SocketAddr,
+        config: ObfuscationConfig,
+    ) -> Self {
         Self {
             listen_addr,
             shutdown_tx: Arc::new(Mutex::new(None)),
@@ -103,28 +106,33 @@ impl Transport for UdpTransport {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind UDP: {}", e))?;
         if actual_addr != bind_addr {
-            crate::info!("[UdpTransport] Port {} busy, bound to {}", bind_addr.port(), actual_addr.port());
+            crate::info!(
+                "[UdpTransport] Port {} busy, bound to {}",
+                bind_addr.port(),
+                actual_addr.port()
+            );
         }
 
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
         let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
         let obfuscator = self.obfuscator.clone();
-        
-        let sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<dyn Session>>>> = 
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let sessions: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<dyn Session>>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let sessions_clone = sessions.clone();
-        
+
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        
+
         {
             let mut shutdown_tx_guard = self.shutdown_tx.lock().await;
             *shutdown_tx_guard = Some(shutdown_tx);
         }
-        
+
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65507];
-            
+
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => {
@@ -138,7 +146,7 @@ impl Transport for UdpTransport {
                                     let sessions_guard = sessions_clone.lock().await;
                                     !sessions_guard.contains_key(&peer_addr)
                                 };
-                                
+
                                 if needs_new_session {
                                     match UdpSession::new_from_socket(
                                         socket_clone.clone(),
@@ -149,7 +157,7 @@ impl Transport for UdpTransport {
                                     ) {
                                         Ok(session) => {
                                             crate::info!("[UdpTransport] New session from {}", peer_addr);
-                                            
+
                                             let session_dyn = session.clone() as Arc<dyn Session>;
                                             match incoming_sessions_tx.send(session_dyn.clone()).await {
                                                 Ok(()) => {
@@ -187,25 +195,26 @@ impl Transport for UdpTransport {
             let mut shutdown_tx_guard = self.shutdown_tx.lock().await;
             shutdown_tx_guard.take()
         };
-        
+
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
             crate::info!("[UdpTransport] Stopped");
         } else {
             crate::info!("[UdpTransport] Already stopped or not started");
         }
-        
+
         Ok(())
     }
 
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>> {
         crate::info!("[UdpTransport] Dialing {}", addr);
-        
-        let socket = UdpSocket::bind("0.0.0.0:0").await
+
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
-        
+
         let socket = Arc::new(socket);
-        
+
         let session = UdpSession::new_from_socket(
             socket,
             addr,
@@ -213,9 +222,9 @@ impl Transport for UdpTransport {
             LinkKind::DirectUdp,
             self.obfuscator.clone(),
         )?;
-        
+
         crate::info!("[UdpTransport] Session created for {}", addr);
-        
+
         Ok(session.clone() as Arc<dyn Session>)
     }
 
@@ -224,38 +233,49 @@ impl Transport for UdpTransport {
     }
 
     async fn get_public_address(&self, local_port: u16) -> Result<PublicAddress> {
-        crate::info!("[UdpTransport] Getting public address via STUN for port {}", local_port);
-        
+        crate::info!(
+            "[UdpTransport] Getting public address via STUN for port {}",
+            local_port
+        );
+
         let (ip, port) = self
             .stun_client
             .get_public_address(local_port)
             .await
             .map_err(|e| anyhow::anyhow!("STUN lookup failed: {}", e))?;
-        
+
         Ok(PublicAddress { ip, port })
     }
 
     async fn punch_tunnel(&self, params: TunnelPunchParams) -> Result<Arc<dyn Session>> {
-        crate::info!("[UdpTransport] Punching tunnel to {}:{}", params.target_ip, params.target_port);
-        
+        crate::info!(
+            "[UdpTransport] Punching tunnel to {}:{}",
+            params.target_ip,
+            params.target_port
+        );
+
         let target_addr: SocketAddr = format!("{}:{}", params.target_ip, params.target_port)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid target address: {}", e))?;
-        
+
         let local_port = self.listen_addr.port();
-        
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", local_port)).await
+
+        let socket = UdpSocket::bind(format!("0.0.0.0:{}", local_port))
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket for tunnel: {}", e))?;
-        
+
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
-        
+
         // Отправляем handshake пакеты для пробития NAT
         let handshake_data = b"KPL"; // Keep-alive packet
         let mut timeout_count = params.timeout_secs;
-        
-        crate::info!("[UdpTransport] Starting tunnel punch with {} attempts", timeout_count);
-        
+
+        crate::info!(
+            "[UdpTransport] Starting tunnel punch with {} attempts",
+            timeout_count
+        );
+
         while timeout_count > 0 {
             // Отправляем handshake пакет
             if let Err(e) = socket_clone.send_to(handshake_data, target_addr).await {
@@ -263,20 +283,26 @@ impl Transport for UdpTransport {
                 timeout_count -= 1;
                 continue;
             }
-            
-            crate::info!("[UdpTransport] Handshake sent, waiting for response... ({}/{})", 
-                     params.timeout_secs - timeout_count + 1, params.timeout_secs);
-            
+
+            crate::info!(
+                "[UdpTransport] Handshake sent, waiting for response... ({}/{})",
+                params.timeout_secs - timeout_count + 1,
+                params.timeout_secs
+            );
+
             // Ждем ответ в течение 2 секунд
             let mut buf = vec![0u8; 1024];
             match timeout(Duration::from_secs(2), socket_clone.recv_from(&mut buf)).await {
                 Ok(Ok((_size, peer))) => {
                     if peer == target_addr {
-                        crate::info!("[UdpTransport] Tunnel punch successful! Received response from {}", peer);
-                        
+                        crate::info!(
+                            "[UdpTransport] Tunnel punch successful! Received response from {}",
+                            peer
+                        );
+
                         // Отправляем еще один пакет для подтверждения
                         let _ = socket_clone.send_to(handshake_data, target_addr).await;
-                        
+
                         // Создаем сессию для туннеля
                         let session = UdpSession::new_from_socket(
                             socket_clone.clone(),
@@ -285,7 +311,7 @@ impl Transport for UdpTransport {
                             LinkKind::TunnelUdp,
                             self.obfuscator.clone(),
                         )?;
-                        
+
                         crate::info!("[UdpTransport] Tunnel session created: {}", session.id());
                         return Ok(session.clone() as Arc<dyn Session>);
                     }
@@ -297,10 +323,10 @@ impl Transport for UdpTransport {
                     // Timeout
                 }
             }
-            
+
             timeout_count -= 1;
         }
-        
+
         Err(anyhow::anyhow!(
             "Failed to punch tunnel to {}:{} after {} attempts",
             params.target_ip,

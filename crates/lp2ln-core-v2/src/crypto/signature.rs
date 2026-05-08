@@ -1,7 +1,7 @@
 use crate::packet::Packet;
+use hex;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use hex;
 use serde::Serialize;
 
 #[derive(Serialize)]

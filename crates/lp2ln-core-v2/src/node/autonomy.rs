@@ -119,10 +119,8 @@ impl ConfigAutonomy {
         let candidate = match NodeOptions::from_json(&raw) {
             Ok(v) => v,
             Err(err) => {
-                self.journal.append_event(
-                    "rollback",
-                    json!({"reason": "parse_failed", "error": err}),
-                );
+                self.journal
+                    .append_event("rollback", json!({"reason": "parse_failed", "error": err}));
                 return Ok(self.fallback_result(
                     "config parse failed; using fallback".to_string(),
                     developer_options,
@@ -260,8 +258,8 @@ impl ConfigAutonomy {
                         continue;
                     }
                     if active.peer_connection_policy != candidate.peer_connection_policy {
-                        let applied =
-                            node.set_peer_connection_policy(candidate.peer_connection_policy.clone());
+                        let applied = node
+                            .set_peer_connection_policy(candidate.peer_connection_policy.clone());
                         active.peer_connection_policy = applied;
                         changed = true;
                     }
@@ -287,7 +285,9 @@ impl ConfigAutonomy {
             return StartupConfigResult {
                 options: lkg,
                 source: StartupConfigSource::LastKnownGood,
-                degraded_reason: Some("rolled back to last-known-good after config failure".to_string()),
+                degraded_reason: Some(
+                    "rolled back to last-known-good after config failure".to_string(),
+                ),
             };
         }
         StartupConfigResult {
@@ -328,7 +328,8 @@ pub fn validate_options(options: &NodeOptions) -> ValidationReport {
 
     if options.keypair.is_none() {
         soft_warnings.push(
-            "soft.keypair: private_key_hex is missing, runtime will load/generate keypair".to_string(),
+            "soft.keypair: private_key_hex is missing, runtime will load/generate keypair"
+                .to_string(),
         );
     }
     if options.listens.is_empty() {
@@ -351,12 +352,12 @@ pub fn validate_options(options: &NodeOptions) -> ValidationReport {
     }
     let p = options.peer_connection_policy.normalized();
     if p.max_active_peers > 128 {
-        soft_warnings.push("soft.peer_connection_policy: max_active_peers is high (>128)".to_string());
+        soft_warnings
+            .push("soft.peer_connection_policy: max_active_peers is high (>128)".to_string());
     }
     if options.topology_tuning.dial_retry_cooldown_ms < 1_000 {
-        soft_warnings.push(
-            "soft.topology_tuning: dial_retry_cooldown_ms is too small (<1000)".to_string(),
-        );
+        soft_warnings
+            .push("soft.topology_tuning: dial_retry_cooldown_ms is too small (<1000)".to_string());
     }
 
     ValidationReport {

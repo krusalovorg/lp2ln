@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use dashmap::DashMap;
 
-use crate::peer_score::{total_score, PeerScoreStore, PeerScoreWeights};
+use crate::peer_score::{PeerScoreStore, PeerScoreWeights, total_score};
+use crate::services::{MetricsProvider, SessionRegistry, SessionSelector};
 use crate::sessions::session::LinkKind;
 use crate::sessions::{Session, SessionMetrics};
 use crate::types::{PeerId, SessionId};
@@ -71,28 +73,30 @@ impl SessionManager {
     }
 
     fn add_to_protocol(&self, kind: LinkKind, session_id: SessionId) {
-        self.by_protocol
-            .entry(kind)
-            .or_default()
-            .push(session_id);
+        self.by_protocol.entry(kind).or_default().push(session_id);
     }
 
-    pub fn register(&self, peer_id: PeerId, session_id: SessionId, session: Arc<dyn Session + Send + Sync>) {
+    pub fn register(
+        &self,
+        peer_id: PeerId,
+        session_id: SessionId,
+        session: Arc<dyn Session + Send + Sync>,
+    ) {
         self.peer_scores.touch_peer(&peer_id);
         self.add_to_protocol(session.kind(), session_id.clone());
         self.sessions.insert(session_id.clone(), session);
-        self.metrics.insert(session_id.clone(), SessionMetrics::new());
-        self.session_to_peer.insert(session_id.clone(), peer_id.clone());
-        self.by_peer
-            .entry(peer_id)
-            .or_default()
-            .push(session_id);
+        self.metrics
+            .insert(session_id.clone(), SessionMetrics::new());
+        self.session_to_peer
+            .insert(session_id.clone(), peer_id.clone());
+        self.by_peer.entry(peer_id).or_default().push(session_id);
     }
 
     pub fn register_session(&self, session_id: SessionId, session: Arc<dyn Session + Send + Sync>) {
         self.add_to_protocol(session.kind(), session_id.clone());
         self.sessions.insert(session_id.clone(), session);
-        self.metrics.insert(session_id.clone(), SessionMetrics::new());
+        self.metrics
+            .insert(session_id.clone(), SessionMetrics::new());
     }
 
     pub fn set_peer_for_session(&self, session_id: SessionId, peer_id: PeerId) {
@@ -100,11 +104,9 @@ impl SessionManager {
             return;
         }
         self.peer_scores.touch_peer(&peer_id);
-        self.session_to_peer.insert(session_id.clone(), peer_id.clone());
-        self.by_peer
-            .entry(peer_id)
-            .or_default()
-            .push(session_id);
+        self.session_to_peer
+            .insert(session_id.clone(), peer_id.clone());
+        self.by_peer.entry(peer_id).or_default().push(session_id);
     }
 
     pub fn get(&self, session_id: &SessionId) -> Option<Arc<dyn Session + Send + Sync>> {
@@ -118,13 +120,13 @@ impl SessionManager {
 
     pub fn get_all_for_peer(&self, peer_id: &PeerId) -> Vec<Arc<dyn Session + Send + Sync>> {
         self.prune_stale_peer_index();
-        let Some(ids_ref) = self.by_peer.get(peer_id) else { return vec![] };
+        let Some(ids_ref) = self.by_peer.get(peer_id) else {
+            return vec![];
+        };
         let ids = ids_ref.clone();
         drop(ids_ref);
 
-        ids.into_iter()
-            .filter_map(|id| self.get(&id))
-            .collect()
+        ids.into_iter().filter_map(|id| self.get(&id)).collect()
     }
 
     pub fn get_all_peers(&self) -> Vec<PeerId> {
@@ -152,7 +154,10 @@ impl SessionManager {
         base - self.peer_weights.w_latency * stale * 0.35 - self.peer_weights.w_load * err_rate
     }
 
-    pub fn get_best_session_for_peer(&self, peer_id: &PeerId) -> Option<Arc<dyn Session + Send + Sync>> {
+    pub fn get_best_session_for_peer(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<Arc<dyn Session + Send + Sync>> {
         let sessions = self.get_all_for_peer(peer_id);
         if sessions.is_empty() {
             return None;
@@ -163,7 +168,9 @@ impl SessionManager {
         let mut best: Option<(Arc<dyn Session + Send + Sync>, f32)> = None;
         for session in sessions {
             let session_id = SessionId::from(session.id().to_string());
-            let Some(metrics) = self.get_metrics(&session_id) else { continue };
+            let Some(metrics) = self.get_metrics(&session_id) else {
+                continue;
+            };
             let rank = self.session_send_priority(peer_id, &session_id, &metrics);
             let better = match &best {
                 None => true,
@@ -316,5 +323,81 @@ impl SessionManager {
             self.close_session(&id).await?;
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl SessionRegistry for SessionManager {
+    fn register_session(
+        &self,
+        peer_id: PeerId,
+        session_id: SessionId,
+        session: Arc<dyn Session + Send + Sync>,
+    ) {
+        SessionManager::register(self, peer_id, session_id, session);
+    }
+
+    fn register_session_only(
+        &self,
+        session_id: SessionId,
+        session: Arc<dyn Session + Send + Sync>,
+    ) {
+        SessionManager::register_session(self, session_id, session);
+    }
+
+    fn set_peer_for_session(&self, session_id: SessionId, peer_id: PeerId) {
+        SessionManager::set_peer_for_session(self, session_id, peer_id);
+    }
+
+    async fn teardown_session(&self, session_id: &SessionId) -> Result<()> {
+        SessionManager::close_session(self, session_id).await
+    }
+}
+
+impl SessionSelector for SessionManager {
+    fn session(&self, session_id: &SessionId) -> Option<Arc<dyn Session + Send + Sync>> {
+        SessionManager::get(self, session_id)
+    }
+
+    fn best_session_for_peer(&self, peer_id: &PeerId) -> Option<Arc<dyn Session + Send + Sync>> {
+        SessionManager::get_best_session_for_peer(self, peer_id)
+    }
+
+    fn connected_peers(&self) -> Vec<PeerId> {
+        SessionManager::get_all_peers(self)
+    }
+
+    fn peers_sorted_by_score(&self) -> Vec<PeerId> {
+        SessionManager::get_all_peers_sorted_by_score(self)
+    }
+}
+
+impl MetricsProvider for SessionManager {
+    fn record_packets_sent(&self, session_id: &SessionId, bytes: u64) {
+        self.update_metrics(session_id, |m| m.increment_packets_sent(bytes));
+    }
+
+    fn record_send_error(&self, session_id: &SessionId) {
+        self.update_metrics(session_id, |m| m.increment_send_errors());
+    }
+
+    fn record_packets_received(&self, session_id: &SessionId, bytes: u64) {
+        self.update_metrics(session_id, |m| m.increment_packets_received(bytes));
+    }
+
+    fn get_metrics_for_protocol(&self, kind: LinkKind) -> Vec<SessionMetrics> {
+        SessionManager::get_metrics_for_protocol(self, kind)
+    }
+
+    fn get_metrics_by_protocol(&self) -> Vec<(LinkKind, Vec<SessionMetrics>)> {
+        SessionManager::get_metrics_by_protocol(self)
+    }
+
+    fn peer_metrics_rollup(&self) -> Vec<(PeerId, Vec<SessionMetrics>)> {
+        SessionManager::peer_metrics_rollup(self)
+    }
+
+    fn total_sessions_count(&self) -> usize {
+        SessionManager::total_sessions_count(self)
     }
 }

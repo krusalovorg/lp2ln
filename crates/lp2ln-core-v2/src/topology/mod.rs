@@ -4,15 +4,15 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use rand::seq::SliceRandom;
 use hex;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
-use crate::peer_score::{total_score, PeerConnectionPolicy, PeerScore, PeerScoreWeights};
-use crate::types::PeerId;
 use crate::metrics::NodeHealthSnapshot;
+use crate::peer_score::{PeerConnectionPolicy, PeerScore, PeerScoreWeights, total_score};
+use crate::types::PeerId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapabilities {
@@ -136,7 +136,8 @@ impl NodeDescriptor {
     }
 
     pub fn expires_at_ms(&self) -> u64 {
-        self.timestamp_ms.saturating_add(self.ttl_secs.saturating_mul(1000))
+        self.timestamp_ms
+            .saturating_add(self.ttl_secs.saturating_mul(1000))
     }
 }
 
@@ -155,7 +156,10 @@ pub fn parse_observed_addr_line(s: &str) -> Option<(String, SocketAddr)> {
     s.parse().ok().map(|a| ("tcp".to_string(), a))
 }
 
-pub fn sign_descriptor(descriptor: &mut NodeDescriptor, signing_key: &SigningKey) -> Result<(), String> {
+pub fn sign_descriptor(
+    descriptor: &mut NodeDescriptor,
+    signing_key: &SigningKey,
+) -> Result<(), String> {
     descriptor.signature.clear();
     let unsigned = NodeDescriptorUnsigned {
         peer_id: &descriptor.peer_id,
@@ -445,9 +449,7 @@ impl PeerCatalog {
     }
 
     pub fn descriptor_of(&self, peer_id: &PeerId) -> Option<NodeDescriptor> {
-        self.peers
-            .get(peer_id)
-            .and_then(|r| r.descriptor.clone())
+        self.peers.get(peer_id).and_then(|r| r.descriptor.clone())
     }
 
     pub fn upsert_descriptor(&self, descriptor: NodeDescriptor) -> Result<bool, String> {
@@ -526,7 +528,8 @@ impl PeerCatalog {
         let now = now_ms();
         let hl = half_life.as_secs_f32().max(1.0);
         for mut rec in self.peers.iter_mut() {
-            let age_secs = ((now.saturating_sub(rec.view.last_updated_ms)) as f32 / 1000.0).max(0.0);
+            let age_secs =
+                ((now.saturating_sub(rec.view.last_updated_ms)) as f32 / 1000.0).max(0.0);
             let decay = 2.0_f32.powf(-age_secs / hl);
             rec.view.stability_score *= decay.max(0.5);
             rec.view.local_total_score *= decay.max(0.6);
@@ -545,7 +548,10 @@ impl PeerCatalog {
                         rec.descriptor = None;
                     }
                 }
-                if rec.descriptor.is_none() && rec.view.success_count == 0 && rec.view.failure_count == 0 {
+                if rec.descriptor.is_none()
+                    && rec.view.success_count == 0
+                    && rec.view.failure_count == 0
+                {
                     remove = true;
                 }
             }
@@ -560,17 +566,35 @@ impl PeerCatalog {
         for mut rec in self.peers.iter_mut() {
             let (relay, storage, routing, load_penalty, nat, up): (f32, f32, f32, f32, f32, f32) =
                 if let Some(desc) = rec.descriptor.as_ref() {
-                let relay = if desc.capabilities.can_relay { 1.0 } else { 0.2 };
-                let storage = if desc.capabilities.can_store_data { 1.0 } else { 0.2 };
-                let routing = if desc.capabilities.public_reachable { 0.9 } else { 0.4 };
-                let load = ((desc.dynamic_status.cpu_load + desc.dynamic_status.memory_pressure) / 2.0)
-                    .clamp(0.0, 1.0);
-                let nat = if desc.capabilities.public_reachable { 0.9 } else { 0.6 };
-                let up = 1.0 - load * 0.5;
-                (relay, storage, routing, load, nat, up)
-            } else {
-                (0.5, 0.5, 0.5, 0.3, 0.5, 0.5)
-            };
+                    let relay = if desc.capabilities.can_relay {
+                        1.0
+                    } else {
+                        0.2
+                    };
+                    let storage = if desc.capabilities.can_store_data {
+                        1.0
+                    } else {
+                        0.2
+                    };
+                    let routing = if desc.capabilities.public_reachable {
+                        0.9
+                    } else {
+                        0.4
+                    };
+                    let load = ((desc.dynamic_status.cpu_load
+                        + desc.dynamic_status.memory_pressure)
+                        / 2.0)
+                        .clamp(0.0, 1.0);
+                    let nat = if desc.capabilities.public_reachable {
+                        0.9
+                    } else {
+                        0.6
+                    };
+                    let up = 1.0 - load * 0.5;
+                    (relay, storage, routing, load, nat, up)
+                } else {
+                    (0.5, 0.5, 0.5, 0.3, 0.5, 0.5)
+                };
             let total = rec.view.success_count + rec.view.failure_count;
             let success_rate = if total > 0 {
                 rec.view.success_count as f32 / total as f32
@@ -618,7 +642,9 @@ impl PeerCatalog {
         let policy = policy.normalized();
         let exploratory_n = (policy.target_active_peers / 6).max(1);
         let core_n = (policy.target_active_peers / 2).max(1);
-        let utility_n = policy.target_active_peers.saturating_sub(core_n + exploratory_n);
+        let utility_n = policy
+            .target_active_peers
+            .saturating_sub(core_n + exploratory_n);
         let mut set = NeighborSet::default();
         for (i, (pid, _)) in ranked.iter().enumerate() {
             if i < core_n {

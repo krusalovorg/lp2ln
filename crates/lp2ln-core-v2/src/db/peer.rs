@@ -1,22 +1,18 @@
 use crate::db::tables::PEER_INFO_TABLE;
-use redb::Error;
 use anyhow::Result;
-use uuid::Uuid;
+use redb::Error;
 use std::io::Read;
+use uuid::Uuid;
 
 use hex::{decode as hex_decode, encode as hex_encode};
-use k256::{
-    elliptic_curve::rand_core::OsRng,
-    SecretKey,
-    PublicKey,
-};
 use k256::ecdsa::SigningKey;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::generic_array::{GenericArray, typenum::U32};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::{PublicKey, SecretKey, elliptic_curve::rand_core::OsRng};
 
 use super::P2PDatabase;
-use crate::crypto::crypto::{get_shared_secret, encrypt, decrypt};
 use crate::crypto::NodeKeypair;
+use crate::crypto::crypto::{decrypt, encrypt, get_shared_secret};
 
 impl P2PDatabase {
     fn get_private_key_bytes(&self) -> Result<Vec<u8>, Error> {
@@ -24,7 +20,8 @@ impl P2PDatabase {
         let read_txn = db.begin_read()?;
         let table = read_txn.open_table(PEER_INFO_TABLE)?;
 
-        let data = table.get("private_key")?
+        let data = table
+            .get("private_key")?
             .ok_or_else(|| Error::Corrupted("Private key not found".to_string()))?;
         let priv_key_hex = String::from_utf8(data.value().to_vec())
             .map_err(|_| Error::Corrupted("Invalid UTF-8 in private key".to_string()))?;
@@ -123,17 +120,26 @@ impl P2PDatabase {
     }
 
     /// Зашифровать сообщение для другого пира
-    pub fn encrypt_message(&self, message: &[u8], peer_public_key: &str) -> Result<(Vec<u8>, [u8; 12])> {
+    pub fn encrypt_message(
+        &self,
+        message: &[u8],
+        peer_public_key: &str,
+    ) -> Result<(Vec<u8>, [u8; 12])> {
         let private_key = self.get_private_key()?;
         let peer_pub_key_bytes = hex_decode(peer_public_key)
             .map_err(|e| anyhow::anyhow!("Failed to decode peer public key: {}", e))?;
-        
+
         let shared_secret = get_shared_secret(&private_key, &peer_pub_key_bytes);
         Ok(encrypt(message, shared_secret))
     }
 
     /// Расшифровать сообщение от другого пира
-    pub fn decrypt_message(&self, ciphertext: &[u8], nonce: [u8; 12], peer_public_key: &str) -> Result<Vec<u8>> {
+    pub fn decrypt_message(
+        &self,
+        ciphertext: &[u8],
+        nonce: [u8; 12],
+        peer_public_key: &str,
+    ) -> Result<Vec<u8>> {
         let private_key = self.get_private_key()?;
         let peer_pub_key_bytes = hex_decode(peer_public_key)
             .map_err(|e| anyhow::anyhow!("Failed to decode peer public key: {}", e))?;
@@ -141,7 +147,7 @@ impl P2PDatabase {
             .map_err(|e| anyhow::anyhow!("Invalid peer public key: {}", e))?;
         let encoded_point = peer_pub_key.to_encoded_point(false);
         let peer_pub_key_bytes = encoded_point.as_bytes();
-        
+
         let shared_secret = get_shared_secret(&private_key, peer_pub_key_bytes);
         Ok(decrypt(ciphertext, shared_secret, nonce))
     }
@@ -150,7 +156,8 @@ impl P2PDatabase {
     pub fn uncompress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut decoder = flate2::read::GzDecoder::new(data);
         let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)
+        decoder
+            .read_to_end(&mut decompressed_data)
             .map_err(|e| anyhow::anyhow!("Failed to decompress data: {}", e))?;
         Ok(decompressed_data)
     }

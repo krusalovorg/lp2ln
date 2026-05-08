@@ -25,7 +25,8 @@ pub fn spawn_health_server(
                 Ok(v) => break v,
                 Err(err) => {
                     let next_port = bind_addr.port().saturating_add(1);
-                    if next_port == bind_addr.port() || next_port > start_addr.port().saturating_add(20)
+                    if next_port == bind_addr.port()
+                        || next_port > start_addr.port().saturating_add(20)
                     {
                         crate::error!(
                             "[HealthServer] bind {} failed and no fallback ports left: {}",

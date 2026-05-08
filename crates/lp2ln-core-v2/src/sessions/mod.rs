@@ -1,5 +1,5 @@
 pub mod manager;
-pub mod session;
 pub mod metrics;
-pub use session::{Session, IncomingPacket, LinkKind};
+pub mod session;
 pub use metrics::SessionMetrics;
+pub use session::{IncomingPacket, LinkKind, Session};

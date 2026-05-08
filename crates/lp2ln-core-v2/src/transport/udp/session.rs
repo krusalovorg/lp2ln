@@ -1,22 +1,22 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use anyhow::Result;
-use tokio::net::UdpSocket;
-use uuid::Uuid;
 use crate::packet::Packet;
 use crate::sessions::{IncomingPacket, LinkKind, Session};
 use crate::transport::obfuscation::Obfuscator;
 use crate::transport::udp::codec::{decode_packet, encode_packet};
+use anyhow::Result;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use uuid::Uuid;
 
 pub struct UdpSession {
     id: String,
     peer_id: Option<String>,
     kind: LinkKind,
-    
+
     tx: tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    
+
     socket: Arc<UdpSocket>,
-    
+
     peer_addr: SocketAddr,
     obfuscator: Arc<Obfuscator>,
 }
@@ -38,7 +38,9 @@ impl Session for UdpSession {
     async fn send(&self, packet: Packet) -> Result<u64> {
         let bytes = encode_packet(packet)?;
         let len = bytes.len() as u64;
-        self.tx.send((bytes, self.peer_addr)).await
+        self.tx
+            .send((bytes, self.peer_addr))
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
         Ok(len)
     }
@@ -47,11 +49,14 @@ impl Session for UdpSession {
         drop(self.tx.clone());
         Ok(())
     }
-    
-    fn spawn_reader(self: Arc<Self>, incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>) {
+
+    fn spawn_reader(
+        self: Arc<Self>,
+        incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
+    ) {
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
-        
+
         tokio::spawn(async move {
             loop {
                 match self.read_packet().await {
@@ -93,9 +98,9 @@ impl UdpSession {
         obfuscator: Arc<Obfuscator>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
-        
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
-        
+
         let session = Arc::new(Self {
             id,
             peer_id,
@@ -105,7 +110,7 @@ impl UdpSession {
             peer_addr,
             obfuscator: obfuscator.clone(),
         });
-        
+
         let socket_clone = socket.clone();
         let obfuscator_clone = obfuscator.clone();
         tokio::spawn(async move {
@@ -123,13 +128,13 @@ impl UdpSession {
                 }
             }
         });
-        
+
         Ok(session)
     }
-    
+
     async fn read_packet(&self) -> Result<Packet> {
         let mut buf = vec![0u8; 65507];
-        
+
         match self.socket.recv_from(&mut buf).await {
             Ok((size, _from_addr)) => {
                 buf.truncate(size);
@@ -137,10 +142,7 @@ impl UdpSession {
                 let packet = decode_packet(decoded)?;
                 Ok(packet)
             }
-            Err(e) => {
-                Err(anyhow::anyhow!("Failed to receive UDP datagram: {}", e))
-            }
+            Err(e) => Err(anyhow::anyhow!("Failed to receive UDP datagram: {}", e)),
         }
     }
 }
-

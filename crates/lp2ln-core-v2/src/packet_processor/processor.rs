@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::crypto::NodeKeypair;
 use crate::crypto::secure_channel::{
-    decode_secure_envelope, derive_shared_key, is_secure_envelope, ReplayWindow,
+    ReplayWindow, decode_secure_envelope, derive_shared_key, is_secure_envelope,
 };
 use crate::crypto::signature::verify_packet;
-use crate::crypto::NodeKeypair;
-use crate::node::nat_traversal::NatTraversalState;
+use crate::nat::NatTraversalState;
 use crate::router::Router;
+use crate::services::{PacketPublisher, SessionRegistry, SessionSelector};
 use crate::sessions::IncomingPacket;
 use crate::topology::PeerCatalog;
 use crate::types::{PeerId, SessionId};
@@ -61,7 +62,8 @@ impl PacketProcessor for DefaultPacketProcessor {
             if let Err(e) = verify_packet(&packet) {
                 crate::processor!(
                     "Invalid or missing signature, dropping packet from {}: {}",
-                    packet.sender, e
+                    packet.sender,
+                    e
                 );
                 return;
             }
@@ -86,11 +88,7 @@ impl PacketProcessor for DefaultPacketProcessor {
             let key = match derive_shared_key(self.local_keypair.signing_key(), &packet.sender) {
                 Ok(k) => k,
                 Err(e) => {
-                    crate::processor!(
-                        "Failed to derive secure key from {}: {}",
-                        packet.sender,
-                        e
-                    );
+                    crate::processor!("Failed to derive secure key from {}: {}", packet.sender, e);
                     return;
                 }
             };
@@ -125,9 +123,12 @@ impl PacketProcessor for DefaultPacketProcessor {
             .as_deref()
             .unwrap_or_else(|| packet.sender.as_str());
         let peer_id = PeerId::from_str(from);
-        router.set_peer_for_session(session_id.clone(), peer_id.clone());
+        let registry: &dyn SessionRegistry = router.as_ref();
+        registry.set_peer_for_session(session_id.clone(), peer_id.clone());
 
         let receiver = packet.receiver.clone();
+        let publisher: &dyn PacketPublisher = router.as_ref();
+        let selector: &dyn SessionSelector = router.as_ref();
 
         if receiver == self.our_peer_id || receiver.is_empty() {
             if super::control::try_handle_control_packet(
@@ -136,9 +137,10 @@ impl PacketProcessor for DefaultPacketProcessor {
                 from,
                 &peer_id,
                 self.peer_catalog.as_ref(),
-                router.clone(),
+                publisher,
+                selector,
                 self.peer_discovery_random_fraction,
-                self.nat_state.clone(),
+                self.nat_state.as_ref(),
             )
             .await
             {
@@ -152,7 +154,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                 &peer_id,
                 &session_id,
                 self.peer_catalog.as_ref(),
-                router,
+                publisher,
             )
             .await;
         } else {
@@ -162,7 +164,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                 &self.our_peer_id,
                 &peer_id,
                 PeerId::from_str(receiver.as_str()),
-                router,
+                publisher,
             )
             .await;
         }

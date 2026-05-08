@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use crate::packet::Packet;
 use crate::protocol::control::NetworkControlPayload;
-use crate::router::Router;
+use crate::services::PacketPublisher;
 use crate::types::{PeerId, SessionId};
 
 pub async fn forward_packet(
@@ -11,7 +9,7 @@ pub async fn forward_packet(
     our_peer_id: &str,
     source_peer_id: &PeerId,
     target_peer_id: PeerId,
-    router: Arc<Router>,
+    publisher: &dyn PacketPublisher,
 ) {
     if packet.max_hops == 0 {
         let is_control_packet = NetworkControlPayload::decode(&packet.data).is_ok();
@@ -38,14 +36,15 @@ pub async fn forward_packet(
     packet.nodes.push(our_peer_id.to_string());
     let sid = SessionId::from(incoming_session_id.to_string());
     let ok = if target_peer_id == *source_peer_id {
-        router.send_to_session(sid, packet.clone()).await.is_ok()
+        publisher.send_to_session(sid, packet.clone()).await.is_ok()
     } else {
         false
     };
-    let ok = ok || router
-        .send_to_peer(target_peer_id.clone(), packet, Some(source_peer_id.clone()))
-        .await
-        .is_ok();
+    let ok = ok
+        || publisher
+            .send_to_peer(target_peer_id.clone(), packet, Some(source_peer_id.clone()))
+            .await
+            .is_ok();
 
     if !ok {
         crate::error!(

@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 use crate::node::options::{BootstrapNode, NodeOptions};
-use crate::peer_score::{total_score, PeerScoreStore};
+use crate::peer_score::{PeerScoreStore, total_score};
 
-pub fn ordered_bootstrap_targets(options: &NodeOptions, peer_scores: &PeerScoreStore) -> Vec<BootstrapNode> {
+pub fn ordered_bootstrap_targets(
+    options: &NodeOptions,
+    peer_scores: &PeerScoreStore,
+) -> Vec<BootstrapNode> {
     let mut targets = if options.bootstrap_nodes.is_empty() {
         options
             .default_nodes
@@ -46,7 +49,11 @@ pub fn detect_lan_advertise_ip(
     probes.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53));
 
     for remote in probes {
-        let bind_addr = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind_addr = if remote.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let Ok(sock) = UdpSocket::bind(bind_addr) else {
             continue;
         };

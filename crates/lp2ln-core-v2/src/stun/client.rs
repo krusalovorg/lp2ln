@@ -1,5 +1,5 @@
-use stun_client::{Attribute, Client};
 use super::config::StunConfig;
+use stun_client::{Attribute, Client};
 
 pub struct StunClient {
     config: StunConfig,

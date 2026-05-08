@@ -1,4 +1,3 @@
-
 mod store;
 
 use serde::{Deserialize, Serialize};
@@ -155,7 +154,9 @@ pub fn select_best_relay(
     scores: impl Fn(&PeerId) -> PeerScore,
     base_weights: &PeerScoreWeights,
 ) -> Option<PeerId> {
-    let w = base_weights.clone().for_context(PeerSelectionContext::Relay);
+    let w = base_weights
+        .clone()
+        .for_context(PeerSelectionContext::Relay);
     select_top_k(peers, scores, &w, 1).into_iter().next()
 }
 

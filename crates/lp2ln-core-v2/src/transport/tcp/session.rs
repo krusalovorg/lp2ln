@@ -1,9 +1,6 @@
-use std::sync::Arc;
 use std::io::ErrorKind;
+use std::sync::Arc;
 
-use anyhow::Result;
-use tokio::net::TcpStream;
-use uuid::Uuid;
 use crate::crypto::signature::verify_packet;
 use crate::packet::Packet;
 use crate::protocol::handshake::decode_hello;
@@ -12,6 +9,9 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::session::Session;
 use crate::transport::obfuscation::Obfuscator;
 use crate::transport::tcp::codec::{decode_packet, encode_packet};
+use anyhow::Result;
+use tokio::net::TcpStream;
+use uuid::Uuid;
 
 fn tcp_peer_display(peer_id: &Option<String>, session_id: &str) -> String {
     match peer_id {
@@ -48,7 +48,12 @@ fn is_benign_tcp_disconnect(err: &anyhow::Error) -> bool {
     false
 }
 
-fn log_tcp_session_disconnect(kind: LinkKind, peer_id: &Option<String>, session_id: &str, when: &str) {
+fn log_tcp_session_disconnect(
+    kind: LinkKind,
+    peer_id: &Option<String>,
+    session_id: &str,
+    when: &str,
+) {
     let peer = tcp_peer_display(peer_id, session_id);
     crate::net_disconnect!("[TcpSession] Node {peer} disconnected (link={kind}, {when})");
 }
@@ -59,7 +64,7 @@ pub struct TcpSession {
     kind: LinkKind,
 
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    
+
     read: tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>,
     obfuscator: Arc<Obfuscator>,
 }
@@ -81,7 +86,9 @@ impl Session for TcpSession {
     async fn send(&self, packet: Packet) -> Result<u64> {
         let bytes = encode_packet(packet)?;
         let len = bytes.len() as u64;
-        self.tx.send(bytes).await
+        self.tx
+            .send(bytes)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
         Ok(len)
     }
@@ -90,12 +97,15 @@ impl Session for TcpSession {
         drop(self.tx.clone());
         Ok(())
     }
-    
-    fn spawn_reader(self: Arc<Self>, incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>) {
+
+    fn spawn_reader(
+        self: Arc<Self>,
+        incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
+    ) {
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
         let link_kind = self.kind();
-        
+
         tokio::spawn(async move {
             loop {
                 match self.read_packet().await {
@@ -119,12 +129,7 @@ impl Session for TcpSession {
                     }
                     Err(e) => {
                         if is_benign_tcp_disconnect(&e) {
-                            log_tcp_session_disconnect(
-                                link_kind,
-                                &peer_id,
-                                &session_id,
-                                "on read",
-                            );
+                            log_tcp_session_disconnect(link_kind, &peer_id, &session_id, "on read");
                         } else {
                             crate::error!(
                                 "[TcpSession] Read error for {}: {}",
@@ -141,7 +146,6 @@ impl Session for TcpSession {
     }
 }
 
-
 impl TcpSession {
     pub fn new_from_stream(
         stream: TcpStream,
@@ -151,9 +155,9 @@ impl TcpSession {
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
         let (read_half, write_half) = stream.into_split();
-        
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
-        
+
         let session = Arc::new(Self {
             id,
             peer_id,
@@ -162,18 +166,18 @@ impl TcpSession {
             read: tokio::sync::Mutex::new(read_half),
             obfuscator: obfuscator.clone(),
         });
-        
+
         let write_half_arc = Arc::new(tokio::sync::Mutex::new(write_half));
         let write_half_clone = write_half_arc.clone();
         let obfuscator_clone = obfuscator.clone();
         let writer_peer_id = session.peer_id.clone();
         let writer_session_id = session.id.clone();
         let writer_kind = session.kind;
-        
+
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 let mut writer = write_half_clone.lock().await;
-                
+
                 if let Err(e) = obfuscator_clone.write_frame(&mut *writer, &data).await {
                     if is_benign_tcp_disconnect(&e) {
                         log_tcp_session_disconnect(
@@ -193,17 +197,17 @@ impl TcpSession {
                 }
             }
         });
-        
+
         Ok(session)
     }
-    
+
     async fn read_packet(&self) -> Result<Packet> {
         let mut reader = self.read.lock().await;
         let frame_data = self.obfuscator.read_frame(&mut *reader).await?;
         let packet = decode_packet(frame_data)?;
         Ok(packet)
     }
-    
+
     pub async fn perform_handshake_on_stream(
         stream: &mut TcpStream,
         obfuscator: &Obfuscator,
@@ -222,8 +226,11 @@ impl TcpSession {
         }
         Ok(packet.sender)
     }
-    
-    pub async fn send_handshake_on_stream(stream: &mut TcpStream, our_peer_id: String) -> Result<()> {
+
+    pub async fn send_handshake_on_stream(
+        stream: &mut TcpStream,
+        our_peer_id: String,
+    ) -> Result<()> {
         let handshake_packet = Packet {
             signature: None,
             data: vec![],

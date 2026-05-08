@@ -22,10 +22,7 @@ impl Default for StunConfig {
 impl StunConfig {
     pub fn new() -> Self {
         Self {
-            servers: DEFAULT_STUN_SERVERS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            servers: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -41,9 +38,7 @@ impl StunConfig {
             }
         }
 
-        Self {
-            servers,
-        }
+        Self { servers }
     }
 
     pub fn with_custom_servers_only(custom_servers: Vec<String>) -> Self {

@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use crate::packet::Packet;
 use crate::protocol::handshake;
-use crate::router::Router;
+use crate::services::PacketPublisher;
 use crate::topology::PeerCatalog;
 use crate::types::{PeerId, SessionId};
 
@@ -14,7 +12,7 @@ pub async fn handle_local_packet(
     peer_id: &PeerId,
     session_id: &SessionId,
     peer_catalog: &PeerCatalog,
-    router: Arc<Router>,
+    publisher: &dyn PacketPublisher,
 ) {
     match payload {
         [] => {
@@ -30,7 +28,7 @@ pub async fn handle_local_packet(
                 chunk_index: None,
                 total_chunks: None,
             };
-            if let Err(e) = router.send_to_session(session_id.clone(), ack).await {
+            if let Err(e) = publisher.send_to_session(session_id.clone(), ack).await {
                 let msg = e.to_string();
                 if msg.contains("not found") {
                     crate::debug!(
@@ -59,7 +57,7 @@ pub async fn handle_local_packet(
                 chunk_index: None,
                 total_chunks: None,
             };
-            if let Err(e) = router.send_to_session(session_id.clone(), ack).await {
+            if let Err(e) = publisher.send_to_session(session_id.clone(), ack).await {
                 let msg = e.to_string();
                 if msg.contains("not found") {
                     crate::debug!(
@@ -85,7 +83,7 @@ pub async fn handle_local_packet(
                 chunk_index: None,
                 total_chunks: None,
             };
-            if let Err(e) = router.send_to_peer(peer_id.clone(), pong, None).await {
+            if let Err(e) = publisher.send_to_peer(peer_id.clone(), pong, None).await {
                 crate::error!("[PacketProcessor] Failed to send pong: {}", e);
             }
         }

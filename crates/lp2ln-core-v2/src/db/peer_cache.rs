@@ -15,8 +15,9 @@ impl P2PDatabase {
         let tx = db.begin_write()?;
         {
             let mut table = tx.open_table(PEER_DESCRIPTOR_TABLE)?;
-            let data = serde_json::to_vec(descriptor)
-                .map_err(|e| redb::Error::Corrupted(format!("descriptor serialize failed: {}", e)))?;
+            let data = serde_json::to_vec(descriptor).map_err(|e| {
+                redb::Error::Corrupted(format!("descriptor serialize failed: {}", e))
+            })?;
             table.insert(descriptor.peer_id.as_str(), data.as_slice())?;
         }
         tx.commit()?;
@@ -56,9 +57,8 @@ impl P2PDatabase {
         for (pid, s) in entries {
             map.insert(pid.as_str().to_string(), s.clone());
         }
-        let data = serde_json::to_vec(&map).map_err(|e| {
-            redb::Error::Corrupted(format!("peer_scores serialize failed: {}", e))
-        })?;
+        let data = serde_json::to_vec(&map)
+            .map_err(|e| redb::Error::Corrupted(format!("peer_scores serialize failed: {}", e)))?;
         let db = self.db.lock().unwrap();
         let tx = db.begin_write()?;
         {
