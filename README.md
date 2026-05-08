@@ -13,6 +13,7 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
 ## Contents
 
 - [Documentation (Wiki)](#documentation-wiki)
+- [Related repositories](#related-repositories)
 - [Overview](#overview)
 - [Workspace layout](#workspace-layout)
 - [Crates](#crates)
@@ -25,6 +26,7 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
   - [`lp2ln-db-export`](#lp2ln-db-export)
 - [Configuration](#configuration)
 - [Development](#development)
+- [Validation and tests](#validation-and-tests)
 - [Why AGPL + Commercial Licensing?](#why-agpl--commercial-licensing)
 - [License](#license)
 
@@ -55,12 +57,12 @@ Additional local docs:
 
 | Area | Notes |
 |------|--------|
-| **Stacks** | **v2 (`lp2ln-core-v2`):** egalitarian peers, no signal server—**main focus**. Legacy stack has been moved to a dedicated repository: [lp2ln-legacy](https://github.com/krusalovorg/lp2ln-legacy). |
-| **Networking** | Async I/O (Tokio), TCP/UDP transports in v2; STUN client usage in core crates |
+| **Stacks** | **v2 (`lp2ln-core-v2`):** egalitarian peers, no signal server in the runtime design—**main focus**. Legacy stack has been moved to a dedicated repository: [lp2ln-legacy](https://github.com/krusalovorg/lp2ln-legacy). |
+| **Networking** | Async I/O (Tokio), TCP/UDP transports in v2, peer discovery/maintenance, health/debug auxiliary endpoints |
 | **Crypto** | ECDH/ECDSA (k256), ChaCha20-Poly1305, SHA-256 |
 | **Storage** | Embedded [redb](https://github.com/cberner/redb) databases where enabled |
 | **Contracts** | WASM contract modules were moved to a dedicated repository; this workspace is focused on core/node crates |
-| **Debug tooling** | `debug-ui/` provides a React + Vite interface for packet/debug workflows |
+| **Debug tooling** | `debug-ui/` provides a React + Vite interface for packet/debug workflows; `lp2lnd` can expose a debug WebSocket stream |
 
 This repository is a **Cargo workspace**. There is no single root `src/main.rs`; binaries live under `crates/`.
 
@@ -87,8 +89,8 @@ P2P-Server/
 
 | Crate | Role |
 |-------|------|
-| **lp2ln-core-v2** | **Current** library: flat topology—**all peers are equal**; **no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, logging, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.85** (edition **2024**; see `crates/lp2ln-core-v2/Cargo.toml`). |
-| **lp2lnd** | Default entry point for the v2 stack. Loads `options.json` (or path from CLI), starts the node, waits for Ctrl+C. Optional binary: `lp2lnd-scale` (`scale_daemon.rs`). Optional feature: `tokio-console` (needs `RUSTFLAGS="--cfg tokio_unstable"`). |
+| **lp2ln-core-v2** | **Current** library: flat topology—**all peers are equal**; **no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, topology maintenance, event core, metrics/health snapshots, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.85** (edition **2024**; see `crates/lp2ln-core-v2/Cargo.toml`). |
+| **lp2lnd** | Default entry point for the v2 stack. Loads config transactionally (`ConfigAutonomy`), can rollback to last-known-good config, can fallback to developer defaults, starts node + health/debug services, waits for Ctrl+C. Optional binary: `lp2lnd-scale` (`scale_daemon.rs`). Optional feature: `tokio-console` (needs `RUSTFLAGS="--cfg tokio_unstable"`). |
 | **lp2ln-db-export** | CLI to dump node `redb` data to JSON (`-h` for usage). Default build includes file-picker support via the `pick` feature. |
 
 ---
@@ -198,15 +200,27 @@ cargo run -p lp2lnd --release -- --options path/to/options.json
 cargo run -p lp2lnd --release -- -o path/to/options.json
 ```
 
-Example option files ship under `crates/lp2lnd/` (e.g. `options-client.json`, `options-bootstrap-*.json`) and `crates/lp2ln-core-v2/options.json`. The on-disk format is JSON; fields include `listens`, `default_nodes`, `bootstrap_nodes`, `database_dir`, `logger_options`, `peer_connection_policy`, and others (see `NodeOptions` / `NodeOptionsFile` in `crates/lp2ln-core-v2/src/node/options.rs`).
+Example option files ship under `crates/lp2lnd/` (e.g. `options-client.json`, `options-bootstrap-*.json`) and `crates/lp2ln-core-v2/options.json`. The on-disk format is JSON; fields include `listens`, `advertise_addrs`, `default_nodes`, `bootstrap_nodes`, `database_dir`, `logger_options`, `peer_connection_policy`, `node_role`, `topology_tuning`, `transport_obfuscation`, `flow_trace`, `debug_server`, and others (see `NodeOptions` / `NodeOptionsFile` in `crates/lp2ln-core-v2/src/node/options.rs`).
 
 Logs: when file logging is enabled, output typically goes under `./logs/` (see `logger_options` in your JSON).
+
+`lp2lnd` runtime behavior summary:
+
+- config startup goes through transactional autonomy (`primary -> last-known-good -> developer defaults`);
+- runtime starts a local health endpoint (`127.0.0.1:9088` by default, overridable via `LP2LND_HEALTH_ADDR`);
+- if `debug_server.enabled` is true, debug WebSocket stream is started on configured address;
+- if `database_dir` is missing, default is `./db`.
 
 Secondary binary (same package):
 
 ```bash
 cargo run -p lp2lnd --bin lp2lnd-scale --release
 ```
+
+Scale mode docs:
+
+- crate README: [`crates/lp2lnd/README.md`](crates/lp2lnd/README.md)
+- supports `--virtual-peers`, `--from`, `--debug-base`, and related env vars for local large-node runs.
 
 ### `debug-ui` (web debug interface)
 
@@ -278,6 +292,33 @@ docker run --rm \
   -v "$(pwd)/data/logs:/app/logs" \
   lp2lnd:binary
 ```
+
+---
+
+## Validation and tests
+
+Recommended baseline checks from repository root:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features
+cargo test --workspace
+cargo build --workspace
+```
+
+Topology simulation regression and size sweep (in `lp2ln-core-v2`):
+
+```bash
+cargo test -p lp2ln-core-v2 --test topology_sim_regression
+cargo test -p lp2ln-core-v2 --test topology_sim_size_sweep
+```
+
+Manual smoke scenario (2+ nodes):
+
+1. Start one bootstrap-like node with `options-bootstrap-*.json`.
+2. Start one regular node with `options-client.json` pointing at bootstrap.
+3. Verify peer discovery, stable connectivity, and health endpoint (`/livez`, `/readyz`).
+4. If debug server is enabled, verify debug WebSocket connect and command roundtrip.
 
 ---
 
