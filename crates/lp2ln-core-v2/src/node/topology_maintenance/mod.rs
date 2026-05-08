@@ -1,27 +1,28 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
 
+mod bootstrap;
+mod descriptor;
+mod dialing;
+mod packet_helpers;
+mod policy;
+mod state;
+
+use self::policy::compute_policy_snapshot;
+use self::state::MaintenanceState;
 use crate::db::P2PDatabase;
 use crate::metrics::MetricsAggregator;
-use crate::metrics::contract::AggregatedMetricsSnapshot;
-use crate::node::addressing::advertised_addr_for_protocol;
 use crate::node::distribution::{
-    DIAL_HUB_SOFT_CAP_EXTRA, REGULAR_SELF_HEAL_FLOOR, bootstrap_dial_quota, capacity_target_factor,
-    connectivity_selective, descriptor_prefix24, dial_endpoint_attempt_budget, dial_reserve_slots,
-    peers_to_drop_when_overloaded, rank_dial_candidates, regular_auto_dial_target,
-    should_skip_for_bootstrap_quota,
+    capacity_target_factor, dial_reserve_slots, peers_to_drop_when_overloaded,
+    regular_auto_dial_target,
 };
 use crate::node::nat_traversal::NatTraversalState;
 use crate::node::options::{BootstrapNode, NodeOptions, NodeRole, TopologyTuning};
-use crate::node::topology_policy::{AdaptiveTickPolicy, compute_policy_snapshot};
-use crate::node::topology_state::MaintenanceState;
-use crate::packet::Packet;
 use crate::peer_score::{
     PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights, total_score,
 };
@@ -29,87 +30,23 @@ use crate::protocol::control::NetworkControlPayload;
 use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
-use crate::topology::{
-    CapacityBudget, NodeCapabilities, NodeDescriptor, NodeDynamicStatus, PeerCatalog,
-    descriptor_ok_for_discovery_redirect, now_ms, parse_observed_addr_line,
-    select_peers_for_discovery_response, sign_descriptor,
-};
+use crate::topology::{CapacityBudget, PeerCatalog, now_ms, parse_observed_addr_line};
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
+use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
+use descriptor::publish_descriptor_if_due;
+use dialing::{build_dial_plan, execute_dial_plan};
+use packet_helpers::{control_packet, handshake_packet, observe_failure_and_close};
 
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const MAINTENANCE_START_JITTER_MS: u64 = 3_000;
 const REGULAR_MAX_HEADROOM: usize = 2;
-const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
-const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
-/// Bootstrap shepherd: интервал между sweep'ами (мс). Не каждый tick,
-/// чтобы не мешать newcomer'у устояться.
-const SHEPHERD_SWEEP_INTERVAL_MS: u64 = 10_000;
-/// Bootstrap закрывает сессию с peer'ом, если у того уже ≥ SHEPHERD_MIN_MESH
-/// не-bootstrap соседей — он устоялся в mesh и bootstrap-слот больше не нужен.
-const SHEPHERD_MIN_MESH: u16 = 3;
-/// Минимальный grace после появления peer'а в каталоге перед shepherd-close.
-const SHEPHERD_GRACE_MS: u64 = 15_000;
-/// Сколько regular-дескрипторов вкладывать в финальный PeersResponse при shepherd-close.
-const SHEPHERD_FINAL_PEERS_LIMIT: usize = 24;
-
-fn bootstrap_identity(target: &BootstrapNode) -> String {
-    if let Some(hint) = target.peer_id_hint.as_ref() {
-        hint.as_str().to_string()
-    } else {
-        target.addr.to_string()
-    }
-}
-
-fn rank_bootstrap_targets_for_peer(
-    local_peer_id: &str,
-    targets: &[BootstrapNode],
-) -> Vec<BootstrapNode> {
-    let mut weighted: Vec<(u64, BootstrapNode)> = targets
-        .iter()
-        .cloned()
-        .map(|t| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            local_peer_id.hash(&mut hasher);
-            bootstrap_identity(&t).hash(&mut hasher);
-            // Reverse sort by score (Rendezvous hashing).
-            (hasher.finish(), t)
-        })
-        .collect();
-    weighted.sort_by(|a, b| b.0.cmp(&a.0));
-    weighted.into_iter().map(|(_, t)| t).collect()
-}
-
-fn control_packet(sender: &str, receiver: String, data: Vec<u8>, max_hops: u8) -> Packet {
-    Packet {
-        signature: None,
-        data,
-        nodes: vec![],
-        sender: sender.to_string(),
-        receiver,
-        max_hops,
-        request_id: None,
-        chunk_stream_id: None,
-        chunk_index: None,
-        total_chunks: None,
-    }
-}
-
-fn handshake_packet(sender: &str, payload: &[u8]) -> Packet {
-    control_packet(sender, String::new(), payload.to_vec(), 8)
-}
-
-async fn observe_failure_and_close(
-    catalog: &Arc<PeerCatalog>,
-    sm: &Arc<SessionManager>,
-    dial_cooldown_until: &mut HashMap<PeerId, u64>,
-    pid: &PeerId,
-    cooldown_until: u64,
-) {
-    catalog.observe_failure(pid);
-    dial_cooldown_until.insert(pid.clone(), cooldown_until);
-    let _ = sm.close_all_sessions_for_peer(pid).await;
-}
+pub(super) const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
+pub(super) const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
+pub(super) const SHEPHERD_SWEEP_INTERVAL_MS: u64 = 10_000;
+pub(super) const SHEPHERD_MIN_MESH: u16 = 3;
+pub(super) const SHEPHERD_GRACE_MS: u64 = 15_000;
+pub(super) const SHEPHERD_FINAL_PEERS_LIMIT: usize = 24;
 
 pub(crate) async fn dial_bootstrap_address(
     transports: &[Arc<dyn Transport>],
@@ -326,516 +263,6 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
             }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_bootstrap_reseed(
-    reseed_for_low: bool,
-    reseed_for_bridge: bool,
-    n: usize,
-    adaptive_min_active_peers: usize,
-    connected_bootstrap_now: usize,
-    bootstrap_targets_maint: &[BootstrapNode],
-    our_peer_maint: &str,
-    topology_tuning: &TopologyTuning,
-    bootstrap_deny_until: &mut HashMap<SocketAddr, u64>,
-    now: u64,
-    adaptive_tick: &AdaptiveTickPolicy,
-    transports_maint: &[Arc<dyn Transport>],
-    router_maint: &Arc<Router>,
-    incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
-    maintenance_handshake_payload: &[u8],
-) -> bool {
-    if bootstrap_targets_maint.is_empty() || !(reseed_for_low || reseed_for_bridge) {
-        return false;
-    }
-    crate::debug!(
-        "[NodeRuntime] bootstrap reseed: active={} min={} boot-connected={} targets={} reason={}",
-        n,
-        adaptive_min_active_peers,
-        connected_bootstrap_now,
-        bootstrap_targets_maint.len(),
-        if reseed_for_low {
-            "low-connectivity"
-        } else {
-            "bridge-rejoin"
-        }
-    );
-    let max_reseed_targets = if reseed_for_low {
-        bootstrap_targets_maint.len()
-    } else {
-        1
-    };
-    let ranked_targets = rank_bootstrap_targets_for_peer(our_peer_maint, bootstrap_targets_maint);
-    let mut attempted = 0usize;
-    let top_k = topology_tuning
-        .adaptive_bootstrap_top_k
-        .max(1)
-        .min(ranked_targets.len());
-    for target in ranked_targets.into_iter().take(top_k) {
-        if attempted >= max_reseed_targets {
-            break;
-        }
-        if bootstrap_deny_until
-            .get(&target.addr)
-            .is_some_and(|until| now < *until)
-        {
-            continue;
-        }
-        attempted = attempted.saturating_add(1);
-        let ok = dial_bootstrap_address(
-            transports_maint,
-            router_maint,
-            incoming_maint,
-            our_peer_maint,
-            &target,
-            maintenance_handshake_payload,
-        )
-        .await;
-        if ok {
-            bootstrap_deny_until.remove(&target.addr);
-        } else {
-            bootstrap_deny_until.insert(
-                target.addr,
-                now.saturating_add(adaptive_tick.bridge_rejoin_cooldown_ms),
-            );
-        }
-    }
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_bootstrap_shepherd(
-    node_role: NodeRole,
-    now: u64,
-    last_shepherd_sweep_ms: u64,
-    router_maint: &Arc<Router>,
-    sm: &Arc<SessionManager>,
-    catalog: &Arc<PeerCatalog>,
-    peer_admission_ms: &mut HashMap<PeerId, u64>,
-    our_peer_maint: &str,
-) -> (bool, usize) {
-    if !matches!(node_role, NodeRole::BootstrapJoin)
-        || now.saturating_sub(last_shepherd_sweep_ms) < SHEPHERD_SWEEP_INTERVAL_MS
-    {
-        return (false, 0);
-    }
-    let connected = router_maint.connected_peers();
-    for pid in connected.iter() {
-        peer_admission_ms.entry(pid.clone()).or_insert(now);
-    }
-    let tracked: Vec<PeerId> = peer_admission_ms.keys().cloned().collect();
-    for pid in tracked {
-        if !sm.is_connected_to_peer(&pid) {
-            peer_admission_ms.remove(&pid);
-        }
-    }
-    let mut shepherded = 0usize;
-    for pid in connected.iter() {
-        if catalog.peer_is_bootstrap_entry(pid) {
-            continue;
-        }
-        let Some(admitted_at) = peer_admission_ms.get(pid).copied() else {
-            continue;
-        };
-        if now.saturating_sub(admitted_at) < SHEPHERD_GRACE_MS {
-            continue;
-        }
-        let Some(desc) = catalog.descriptor_of(pid) else {
-            continue;
-        };
-        let peer_mesh_size = desc.dynamic_status.active_connections.saturating_sub(1);
-        if peer_mesh_size < SHEPHERD_MIN_MESH {
-            continue;
-        }
-        let descriptors = select_peers_for_discovery_response(
-            catalog
-                .descriptors()
-                .into_iter()
-                .filter(|d| d.peer_id != pid.as_str())
-                .filter(|d| descriptor_ok_for_discovery_redirect(d))
-                .collect(),
-            Some(pid.as_str()),
-            SHEPHERD_FINAL_PEERS_LIMIT,
-            0.4,
-        );
-        if !descriptors.is_empty() {
-            let msg = NetworkControlPayload::PeersResponse { descriptors };
-            if let Ok(data) = msg.encode() {
-                let packet = control_packet(our_peer_maint, pid.as_str().to_string(), data, 2);
-                let _ = router_maint.send_to_peer(pid.clone(), packet, None).await;
-            }
-        }
-        let _ = sm.close_all_sessions_for_peer(pid).await;
-        peer_admission_ms.remove(pid);
-        shepherded += 1;
-    }
-    if shepherded > 0 {
-        crate::info!(
-            "[NodeRuntime] shepherd sweep: closed {} settled peer(s) to free bootstrap slot",
-            shepherded
-        );
-    }
-    (true, shepherded)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_descriptor_if_due(
-    now: u64,
-    last_publish: u64,
-    descriptor_interval: Duration,
-    descriptor_ttl_secs: u64,
-    descriptor_ver: &Arc<AtomicU64>,
-    transports_maint: &[Arc<dyn Transport>],
-    listens: &DashMap<String, SocketAddr>,
-    advertise_addrs: &std::collections::HashMap<String, SocketAddr>,
-    advertise_fallback_ip: Option<IpAddr>,
-    node_role: NodeRole,
-    adaptive: &PeerConnectionPolicy,
-    metrics: &AggregatedMetricsSnapshot,
-    n: usize,
-    our_peer_maint: &str,
-    signing_key: &k256::ecdsa::SigningKey,
-    catalog: &Arc<PeerCatalog>,
-    db: &Option<Arc<P2PDatabase>>,
-    router_maint: &Arc<Router>,
-) -> u64 {
-    if now.saturating_sub(last_publish) < descriptor_interval.as_millis() as u64 {
-        return last_publish;
-    }
-    let version = descriptor_ver.fetch_add(1, Ordering::Relaxed) + 1;
-    let mut srflx_by_proto: HashMap<String, SocketAddr> = HashMap::new();
-    for transport in transports_maint {
-        if !transport.supports_tunneling() {
-            continue;
-        }
-        let proto = transport.name().to_string();
-        let Some(listen_addr) = listens.get(&proto).map(|r| *r.value()) else {
-            continue;
-        };
-        match transport.get_public_address(listen_addr.port()).await {
-            Ok(public) => {
-                if let Ok(ip) = public.ip.parse::<IpAddr>() {
-                    srflx_by_proto.insert(proto, SocketAddr::new(ip, public.port));
-                }
-            }
-            Err(e) => {
-                crate::debug!(
-                    "[NodeRuntime] STUN unavailable for {}:{}: {}",
-                    proto,
-                    listen_addr.port(),
-                    e
-                );
-            }
-        }
-    }
-    let mut proto_list: Vec<(String, SocketAddr)> = listens
-        .iter()
-        .map(|r| {
-            let proto = r.key().clone();
-            let advertised = advertised_addr_for_protocol(
-                &proto,
-                *r.value(),
-                advertise_addrs,
-                advertise_fallback_ip,
-            );
-            (proto, advertised)
-        })
-        .collect();
-    proto_list.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut observed_addrs: Vec<String> = proto_list
-        .into_iter()
-        .map(|(p, a)| format!("{}:{}", p.to_lowercase(), a))
-        .collect();
-    for (proto, addr) in srflx_by_proto {
-        observed_addrs.push(format!("{}:{}", proto.to_lowercase(), addr));
-    }
-    observed_addrs.sort();
-    observed_addrs.dedup();
-    let mut caps = NodeCapabilities::default();
-    if matches!(node_role, NodeRole::BootstrapJoin) {
-        caps.bootstrap_entry = true;
-    }
-    let base_cap = adaptive
-        .max_active_peers
-        .max(caps.base_session_limit as usize)
-        .min(u16::MAX as usize) as u16;
-    let load = metrics
-        .node
-        .cpu_load_estimate
-        .max(metrics.node.memory_pressure_estimate)
-        .clamp(0.0, 1.0);
-    let pressure_factor = (1.0 - ((load - 0.5).max(0.0) * 2.0)).clamp(0.3, 1.0);
-    let effective_cap = (((base_cap as f32) * pressure_factor).round() as u16).max(4);
-    caps.base_session_limit = effective_cap;
-    let descriptor = NodeDescriptor::new_unsigned(
-        our_peer_maint.to_string(),
-        caps,
-        {
-            let mut s = NodeDynamicStatus::from(&metrics.node);
-            s.accepts_new_sessions = n < adaptive.max_active_peers && pressure_factor >= 0.5;
-            s
-        },
-        observed_addrs,
-        descriptor_ttl_secs,
-        version,
-    );
-    let mut descriptor = descriptor;
-    if sign_descriptor(&mut descriptor, signing_key).is_ok() {
-        let _ = catalog.upsert_descriptor(descriptor.clone());
-        if let Some(db) = db.as_ref() {
-            let _ = db.upsert_peer_descriptor(&descriptor);
-        }
-        let msg = NetworkControlPayload::AnnounceNodeDescriptor { descriptor };
-        if let Ok(data) = msg.encode() {
-            for p in router_maint.connected_peers() {
-                let packet =
-                    control_packet(our_peer_maint, p.as_str().to_string(), data.clone(), 2);
-                let _ = router_maint.send_to_peer(p, packet, None).await;
-            }
-        }
-    }
-    now
-}
-
-struct DialPlan {
-    candidates: Vec<PeerId>,
-    desc_by_peer: HashMap<PeerId, NodeDescriptor>,
-    connected_bootstrap: usize,
-    dial_limit: usize,
-    force_non_bootstrap: bool,
-}
-
-struct DialExecutionResult {
-    dialed_any: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_dial_plan(
-    dial_book: &Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
-    router_maint: &Arc<Router>,
-    catalog: &Arc<PeerCatalog>,
-    peer_store: &Arc<PeerScoreStore>,
-    weights: &PeerScoreWeights,
-    our_peer: &str,
-    node_role: NodeRole,
-    known_peers: usize,
-    n: usize,
-    desired: usize,
-    dial_target: usize,
-    dial_target_high: usize,
-    adaptive_min_active_peers: usize,
-    exploratory_slots: usize,
-    topology_tuning: &TopologyTuning,
-    should_explore: bool,
-    now: u64,
-) -> DialPlan {
-    let mut candidates: Vec<PeerId> = dial_book.iter().map(|r| r.key().clone()).collect();
-    let desc_by_peer: HashMap<PeerId, NodeDescriptor> = catalog
-        .descriptors()
-        .into_iter()
-        .map(|d| (PeerId::from(d.peer_id.as_str()), d))
-        .collect();
-    let stale_descriptor_cutoff_ms = now.saturating_sub(90_000);
-    candidates.retain(|pid| {
-        desc_by_peer
-            .get(pid)
-            .map(|d| d.timestamp_ms >= stale_descriptor_cutoff_ms)
-            .unwrap_or(true)
-    });
-    let connected_snapshot = router_maint.connected_peers();
-    let connected_bootstrap = connected_snapshot
-        .iter()
-        .filter(|p| catalog.peer_is_bootstrap_entry(p))
-        .count();
-    let connected_non_bootstrap = connected_snapshot.len().saturating_sub(connected_bootstrap);
-    let target_non_bootstrap = if matches!(node_role, NodeRole::Regular) {
-        desired.saturating_sub(topology_tuning.regular_bootstrap_min_keep)
-    } else {
-        0
-    };
-    let force_non_bootstrap = matches!(node_role, NodeRole::Regular)
-        && connected_bootstrap > 0
-        && connected_non_bootstrap < target_non_bootstrap;
-    let bootstrap_quota = bootstrap_dial_quota(node_role);
-    let connected_prefix24: HashSet<[u8; 3]> = connected_snapshot
-        .iter()
-        .filter_map(|pid| catalog.descriptor_of(pid))
-        .filter_map(|d| descriptor_prefix24(&d))
-        .collect();
-    rank_dial_candidates(
-        &mut candidates,
-        peer_store.as_ref(),
-        weights,
-        &desc_by_peer,
-        our_peer,
-        node_role,
-        dial_target,
-        connected_bootstrap,
-        bootstrap_quota,
-        true,
-        n,
-        adaptive_min_active_peers,
-        &connected_prefix24,
-        known_peers,
-        exploratory_slots,
-    );
-    let dial_limit = if should_explore || force_non_bootstrap {
-        dial_target_high
-    } else {
-        dial_target
-    };
-    DialPlan {
-        candidates,
-        desc_by_peer,
-        connected_bootstrap,
-        dial_limit,
-        force_non_bootstrap,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_dial_plan(
-    plan: &mut DialPlan,
-    n: usize,
-    node_role: NodeRole,
-    adaptive_min_active_peers: usize,
-    dial_target: usize,
-    dial_book: &Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
-    catalog: &Arc<PeerCatalog>,
-    sm: &Arc<SessionManager>,
-    transports_maint: &[Arc<dyn Transport>],
-    router_maint: &Arc<Router>,
-    incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
-    our_peer_maint: &str,
-    maintenance_handshake_payload: &[u8],
-    dial_cooldown_until: &mut HashMap<PeerId, u64>,
-    topology_tuning: &TopologyTuning,
-    now: u64,
-) -> DialExecutionResult {
-    let dial_deficit = plan.dial_limit.saturating_sub(n).max(1);
-    let mut dial_attempts_left = if matches!(node_role, NodeRole::Regular) {
-        dial_deficit.min(REGULAR_DIAL_ATTEMPT_BUDGET_MAX)
-    } else {
-        dial_deficit.min(BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX)
-    };
-    let mut active_peers = n;
-    let mut dialed_any = false;
-    for pid in plan.candidates.clone() {
-        if active_peers >= plan.dial_limit || dial_attempts_left == 0 {
-            break;
-        }
-        if pid.as_str() == our_peer_maint || sm.is_connected_to_peer(&pid) {
-            continue;
-        }
-        if let Some(until) = dial_cooldown_until.get(&pid).copied() {
-            if now < until {
-                continue;
-            }
-        }
-        if let Some(desc) = plan.desc_by_peer.get(&pid) {
-            if plan.force_non_bootstrap && desc.capabilities.bootstrap_entry {
-                continue;
-            }
-            if should_skip_for_bootstrap_quota(
-                desc,
-                node_role,
-                plan.connected_bootstrap,
-                bootstrap_dial_quota(node_role),
-                active_peers,
-                adaptive_min_active_peers,
-            ) {
-                continue;
-            }
-            if !desc.capabilities.bootstrap_entry {
-                let selective =
-                    connectivity_selective(active_peers, dial_target, adaptive_min_active_peers);
-                if selective && !desc.dynamic_status.accepts_new_sessions {
-                    continue;
-                }
-                let cap = desc.capabilities.base_session_limit.max(1) as usize;
-                if selective
-                    && active_peers >= REGULAR_SELF_HEAL_FLOOR
-                    && desc.dynamic_status.active_connections as usize >= cap
-                {
-                    continue;
-                }
-                let soft_cap = dial_target.saturating_add(DIAL_HUB_SOFT_CAP_EXTRA);
-                if selective
-                    && active_peers >= REGULAR_SELF_HEAL_FLOOR
-                    && desc.dynamic_status.active_connections as usize > soft_cap
-                {
-                    continue;
-                }
-            }
-        }
-
-        let Some(entry) = dial_book.get(&pid) else {
-            continue;
-        };
-        let endpoints = entry.value().to_vec();
-        drop(entry);
-        let max_endpoints = dial_endpoint_attempt_budget(
-            active_peers,
-            dial_target,
-            adaptive_min_active_peers,
-            endpoints.len(),
-        );
-        let mut tried_endpoints: HashSet<(String, SocketAddr)> = HashSet::new();
-        let mut endpoint_attempts = 0usize;
-        for (transport_name, addr) in endpoints {
-            if endpoint_attempts >= max_endpoints {
-                break;
-            }
-            if !tried_endpoints.insert((transport_name.clone(), addr)) {
-                continue;
-            }
-            if let Some(t) = transports_maint
-                .iter()
-                .find(|t| t.name() == transport_name.as_str())
-            {
-                if !t.is_listener() {
-                    continue;
-                }
-                endpoint_attempts = endpoint_attempts.saturating_add(1);
-                dial_attempts_left = dial_attempts_left.saturating_sub(1);
-                match t.dial(addr).await {
-                    Ok(session) => {
-                        let session_id = SessionId::from(session.id().to_string());
-                        router_maint.register_session(
-                            pid.clone(),
-                            session_id.clone(),
-                            session.clone(),
-                        );
-                        session.spawn_reader(incoming_maint.clone());
-                        let handshake =
-                            handshake_packet(our_peer_maint, maintenance_handshake_payload);
-                        let _ = router_maint.send_to_session(session_id, handshake).await;
-                        catalog.observe_success(&pid, 80);
-                        if plan
-                            .desc_by_peer
-                            .get(&pid)
-                            .is_some_and(|d| d.capabilities.bootstrap_entry)
-                        {
-                            plan.connected_bootstrap = plan.connected_bootstrap.saturating_add(1);
-                        }
-                        dial_cooldown_until.remove(&pid);
-                        dialed_any = true;
-                        active_peers = sm.distinct_peer_count();
-                        break;
-                    }
-                    Err(_) => {
-                        catalog.observe_failure(&pid);
-                        dial_cooldown_until.insert(
-                            pid.clone(),
-                            now.saturating_add(topology_tuning.dial_retry_cooldown_ms),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    DialExecutionResult { dialed_any }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,8 +668,8 @@ pub(crate) async fn run_topology_maintenance_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::policy::TopologyPhase;
     use super::*;
-    use crate::node::topology_policy::TopologyPhase;
 
     #[test]
     fn policy_snapshot_bootstrapping_phase_on_small_network() {

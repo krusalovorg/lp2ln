@@ -10,8 +10,6 @@ pub mod options;
 mod options_file;
 pub mod runtime;
 pub mod topology_maintenance;
-pub(crate) mod topology_policy;
-pub(crate) mod topology_state;
 
 pub mod connection_strategy {
     pub use super::distribution::*;
