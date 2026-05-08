@@ -1,12 +1,12 @@
 use core::fmt;
 mod debug_server;
 use lp2ln_core_v2::db::P2PDatabase;
-use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::logger::LoggerOptions;
-use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
+use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::node::{
     ConfigAutonomy, NodeBuilder, NodeOptions, StartupConfigSource, health_server,
 };
+use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
 use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -72,7 +72,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "tokio-console")]
     {
         console_subscriber::init();
-        lp2ln_core_v2::info!("[Main] console_subscriber inited (needs RUSTFLAGS=\"--cfg tokio_unstable\")");
+        lp2ln_core_v2::info!(
+            "[Main] console_subscriber inited (needs RUSTFLAGS=\"--cfg tokio_unstable\")"
+        );
     }
 
     let args = parse_args();
@@ -162,7 +164,8 @@ async fn main() -> anyhow::Result<()> {
         db_handle,
     );
     let _health_task = health_server::spawn_health_server(node.clone(), None);
-    let _config_watcher_task = config_engine.spawn_runtime_config_watcher(node.clone(), applied_options);
+    let _config_watcher_task =
+        config_engine.spawn_runtime_config_watcher(node.clone(), applied_options);
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

@@ -127,10 +127,7 @@ fn resolve_options_template_path(raw: &str) -> PathBuf {
     p
 }
 
-fn scale_bind_ip(
-    bootstrap_targets: &[BootstrapNode],
-    default_nodes: &[SocketAddr],
-) -> String {
+fn scale_bind_ip(bootstrap_targets: &[BootstrapNode], default_nodes: &[SocketAddr]) -> String {
     if let Ok(v) = env::var("LP2LND_SCALE_BIND_IP") {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
@@ -186,7 +183,10 @@ fn write_peer_options_from_template(
     );
     topology_defaults.insert("dial_retry_cooldown_ms".into(), serde_json::json!(45000));
     topology_defaults.insert("prune_redial_cooldown_ms".into(), serde_json::json!(60000));
-    topology_defaults.insert("bootstrap_stable_peer_threshold".into(), serde_json::json!(6));
+    topology_defaults.insert(
+        "bootstrap_stable_peer_threshold".into(),
+        serde_json::json!(6),
+    );
     topology_defaults.insert(
         "avoid_reseed_when_stable_bootstrap".into(),
         serde_json::json!(true),
@@ -213,7 +213,10 @@ fn write_peer_options_from_template(
         "adaptive_rejoin_cooldown_max_ms".into(),
         serde_json::json!(180000),
     );
-    topology_defaults.insert("adaptive_redirect_memory_ms".into(), serde_json::json!(12000));
+    topology_defaults.insert(
+        "adaptive_redirect_memory_ms".into(),
+        serde_json::json!(12000),
+    );
 
     if !v.get("topology_tuning").is_some_and(|x| x.is_object()) {
         v["topology_tuning"] = serde_json::Value::Object(serde_json::Map::new());
@@ -230,9 +233,7 @@ fn write_peer_options_from_template(
 
     v["database_dir"] = serde_json::Value::String(db_dir.clone());
     if IpAddr::from_str(bind_ip.trim()).is_err() {
-        anyhow::bail!(
-            "lp2lnd-scale: bind_ip={bind_ip:?} не является валидным IP"
-        );
+        anyhow::bail!("lp2lnd-scale: bind_ip={bind_ip:?} не является валидным IP");
     }
     let tcp_base = scale_tcp_base_port();
     let udp_base = scale_udp_base_port();
@@ -254,10 +255,7 @@ fn write_peer_options_from_template(
         .filter(|x| x.is_object())
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let mut listens_obj = listens
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut listens_obj = listens.as_object().cloned().unwrap_or_default();
     listens_obj.insert(
         "tcp".to_string(),
         serde_json::Value::String(format!("{bind_ip}:{tcp_port}")),
@@ -351,9 +349,7 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     if template.bootstrap_nodes.is_empty() && template.default_nodes.is_empty() {
-        anyhow::bail!(
-            "lp2lnd-scale: в options нужны bootstrap_nodes или default_nodes"
-        );
+        anyhow::bail!("lp2lnd-scale: в options нужны bootstrap_nodes или default_nodes");
     }
 
     let peer_end = args.from.checked_add(args.virtual_peers).ok_or_else(|| {
@@ -393,12 +389,16 @@ async fn main() -> anyhow::Result<()> {
 
     let mut nodes: Vec<Arc<NodeRuntime>> = Vec::with_capacity(args.virtual_peers);
     for peer_idx in args.from..peer_end {
-        let opts_path =
-            write_peer_options_from_template(&path, peer_idx, &bind_ip, args.debug_enabled, args.debug_base)?;
+        let opts_path = write_peer_options_from_template(
+            &path,
+            peer_idx,
+            &bind_ip,
+            args.debug_enabled,
+            args.debug_base,
+        )?;
         let path_s = opts_path.to_string_lossy().to_string();
-        let options = NodeOptions::from_file(&path_s).map_err(|e| {
-            anyhow::anyhow!("lp2lnd-scale: не удалось прочитать {}: {}", path_s, e)
-        })?;
+        let options = NodeOptions::from_file(&path_s)
+            .map_err(|e| anyhow::anyhow!("lp2lnd-scale: не удалось прочитать {}: {}", path_s, e))?;
 
         let mut builder = NodeBuilder::new()
             .add_transport(Arc::new(TcpTransport::new()))

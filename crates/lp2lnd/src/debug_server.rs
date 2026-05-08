@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::node::NodeRuntime;
@@ -33,11 +33,7 @@ pub fn spawn_debug_server(
         let bind_addr: SocketAddr = match cfg.bind_addr.parse() {
             Ok(v) => v,
             Err(e) => {
-                lp2ln_core_v2::error!(
-                    "[DebugServer] invalid bind_addr '{}': {}",
-                    cfg.bind_addr,
-                    e
-                );
+                lp2ln_core_v2::error!("[DebugServer] invalid bind_addr '{}': {}", cfg.bind_addr, e);
                 return;
             }
         };
@@ -158,8 +154,14 @@ async fn handle_client_command(
     match cmd {
         "get_db_tables" => Some(collect_db_tables(db).await),
         "connect_peer" => {
-            let transport = value.get("transport").and_then(|v| v.as_str()).unwrap_or("tcp");
-            let addr = value.get("addr").and_then(|v| v.as_str()).unwrap_or_default();
+            let transport = value
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tcp");
+            let addr = value
+                .get("addr")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             let parsed = addr.parse::<SocketAddr>();
             match parsed {
                 Ok(addr) => match node.connect(transport, addr).await {
@@ -188,7 +190,10 @@ async fn handle_client_command(
             }
         }
         "disconnect_peer" => {
-            let peer_id = value.get("peer_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let peer_id = value
+                .get("peer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if peer_id.is_empty() {
                 return Some(json!({
                     "event": "command_result",
@@ -217,7 +222,10 @@ async fn handle_client_command(
             }
         }
         "close_session" => {
-            let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let session_id = value
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if session_id.is_empty() {
                 return Some(json!({
                     "event": "command_result",
@@ -246,7 +254,10 @@ async fn handle_client_command(
             }
         }
         "send_to_peer" => {
-            let peer_id = value.get("peer_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let peer_id = value
+                .get("peer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if peer_id.is_empty() {
                 return Some(json!({
                     "event": "command_result",
@@ -256,8 +267,14 @@ async fn handle_client_command(
                     "error": "peer_id is required",
                 }));
             }
-            let data = value.get("data").and_then(|v| v.as_str()).unwrap_or_default();
-            let encoding = value.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+            let data = value
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let encoding = value
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf8");
             let bytes = payload_to_bytes(data, encoding);
             match bytes {
                 Ok(bytes) => match node.send(PeerId::from(peer_id), bytes).await {
@@ -290,7 +307,10 @@ async fn handle_client_command(
             }
         }
         "send_packet" => {
-            let peer_id = value.get("peer_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let peer_id = value
+                .get("peer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if peer_id.is_empty() {
                 return Some(json!({
                     "event": "command_result",
@@ -300,8 +320,14 @@ async fn handle_client_command(
                     "error": "peer_id is required",
                 }));
             }
-            let data = value.get("data").and_then(|v| v.as_str()).unwrap_or_default();
-            let encoding = value.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+            let data = value
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let encoding = value
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf8");
             let wait_reply = value
                 .get("wait_reply")
                 .and_then(|v| v.as_bool())
@@ -339,7 +365,8 @@ async fn handle_client_command(
                         {
                             Ok((request_id, reply)) => {
                                 let b64 = STANDARD.encode(&reply);
-                                let reply_text = std::str::from_utf8(&reply).ok().map(|s| s.to_string());
+                                let reply_text =
+                                    std::str::from_utf8(&reply).ok().map(|s| s.to_string());
                                 Some(json!({
                                     "event": "command_result",
                                     "ts_ms": now_ms(),
@@ -400,7 +427,10 @@ async fn handle_client_command(
             }
         }
         "send_to_session" => {
-            let session_id = value.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let session_id = value
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if session_id.is_empty() {
                 return Some(json!({
                     "event": "command_result",
@@ -410,8 +440,14 @@ async fn handle_client_command(
                     "error": "session_id is required",
                 }));
             }
-            let data = value.get("data").and_then(|v| v.as_str()).unwrap_or_default();
-            let encoding = value.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+            let data = value
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let encoding = value
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf8");
             let bytes = payload_to_bytes(data, encoding);
             match bytes {
                 Ok(bytes) => match node
@@ -543,7 +579,11 @@ async fn handle_client_command(
             }
             match addr_s.parse::<SocketAddr>() {
                 Ok(addr) => {
-                    node.register_known_peer_addr(PeerId::from(peer_id.as_str()), transport.clone(), addr);
+                    node.register_known_peer_addr(
+                        PeerId::from(peer_id.as_str()),
+                        transport.clone(),
+                        addr,
+                    );
                     Some(json!({
                         "event": "command_result",
                         "ts_ms": now_ms(),
@@ -752,18 +792,31 @@ async fn collect_peer_rollup(node: Arc<NodeRuntime>) -> Value {
     }
     let rows: Vec<Value> = by_peer
         .into_iter()
-        .map(|(peer_id, (packets_sent, packets_received, bytes_sent, bytes_received, send_errors, receive_errors, sessions))| {
-            json!({
-                "peer_id": peer_id,
-                "sessions": sessions,
-                "packets_sent": packets_sent,
-                "packets_received": packets_received,
-                "bytes_sent": bytes_sent,
-                "bytes_received": bytes_received,
-                "send_errors": send_errors,
-                "receive_errors": receive_errors,
-            })
-        })
+        .map(
+            |(
+                peer_id,
+                (
+                    packets_sent,
+                    packets_received,
+                    bytes_sent,
+                    bytes_received,
+                    send_errors,
+                    receive_errors,
+                    sessions,
+                ),
+            )| {
+                json!({
+                    "peer_id": peer_id,
+                    "sessions": sessions,
+                    "packets_sent": packets_sent,
+                    "packets_received": packets_received,
+                    "bytes_sent": bytes_sent,
+                    "bytes_received": bytes_received,
+                    "send_errors": send_errors,
+                    "receive_errors": receive_errors,
+                })
+            },
+        )
         .collect();
     json!({
         "event": "peer_rollup",
@@ -968,7 +1021,10 @@ async fn collect_snapshot(node: Arc<NodeRuntime>, db: Option<Arc<P2PDatabase>>) 
     let edges = neighbors
         .iter()
         .map(|n| {
-            let peer_id = n.get("peer_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let peer_id = n
+                .get("peer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             let is_connected = n
                 .get("is_connected")
                 .and_then(|v| v.as_bool())
@@ -1035,20 +1091,20 @@ async fn collect_db_metrics(db: Option<Arc<P2PDatabase>>) -> Value {
     let blobs_size = db.get_storage_size().await.ok().unwrap_or(0);
 
     let db_for_files = db.clone();
-    let files_count = tokio::task::spawn_blocking(move || db_for_files.get_all_files().map(|v| v.len()))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(0);
+    let files_count =
+        tokio::task::spawn_blocking(move || db_for_files.get_all_files().map(|v| v.len()))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
 
     let db_for_desc = db.clone();
-    let descriptor_count = tokio::task::spawn_blocking(move || {
-        db_for_desc.load_peer_descriptors().map(|v| v.len())
-    })
-    .await
-    .ok()
-    .and_then(|r| r.ok())
-    .unwrap_or(0);
+    let descriptor_count =
+        tokio::task::spawn_blocking(move || db_for_desc.load_peer_descriptors().map(|v| v.len()))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
 
     let db_for_scores = db.clone();
     let peer_score_count = tokio::task::spawn_blocking(move || {

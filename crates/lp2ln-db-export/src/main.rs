@@ -144,7 +144,8 @@ fn parse_descriptor_value(bytes: &[u8]) -> Value {
 }
 
 fn dump_db(db_path: &Path, include_secrets: bool) -> Result<Dump> {
-    let db = redb::Database::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
+    let db =
+        redb::Database::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     let read = db
         .begin_read()
         .with_context(|| format!("read txn {}", db_path.display()))?;
@@ -188,13 +189,10 @@ fn dump_db(db_path: &Path, include_secrets: bool) -> Result<Dump> {
     }
 
     let peer_scores = if let Ok(table) = read.open_table(PEER_SCORE_TABLE) {
-        table
-            .get(PEER_SCORE_SNAPSHOT_KEY)?
-            .map(|raw| {
-                serde_json::from_slice::<Value>(raw.value()).unwrap_or_else(|_| {
-                    json!({ "raw_hex": hex::encode(raw.value()) })
-                })
-            })
+        table.get(PEER_SCORE_SNAPSHOT_KEY)?.map(|raw| {
+            serde_json::from_slice::<Value>(raw.value())
+                .unwrap_or_else(|_| json!({ "raw_hex": hex::encode(raw.value()) }))
+        })
     } else {
         None
     };
