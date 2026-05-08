@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod router;
 pub mod services;
 pub mod sessions;
+pub mod simulation;
 pub mod stun;
 pub mod topology;
 pub mod transport;
