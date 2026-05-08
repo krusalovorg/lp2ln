@@ -5,8 +5,8 @@ pub mod lifecycle;
 
 pub mod prelude {
     pub use super::bus::{
-        CommandContext, CoreBus, CoreCommandHandler, CoreEventHandler, EventContext, HandlerId,
-        HandlerRegistration,
+        CommandContext, CoreBus, CoreBusStats, CoreCommandHandler, CoreEventHandler, EventContext,
+        HandlerId, HandlerRegistration,
     };
     pub use super::commands::{
         ConsensusCommand, CoreCommand, CoreCommandKind, DhtCommand, LifecycleAction,

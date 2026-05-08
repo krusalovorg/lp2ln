@@ -12,25 +12,26 @@ use tokio::sync::mpsc;
 
 use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
+use crate::logger;
+use crate::nat::NatTraversalState;
 use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
+use crate::node::flow_trace::FlowTraceService;
 use crate::node::incoming_sessions::run_incoming_session_handler;
-use crate::node::nat_traversal::NatTraversalState;
 use crate::node::options::{NodeOptions, NodeRole};
 use crate::node::topology_maintenance::{dial_bootstrap_address, run_topology_maintenance_loop};
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
+use crate::peer_score::PeerConnectionPolicy;
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::protocol::handshake;
-use crate::router::{Router, ROUTER_INCOMING_QUEUE_CAP};
+use crate::router::{ROUTER_INCOMING_QUEUE_CAP, Router};
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::sessions::{LinkKind, Session, SessionMetrics};
 use crate::topology::PeerCatalog;
 use crate::transport::{Transport, TransportContext};
 use crate::types::{PeerId, SessionId};
-use crate::logger;
-use crate::peer_score::PeerConnectionPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -123,7 +124,10 @@ impl NodeRuntime {
         let peer_catalog = Arc::new(PeerCatalog::with_max_peers(catalog_cap));
         let keypair = options
             .keypair
-            .or_else(|| db.as_ref().and_then(|db| db.get_or_create_node_keypair().ok()))
+            .or_else(|| {
+                db.as_ref()
+                    .and_then(|db| db.get_or_create_node_keypair().ok())
+            })
             .unwrap_or_else(NodeKeypair::generate);
         let nat_state = NatTraversalState::new();
         let packet_processor = packet_processor.unwrap_or_else(|| {
@@ -201,10 +205,7 @@ impl NodeRuntime {
     ) {
         let transport = transport.into();
         let mut entry = self.dial_book.entry(peer_id).or_default();
-        if !entry
-            .iter()
-            .any(|(t, a)| t == &transport && a == &addr)
-        {
+        if !entry.iter().any(|(t, a)| t == &transport && a == &addr) {
             entry.push((transport, addr));
         }
     }
@@ -214,7 +215,12 @@ impl NodeRuntime {
             .transports
             .iter()
             .find(|t| t.name() == transport_name)
-            .ok_or_else(|| anyhow::anyhow!("Transport '{}' is not registered in runtime", transport_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Transport '{}' is not registered in runtime",
+                    transport_name
+                )
+            })?;
 
         transport.dial(addr).await
     }
@@ -251,7 +257,9 @@ impl NodeRuntime {
             chunk_index: None,
             total_chunks: None,
         };
-        router.send_to_session(session_id.clone(), handshake).await?;
+        router
+            .send_to_session(session_id.clone(), handshake)
+            .await?;
 
         Ok(session_id)
     }
@@ -291,7 +299,8 @@ impl NodeRuntime {
     }
 
     pub async fn send(&self, peer_id: PeerId, data: Vec<u8>) -> Result<u64> {
-        self.send_with_options(peer_id, data, None, None, None).await
+        self.send_with_options(peer_id, data, None, None, None)
+            .await
     }
 
     async fn build_local_nat_candidates(&self) -> Vec<NatCandidate> {
@@ -323,7 +332,8 @@ impl NodeRuntime {
             }
         }
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
-        candidates.dedup_by(|a, b| a.protocol == b.protocol && a.addr == b.addr && a.kind == b.kind);
+        candidates
+            .dedup_by(|a, b| a.protocol == b.protocol && a.addr == b.addr && a.kind == b.kind);
         candidates
     }
 
@@ -431,13 +441,7 @@ impl NodeRuntime {
             .ok_or_else(|| anyhow::anyhow!("Node is not started, call start() first"))?;
         let mut sub = router.subscribe();
         let request_id = self
-            .send_with_options(
-                route_peer_id.clone(),
-                data,
-                receiver,
-                max_hops,
-                nodes,
-            )
+            .send_with_options(route_peer_id.clone(), data, receiver, max_hops, nodes)
             .await?;
         let reply = self
             .recv_reply_matching(&mut sub, &route_peer_id, request_id, timeout)
@@ -585,8 +589,7 @@ impl NodeRuntime {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        let (incoming_sessions_tx, incoming_sessions_rx) =
-            mpsc::channel(ROUTER_INCOMING_QUEUE_CAP);
+        let (incoming_sessions_tx, incoming_sessions_rx) = mpsc::channel(ROUTER_INCOMING_QUEUE_CAP);
         let signing_key = Some(Arc::new(self.keypair.signing_key().clone()));
         let (router_raw, mut incoming_packets_rx) = Router::new(
             self.session_manager.clone(),
@@ -601,9 +604,10 @@ impl NodeRuntime {
             tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(500);
                 loop {
-                    let result = AssertUnwindSafe(router_loop.clone().run(&mut incoming_packets_rx))
-                        .catch_unwind()
-                        .await;
+                    let result =
+                        AssertUnwindSafe(router_loop.clone().run(&mut incoming_packets_rx))
+                            .catch_unwind()
+                            .await;
                     match result {
                         Ok(Ok(_)) => {
                             health.mark_healthy();
@@ -624,155 +628,12 @@ impl NodeRuntime {
             });
         }
         self.router = Some(router.clone());
-        let flow_trace_enabled_from_env = std::env::var("LP2LN_TRACE_FLOW")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false);
-        let flow_trace_enabled = flow_trace_enabled_from_env || self._options.flow_trace.enabled;
-        let flow_trace_json_packets = self._options.flow_trace.json_packets;
-        let flow_trace_payload_preview_bytes = self._options.flow_trace.payload_preview_bytes.min(256);
-        let node_role_for_trace = self._options.node_role;
-        let our_peer_for_trace = self.keypair.peer_id().to_string();
-        if flow_trace_enabled {
-            let mut trace_rx = router.subscribe();
-            crate::info!(
-                "[NodeRuntime] flow-trace enabled on {:?}; reporting every 10s",
-                node_role_for_trace
-            );
-            tokio::spawn(async move {
-                use std::collections::HashMap;
-                use tokio::sync::broadcast::error::RecvError;
-                use tokio::time::{self, MissedTickBehavior};
-
-                let mut interval = time::interval(Duration::from_secs(10));
-                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut counters: HashMap<(String, String, String, u8, u8, bool, String), u64> =
-                    HashMap::new();
-
-                loop {
-                    tokio::select! {
-                        evt = trace_rx.recv() => {
-                            match evt {
-                                Ok(incoming) => {
-                                    let packet = incoming.packet;
-                                    let via = incoming
-                                        .from_node
-                                        .unwrap_or_else(|| packet.sender.clone());
-                                    let hops_len = packet.nodes.len().min(u8::MAX as usize) as u8;
-                                    let is_forward = !packet.receiver.is_empty() && packet.receiver != our_peer_for_trace;
-                                    let payload_kind = if packet.data.is_empty() {
-                                        "local:handshake".to_string()
-                                    } else if crate::protocol::handshake::decode_hello(&packet.data).is_some() {
-                                        "local:handshake_hello".to_string()
-                                    } else if packet.data.as_slice() == b"hs_ack" {
-                                        "local:handshake_ack".to_string()
-                                    } else if packet.data.as_slice() == b"ping" {
-                                        "local:ping".to_string()
-                                    } else if packet.data.as_slice() == b"pong" {
-                                        "local:pong".to_string()
-                                    } else if let Ok(ctrl) = NetworkControlPayload::decode(&packet.data) {
-                                        let tag = match ctrl {
-                                            NetworkControlPayload::AnnounceNodeDescriptor { .. } => "control:AnnounceNodeDescriptor",
-                                            NetworkControlPayload::RequestPeers { .. } => "control:RequestPeers",
-                                            NetworkControlPayload::PeersResponse { .. } => "control:PeersResponse",
-                                            NetworkControlPayload::AnnounceEvidence { .. } => "control:AnnounceEvidence",
-                                            NetworkControlPayload::PingPeerQuality { .. } => "control:PingPeerQuality",
-                                            NetworkControlPayload::PongPeerQuality { .. } => "control:PongPeerQuality",
-                                            NetworkControlPayload::RequestDescriptors { .. } => "control:RequestDescriptors",
-                                            NetworkControlPayload::RequestCapabilities { .. } => "control:RequestCapabilities",
-                                            NetworkControlPayload::FindRelays { .. } => "control:FindRelays",
-                                            NetworkControlPayload::FindProviders { .. } => "control:FindProviders",
-                                            NetworkControlPayload::RequestAdjacency { .. } => "control:RequestAdjacency",
-                                            NetworkControlPayload::AdjacencyResponse { .. } => "control:AdjacencyResponse",
-                                            NetworkControlPayload::NatOffer { .. } => "control:NatOffer",
-                                            NetworkControlPayload::NatAnswer { .. } => "control:NatAnswer",
-                                            NetworkControlPayload::NatPunchStart { .. } => "control:NatPunchStart",
-                                            NetworkControlPayload::NatPunchResult { .. } => "control:NatPunchResult",
-                                        };
-                                        tag.to_string()
-                                    } else {
-                                        "data:opaque".to_string()
-                                    };
-                                    if flow_trace_json_packets {
-                                        let preview = packet
-                                            .data
-                                            .iter()
-                                            .take(flow_trace_payload_preview_bytes)
-                                            .map(|b| format!("{:02x}", b))
-                                            .collect::<Vec<_>>()
-                                            .join("");
-                                        let row = serde_json::json!({
-                                            "sender": packet.sender.clone(),
-                                            "receiver": packet.receiver.clone(),
-                                            "via": via.clone(),
-                                            "payload_kind": payload_kind.clone(),
-                                            "payload_len": packet.data.len(),
-                                            "payload_preview_hex": preview,
-                                            "payload_preview_truncated": packet.data.len() > flow_trace_payload_preview_bytes,
-                                            "path_len": hops_len,
-                                            "hops_left": packet.max_hops,
-                                            "is_forward": is_forward,
-                                        });
-                                        match serde_json::to_string_pretty(&row) {
-                                            Ok(pretty) => {
-                                                crate::info!("[FLOWTRACE]\n{}", pretty);
-                                            }
-                                            Err(_) => {
-                                                crate::info!("[FLOWTRACE] packet {}", row);
-                                            }
-                                        }
-                                    }
-                                    let key = (
-                                        packet.sender,
-                                        packet.receiver,
-                                        via,
-                                        hops_len,
-                                        packet.max_hops,
-                                        is_forward,
-                                        payload_kind,
-                                    );
-                                    *counters.entry(key).or_insert(0) += 1;
-                                }
-                                Err(RecvError::Lagged(skipped)) => {
-                                    crate::warn!("[NodeRuntime] flow-trace lagged, skipped {} packets", skipped);
-                                }
-                                Err(RecvError::Closed) => break,
-                            }
-                        }
-                        _ = interval.tick() => {
-                            if counters.is_empty() {
-                                continue;
-                            }
-                            let mut rows: Vec<_> = counters.into_iter().collect();
-                            rows.sort_by(|a, b| b.1.cmp(&a.1));
-                            let top = rows
-                                .into_iter()
-                                .take(12)
-                                .map(|((sender, receiver, via, hops_len, hops_left, is_forward, payload_kind), cnt)| {
-                                    let kind = if is_forward { "fwd" } else { "local" };
-                                    format!(
-                                        "{}:{} {} {}->{} via={} path_len={} hops_left={}",
-                                        cnt,
-                                        kind,
-                                        payload_kind,
-                                        sender,
-                                        receiver,
-                                        via,
-                                        hops_len,
-                                        hops_left
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" | ");
-                            crate::info!("[FLOWTRACE] top {}", top);
-                            counters = HashMap::new();
-                        }
-                    }
-                }
-            });
-        }
+        FlowTraceService::spawn(
+            &router,
+            self._options.node_role,
+            self.keypair.peer_id().to_string(),
+            &self._options.flow_trace,
+        );
 
         self.incoming_sessions_tx = Some(incoming_sessions_tx.clone());
         let ctx = TransportContext {
@@ -884,11 +745,15 @@ impl NodeRuntime {
                         health_incoming.mark_healthy();
                     }
                     Ok(Err(err)) => {
-                        health_incoming.incoming_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_incoming
+                            .incoming_restarts
+                            .fetch_add(1, Ordering::Relaxed);
                         health_incoming.record_error("incoming_loop", err.to_string());
                     }
                     Err(_) => {
-                        health_incoming.incoming_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_incoming
+                            .incoming_restarts
+                            .fetch_add(1, Ordering::Relaxed);
                         health_incoming.record_error("incoming_loop", "panic in incoming loop");
                     }
                 }
@@ -898,7 +763,8 @@ impl NodeRuntime {
         });
 
         let peer_scores_for_order = self.session_manager.peer_score_store();
-        let bootstrap_targets = ordered_bootstrap_targets(&self._options, peer_scores_for_order.as_ref());
+        let bootstrap_targets =
+            ordered_bootstrap_targets(&self._options, peer_scores_for_order.as_ref());
         let bootstrap_targets_maint = bootstrap_targets.clone();
         let advertise_fallback_ip =
             detect_lan_advertise_ip(&bootstrap_targets_maint, &self._options.default_nodes);
@@ -1006,11 +872,15 @@ impl NodeRuntime {
                         health_maint.mark_healthy();
                     }
                     Ok(Err(err)) => {
-                        health_maint.topology_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_maint
+                            .topology_restarts
+                            .fetch_add(1, Ordering::Relaxed);
                         health_maint.record_error("topology_loop", err.to_string());
                     }
                     Err(_) => {
-                        health_maint.topology_restarts.fetch_add(1, Ordering::Relaxed);
+                        health_maint
+                            .topology_restarts
+                            .fetch_add(1, Ordering::Relaxed);
                         health_maint.record_error("topology_loop", "panic in topology loop");
                     }
                 }
