@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 #[path = "debug_server.rs"]
 mod debug_server;
+#[path = "ipc_tcp.rs"]
+mod ipc_tcp;
 
 const DEFAULT_VIRTUAL_PEERS: usize = 10;
 const TEMP_DB_DIR: &str = "temp_db";
@@ -19,6 +21,7 @@ const TEMP_CONFIGS_DIR: &str = "temp_configs";
 const DEFAULT_SCALE_TCP_BASE: u32 = 22_000;
 const DEFAULT_SCALE_UDP_BASE: u32 = 24_000;
 const DEFAULT_SCALE_DEBUG_BASE: u32 = 9_100;
+const DEFAULT_SCALE_IPC_TCP_BASE: u32 = 9_191;
 
 struct Args {
     options_path: String,
@@ -157,6 +160,13 @@ fn scale_udp_base_port() -> u32 {
         .unwrap_or(DEFAULT_SCALE_UDP_BASE)
 }
 
+fn scale_ipc_tcp_base_port() -> u32 {
+    env::var("LP2LND_SCALE_IPC_TCP_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SCALE_IPC_TCP_BASE)
+}
+
 fn write_peer_options_from_template(
     template_path: &Path,
     peer_idx: usize,
@@ -284,6 +294,39 @@ fn write_peer_options_from_template(
             "enabled": true,
             "bind_addr": format!("{bind_ip}:{debug_port}"),
             "push_interval_ms": push_ms
+        });
+    }
+
+    if v.get("ipc_tcp")
+        .and_then(|x| x.get("enabled"))
+        .and_then(|e| e.as_bool())
+        == Some(true)
+    {
+        let ipc_base = scale_ipc_tcp_base_port();
+        let ipc_port = ipc_base.checked_add(idx).ok_or_else(|| {
+            anyhow::anyhow!("lp2lnd-scale: переполнение порта ipc_tcp (peer_idx={peer_idx})")
+        })?;
+        if ipc_port > u16::MAX as u32 {
+            anyhow::bail!(
+                "lp2lnd-scale: слишком большой peer_idx={peer_idx} для ipc_tcp (> 65535)"
+            );
+        }
+        let push_incoming = v
+            .get("ipc_tcp")
+            .and_then(|x| x.get("push_incoming_packets"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        let max_frame = v
+            .get("ipc_tcp")
+            .and_then(|x| x.get("max_frame_bytes"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(16 * 1024 * 1024)
+            .clamp(4096, 64 * 1024 * 1024) as u32;
+        v["ipc_tcp"] = serde_json::json!({
+            "enabled": true,
+            "bind_addr": format!("{bind_ip}:{ipc_port}"),
+            "push_incoming_packets": push_incoming,
+            "max_frame_bytes": max_frame,
         });
     }
 
@@ -437,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let dbg_cfg = options.debug_server.clone();
+        let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp);
         let mut node = builder.build(options)?;
         node.start().await?;
         let node = Arc::new(node);
@@ -448,8 +492,10 @@ async fn main() -> anyhow::Result<()> {
                 push_interval_ms: dbg_cfg.push_interval_ms,
             },
             node.clone(),
-            db_for_debug,
+            db_for_debug.clone(),
         );
+
+        let _ipc_tcp_task = ipc_tcp::spawn_ipc_tcp_server(ipc_cfg, node.clone(), db_for_debug);
 
         let n_in_run = peer_idx - args.from + 1;
         let debug_ws_note = if args.debug_enabled {

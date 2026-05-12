@@ -14,7 +14,9 @@ use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
 use crate::logger;
 use crate::nat::NatTraversalState;
-use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
+use crate::node::addressing::{
+    advertised_addr_for_protocol, detect_lan_advertise_ip, ordered_bootstrap_targets,
+};
 use crate::node::flow_trace::FlowTraceService;
 use crate::node::incoming_sessions::run_incoming_session_handler;
 use crate::node::options::{NodeOptions, NodeRole};
@@ -168,6 +170,7 @@ impl NodeRuntime {
                 topology_tuning: options.topology_tuning,
                 flow_trace: options.flow_trace,
                 debug_server: options.debug_server,
+                ipc_tcp: options.ipc_tcp,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,

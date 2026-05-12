@@ -359,6 +359,15 @@ pub fn validate_options(options: &NodeOptions) -> ValidationReport {
         soft_warnings
             .push("soft.topology_tuning: dial_retry_cooldown_ms is too small (<1000)".to_string());
     }
+    if options.debug_server.enabled
+        && options.ipc_tcp.enabled
+        && options.debug_server.bind_addr == options.ipc_tcp.bind_addr
+    {
+        strict_errors.push(
+            "critical.ipc_tcp: bind_addr must differ from debug_server when both are enabled"
+                .to_string(),
+        );
+    }
 
     ValidationReport {
         strict_errors,

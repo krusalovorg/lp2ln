@@ -169,6 +169,29 @@ impl Default for DebugServerOptions {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcTcpOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ipc_tcp_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_true")]
+    pub push_incoming_packets: bool,
+    #[serde(default = "default_ipc_tcp_max_frame_bytes")]
+    pub max_frame_bytes: u32,
+}
+
+impl Default for IpcTcpOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_ipc_tcp_bind_addr(),
+            push_incoming_packets: true,
+            max_frame_bytes: default_ipc_tcp_max_frame_bytes(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeOptions {
     pub listens: DashMap<String, SocketAddr>,
@@ -190,6 +213,7 @@ pub struct NodeOptions {
     pub topology_tuning: TopologyTuning,
     pub flow_trace: FlowTraceOptions,
     pub debug_server: DebugServerOptions,
+    pub ipc_tcp: IpcTcpOptions,
 }
 
 impl NodeOptions {
@@ -213,6 +237,7 @@ impl NodeOptions {
             topology_tuning: TopologyTuning::default(),
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
+            ipc_tcp: IpcTcpOptions::default(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -246,6 +271,7 @@ impl NodeOptions {
             topology_tuning: TopologyTuning::default(),
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
+            ipc_tcp: IpcTcpOptions::default(),
             logger_options: Some(LoggerOptions::default()),
         }
     }
@@ -507,6 +533,14 @@ fn default_debug_server_bind_addr() -> String {
 
 fn default_debug_server_push_interval_ms() -> u64 {
     1000
+}
+
+fn default_ipc_tcp_bind_addr() -> String {
+    "127.0.0.1:9091".to_string()
+}
+
+fn default_ipc_tcp_max_frame_bytes() -> u32 {
+    16 * 1024 * 1024
 }
 
 pub(super) fn default_transport_obfuscation() -> HashMap<String, ObfuscationConfig> {

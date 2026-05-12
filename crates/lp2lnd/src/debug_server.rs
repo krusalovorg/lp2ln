@@ -144,7 +144,7 @@ async fn handle_ws_client(
     Ok(())
 }
 
-async fn handle_client_command(
+pub(crate) async fn handle_client_command(
     text: &str,
     node: Arc<NodeRuntime>,
     db: Option<Arc<P2PDatabase>>,

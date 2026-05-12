@@ -13,8 +13,8 @@ use crate::transport::obfuscation::ObfuscationConfig;
 use crate::types::PeerId;
 
 use super::options::{
-    BootstrapNode, DebugServerOptions, FlowTraceOptions, NodeOptions, NodeRole, TopologyTuning,
-    default_transport_obfuscation,
+    BootstrapNode, DebugServerOptions, FlowTraceOptions, IpcTcpOptions, NodeOptions, NodeRole,
+    TopologyTuning, default_transport_obfuscation,
 };
 
 pub(super) fn from_file(path: impl AsRef<Path>) -> Result<NodeOptions, String> {
@@ -92,6 +92,8 @@ struct NodeOptionsFile {
     flow_trace: FlowTraceOptions,
     #[serde(default)]
     debug_server: DebugServerOptions,
+    #[serde(default)]
+    ipc_tcp: IpcTcpOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +186,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             topology_tuning: file.topology_tuning,
             flow_trace: file.flow_trace,
             debug_server: file.debug_server,
+            ipc_tcp: file.ipc_tcp,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -325,6 +328,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             topology_tuning: opts.topology_tuning.clone(),
             flow_trace: opts.flow_trace.clone(),
             debug_server: opts.debug_server.clone(),
+            ipc_tcp: opts.ipc_tcp.clone(),
         }
     }
 }

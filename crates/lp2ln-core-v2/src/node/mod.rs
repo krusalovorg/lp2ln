@@ -18,5 +18,5 @@ pub mod connection_strategy {
 
 pub use autonomy::{ConfigAutonomy, StartupConfigResult, StartupConfigSource, ValidationReport};
 pub use builder::NodeBuilder;
-pub use options::{NodeOptions, NodeRole};
+pub use options::{IpcTcpOptions, NodeOptions, NodeRole};
 pub use runtime::{NodeRuntime, RuntimeHealthSnapshot, RuntimeMode};

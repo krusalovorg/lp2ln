@@ -1,5 +1,6 @@
 use core::fmt;
 mod debug_server;
+mod ipc_tcp;
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::logger::info;
@@ -139,12 +140,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let dbg_cfg = options.debug_server.clone();
+    let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp);
     let mut node = builder.build(options.clone())?;
     node.start().await?;
     let node = Arc::new(node);
     let applied_options = Arc::new(RwLock::new(options.clone()));
 
     info("[Main] Node started");
+    info("[Main] Node started");
+    const PEER_ID_HIGHLIGHT: &str = "\x1b[47;30m";
+    const ANSI_RESET: &str = "\x1b[0m";
+    println!(
+        "[Main] peer_id: {}{}{}",
+        PEER_ID_HIGHLIGHT,
+        node.peer_id(),
+        ANSI_RESET
+    );
     let eff = node.effective_peer_connection_policy();
     info(&format!(
         "[Main] peer-policy (effective): min={}, target={}, max={}; role={:?}",
@@ -161,8 +172,9 @@ async fn main() -> anyhow::Result<()> {
             push_interval_ms: dbg_cfg.push_interval_ms,
         },
         node.clone(),
-        db_handle,
+        db_handle.clone(),
     );
+    let _ipc_tcp_task = ipc_tcp::spawn_ipc_tcp_server(ipc_cfg, node.clone(), db_handle);
     let _health_task = health_server::spawn_health_server(node.clone(), None);
     let _config_watcher_task =
         config_engine.spawn_runtime_config_watcher(node.clone(), applied_options);
