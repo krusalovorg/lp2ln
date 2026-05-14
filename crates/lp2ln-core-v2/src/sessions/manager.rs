@@ -154,6 +154,18 @@ impl SessionManager {
         base - self.peer_weights.w_latency * stale * 0.35 - self.peer_weights.w_load * err_rate
     }
 
+    fn link_kind_bonus(kind: LinkKind, metrics: &SessionMetrics) -> f32 {
+        let packets = metrics.total_packets().max(1) as f32;
+        let err_rate = (metrics.total_errors() as f32 / packets).min(1.0);
+        let damp = (1.0 - err_rate).clamp(0.0, 1.0);
+        let raw = match kind {
+            LinkKind::DirectTcp | LinkKind::DirectUdp => 0.08,
+            LinkKind::TunnelTcp | LinkKind::TunnelUdp => 0.03,
+            LinkKind::Relay => 0.0,
+        };
+        raw * damp
+    }
+
     pub fn get_best_session_for_peer(
         &self,
         peer_id: &PeerId,
@@ -171,7 +183,8 @@ impl SessionManager {
             let Some(metrics) = self.get_metrics(&session_id) else {
                 continue;
             };
-            let rank = self.session_send_priority(peer_id, &session_id, &metrics);
+            let rank = self.session_send_priority(peer_id, &session_id, &metrics)
+                + Self::link_kind_bonus(session.kind(), &metrics);
             let better = match &best {
                 None => true,
                 Some((_, prev)) => rank > *prev,
@@ -399,5 +412,75 @@ impl MetricsProvider for SessionManager {
 
     fn total_sessions_count(&self) -> usize {
         SessionManager::total_sessions_count(self)
+    }
+}
+
+#[cfg(test)]
+mod link_kind_rank_tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    use crate::packet::Packet;
+    use crate::sessions::session::IncomingPacket;
+
+    struct KindSession {
+        id: String,
+        kind: LinkKind,
+        peer: String,
+    }
+
+    #[async_trait]
+    impl Session for KindSession {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn peer_id(&self) -> Option<&str> {
+            Some(&self.peer)
+        }
+
+        fn kind(&self) -> LinkKind {
+            self.kind
+        }
+
+        async fn send(&self, _packet: Packet) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn spawn_reader(self: Arc<Self>, _tx: tokio::sync::mpsc::Sender<IncomingPacket>) {}
+    }
+
+    #[test]
+    fn best_session_prefers_direct_when_metrics_equal() {
+        let store = Arc::new(PeerScoreStore::new());
+        let mgr = SessionManager::new(store, PeerScoreWeights::default());
+        let peer = PeerId::from("same-peer");
+        let tun = Arc::new(KindSession {
+            id: "t1".into(),
+            kind: LinkKind::TunnelTcp,
+            peer: peer.as_str().to_string(),
+        }) as Arc<dyn Session + Send + Sync>;
+        let dir = Arc::new(KindSession {
+            id: "d1".into(),
+            kind: LinkKind::DirectTcp,
+            peer: peer.as_str().to_string(),
+        }) as Arc<dyn Session + Send + Sync>;
+        mgr.register(
+            peer.clone(),
+            SessionId::from("t1"),
+            tun.clone(),
+        );
+        mgr.register(
+            peer.clone(),
+            SessionId::from("d1"),
+            dir.clone(),
+        );
+        let best = mgr.get_best_session_for_peer(&peer).expect("session");
+        assert_eq!(best.kind(), LinkKind::DirectTcp);
     }
 }

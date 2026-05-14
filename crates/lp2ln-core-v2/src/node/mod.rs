@@ -1,5 +1,6 @@
 pub mod addressing;
 pub mod autonomy;
+pub mod direct_upgrade;
 pub mod builder;
 pub mod distribution;
 pub mod flow_trace;
@@ -18,5 +19,5 @@ pub mod connection_strategy {
 
 pub use autonomy::{ConfigAutonomy, StartupConfigResult, StartupConfigSource, ValidationReport};
 pub use builder::NodeBuilder;
-pub use options::{IpcTcpOptions, NodeOptions, NodeRole};
+pub use options::{DirectUpgradeConfig, IpcTcpOptions, NodeOptions, NodeRole};
 pub use runtime::{NodeRuntime, RuntimeHealthSnapshot, RuntimeMode};

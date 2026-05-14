@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -38,6 +38,82 @@ use descriptor::publish_descriptor_if_due;
 use dialing::{build_dial_plan, execute_dial_plan};
 use packet_helpers::{control_packet, handshake_packet, observe_failure_and_close};
 
+#[derive(Clone)]
+pub(crate) struct BootstrapDialDedupe {
+    pub active_peers: usize,
+    pub set: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
+}
+
+fn effective_bootstrap_connected_count(
+    connected: &[PeerId],
+    catalog: &PeerCatalog,
+    bootstrap_targets: &[BootstrapNode],
+    dial_book: &DashMap<PeerId, Vec<(String, SocketAddr)>>,
+    bootstrap_dial_ok_ms: &HashMap<SocketAddr, u64>,
+    now: u64,
+) -> usize {
+    let mut seen: HashSet<PeerId> = HashSet::new();
+    for p in connected {
+        if catalog.peer_is_bootstrap_entry(p) {
+            seen.insert(p.clone());
+            continue;
+        }
+        if let Some(desc) = catalog.descriptor_of(p) {
+            if bootstrap_targets
+                .iter()
+                .any(|t| descriptor_announces_bootstrap_target(&desc, t))
+            {
+                seen.insert(p.clone());
+                continue;
+            }
+        }
+        if let Some(entry) = dial_book.get(p) {
+            let hinted = bootstrap_targets.iter().any(|t| t.peer_id_hint.as_ref() == Some(p));
+            let addr_match = bootstrap_targets.iter().any(|t| {
+                entry.value().iter().any(|(proto, addr)| {
+                    *addr == t.addr
+                        && (t.protocols.is_empty()
+                            || t
+                                .protocols
+                                .iter()
+                                .any(|tp| tp.eq_ignore_ascii_case(proto)))
+                })
+            });
+            if hinted || addr_match {
+                seen.insert(p.clone());
+            }
+        }
+    }
+    if !seen.is_empty() {
+        return seen.len();
+    }
+    let any_recent_dial = bootstrap_targets.iter().any(|t| {
+        bootstrap_dial_ok_ms
+            .get(&t.addr)
+            .copied()
+            .map(|ts| now.saturating_sub(ts) < BOOTSTRAP_DIAL_OK_TTL_MS)
+            .unwrap_or(false)
+    });
+    if any_recent_dial {
+        1
+    } else {
+        0
+    }
+}
+
+fn descriptor_announces_bootstrap_target(
+    desc: &crate::topology::NodeDescriptor,
+    t: &BootstrapNode,
+) -> bool {
+    desc.observed_addrs.iter().any(|line| {
+        parse_observed_addr_line(line).is_some_and(|(proto, addr)| {
+            addr == t.addr
+                && (t.protocols.is_empty()
+                    || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(&proto)))
+        })
+    })
+}
+
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const MAINTENANCE_START_JITTER_MS: u64 = 3_000;
 const REGULAR_MAX_HEADROOM: usize = 2;
@@ -47,6 +123,9 @@ pub(super) const SHEPHERD_SWEEP_INTERVAL_MS: u64 = 10_000;
 pub(super) const SHEPHERD_MIN_MESH: u16 = 3;
 pub(super) const SHEPHERD_GRACE_MS: u64 = 15_000;
 pub(super) const SHEPHERD_FINAL_PEERS_LIMIT: usize = 24;
+pub(super) const SHEPHERD_SKIP_IF_CONNECTED_AT_MOST: usize = 6;
+
+pub(super) const BOOTSTRAP_DIAL_OK_TTL_MS: u64 = 120_000;
 
 pub(crate) async fn dial_bootstrap_address(
     transports: &[Arc<dyn Transport>],
@@ -55,6 +134,8 @@ pub(crate) async fn dial_bootstrap_address(
     our_peer_id: &str,
     target: &BootstrapNode,
     handshake_payload: &[u8],
+    dedupe: Option<&BootstrapDialDedupe>,
+    record_dial_ok: Option<(&Arc<Mutex<HashMap<SocketAddr, u64>>>, u64)>,
 ) -> bool {
     for transport in transports {
         if !transport.is_listener() {
@@ -67,6 +148,16 @@ pub(crate) async fn dial_bootstrap_address(
                 .any(|p| p.eq_ignore_ascii_case(transport.name()))
         {
             continue;
+        }
+        let transport_name = transport.name().to_string();
+        let key = (transport_name.clone(), target.addr);
+        if let Some(d) = dedupe {
+            if d.active_peers > 0 && d.set.lock().unwrap().contains(&key) {
+                if let Some((m, ts)) = record_dial_ok {
+                    m.lock().unwrap().insert(target.addr, ts);
+                }
+                return true;
+            }
         }
         match transport.dial(target.addr).await {
             Ok(session) => {
@@ -86,6 +177,12 @@ pub(crate) async fn dial_bootstrap_address(
                         e
                     );
                     return false;
+                }
+                if let Some(d) = dedupe {
+                    d.set.lock().unwrap().insert(key);
+                }
+                if let Some((m, ts)) = record_dial_ok {
+                    m.lock().unwrap().insert(target.addr, ts);
                 }
                 return true;
             }
@@ -289,6 +386,8 @@ pub(crate) async fn run_topology_maintenance_loop(
     maintenance_handshake_payload: Vec<u8>,
     bootstrap_targets_maint: Vec<BootstrapNode>,
     nat_state: Arc<NatTraversalState>,
+    bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
+    bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
 ) -> anyhow::Result<()> {
     let initial_jitter = (our_peer_maint
         .bytes()
@@ -380,10 +479,19 @@ pub(crate) async fn run_topology_maintenance_loop(
             .saturating_sub(reserve_slots)
             .max(adaptive.min_active_peers);
         let connected_snapshot_for_policy = router_maint.connected_peers();
-        let connected_bootstrap_now = connected_snapshot_for_policy
-            .iter()
-            .filter(|p| catalog.peer_is_bootstrap_entry(p))
-            .count();
+        {
+            let mut g = bootstrap_dial_ok_ms.lock().unwrap();
+            g.retain(|_, ts| now.saturating_sub(*ts) < BOOTSTRAP_DIAL_OK_TTL_MS);
+        }
+        let dial_ok_snap = bootstrap_dial_ok_ms.lock().unwrap().clone();
+        let connected_bootstrap_now = effective_bootstrap_connected_count(
+            &connected_snapshot_for_policy,
+            catalog.as_ref(),
+            &bootstrap_targets_maint,
+            dial_book.as_ref(),
+            &dial_ok_snap,
+            now,
+        );
         let connected_non_bootstrap_now = connected_snapshot_for_policy
             .len()
             .saturating_sub(connected_bootstrap_now);
@@ -424,6 +532,8 @@ pub(crate) async fn run_topology_maintenance_loop(
             &router_maint,
             &incoming_maint,
             &maintenance_handshake_payload,
+            &bootstrap_dial_dedupe,
+            &bootstrap_dial_ok_ms,
         )
         .await
         {

@@ -6,10 +6,13 @@ use std::sync::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc;
+
 use lp2ln_core_v2::{
     PeerId, SessionId,
     node::{
         NodeRole,
+        direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
         distribution::{
             rank_dial_candidates, should_skip_for_bootstrap_quota, structured_slot_count,
         },
@@ -86,7 +89,9 @@ impl PacketProcessor for NoopProcessor {
     async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {}
 }
 
-fn test_router() -> (Router, Arc<SessionManager>) {
+fn test_router_with_sink(
+    sink: Option<DirectUpgradeRouterSink>,
+) -> (Router, Arc<SessionManager>) {
     let store = Arc::new(PeerScoreStore::new());
     let manager = Arc::new(SessionManager::new(store, PeerScoreWeights::default()));
     let (router, _rx) = Router::new(
@@ -94,8 +99,13 @@ fn test_router() -> (Router, Arc<SessionManager>) {
         Arc::new(NoopProcessor),
         None,
         "router-self",
+        sink,
     );
     (router, manager)
+}
+
+fn test_router() -> (Router, Arc<SessionManager>) {
+    test_router_with_sink(None)
 }
 
 fn packet(data: Vec<u8>) -> Packet {
@@ -299,6 +309,85 @@ async fn router_does_not_flood_control_packets_without_direct_session() {
     );
     assert_eq!(n1.sent_len(), 0);
     assert_eq!(n2.sent_len(), 0);
+}
+
+#[tokio::test]
+async fn router_fallback_emits_direct_upgrade_event() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let sink = Some(DirectUpgradeRouterSink { enabled: true, tx });
+    let (router, _mgr) = test_router_with_sink(sink);
+    let n1 = RecordingSession::new("sess-n1", Some("neighbor-1"));
+    let n2 = RecordingSession::new("sess-n2", Some("neighbor-2"));
+    router.register_session(
+        PeerId::from("neighbor-1"),
+        SessionId::from("sess-n1"),
+        n1.clone(),
+    );
+    router.register_session(
+        PeerId::from("neighbor-2"),
+        SessionId::from("sess-n2"),
+        n2.clone(),
+    );
+
+    router
+        .send_to_peer(
+            PeerId::from("missing-target"),
+            packet(b"x".to_vec()),
+            None,
+        )
+        .await
+        .expect("fallback send");
+
+    let ev = rx.recv().await.expect("upgrade event");
+    match ev {
+        DirectUpgradeEvent::FallbackTraffic { peer_id, bytes } => {
+            assert_eq!(peer_id.as_str(), "missing-target");
+            assert!(bytes > 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn router_fallback_continues_when_direct_upgrade_queue_full() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let sink = Some(DirectUpgradeRouterSink { enabled: true, tx });
+    let (router, _mgr) = test_router_with_sink(sink);
+    let mut sessions = Vec::new();
+    for i in 0..3 {
+        let peer = format!("neighbor-{i}");
+        let sess = RecordingSession::new(&format!("sess-{i}"), Some(&peer));
+        router.register_session(
+            PeerId::from(peer.as_str()),
+            SessionId::from(sess.id()),
+            sess.clone(),
+        );
+        sessions.push(sess);
+    }
+
+    router
+        .send_to_peer(
+            PeerId::from("missing-target"),
+            packet(b"a".to_vec()),
+            None,
+        )
+        .await
+        .expect("first fallback send");
+    router
+        .send_to_peer(
+            PeerId::from("missing-target"),
+            packet(b"b".to_vec()),
+            None,
+        )
+        .await
+        .expect("second fallback when upgrade queue saturated");
+
+    assert!(
+        router.direct_upgrade_queue_drops() >= 1,
+        "second event should overflow capacity-1 queue"
+    );
+    let _ = rx.recv().await;
+    let total_sent: usize = sessions.iter().map(|s| s.sent_len()).sum();
+    assert!(total_sent >= 2);
 }
 
 fn descriptor(peer_id: &str, bootstrap_entry: bool, active_connections: u16) -> NodeDescriptor {

@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -14,13 +16,17 @@ use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
 use crate::logger;
 use crate::nat::NatTraversalState;
-use crate::node::addressing::{
-    advertised_addr_for_protocol, detect_lan_advertise_ip, ordered_bootstrap_targets,
+use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
+use crate::node::direct_upgrade::{
+    nat_trigger_from_parts, spawn_direct_upgrade_loop, CoreDirectDialer, DirectUpgradeContext,
+    DirectUpgradeRouterSink, TrafficDemandTracker,
 };
 use crate::node::flow_trace::FlowTraceService;
 use crate::node::incoming_sessions::run_incoming_session_handler;
 use crate::node::options::{NodeOptions, NodeRole};
-use crate::node::topology_maintenance::{dial_bootstrap_address, run_topology_maintenance_loop};
+use crate::node::topology_maintenance::{
+    dial_bootstrap_address, run_topology_maintenance_loop, BootstrapDialDedupe,
+};
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
 use crate::peer_score::PeerConnectionPolicy;
@@ -107,6 +113,8 @@ pub struct NodeRuntime {
     peer_catalog: Arc<PeerCatalog>,
     nat_state: Arc<NatTraversalState>,
     dial_book: Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
+    bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
+    bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
     descriptor_version: Arc<AtomicU64>,
     router: Option<Arc<Router>>,
     incoming_sessions_tx: Option<mpsc::Sender<Arc<dyn Session>>>,
@@ -171,6 +179,7 @@ impl NodeRuntime {
                 flow_trace: options.flow_trace,
                 debug_server: options.debug_server,
                 ipc_tcp: options.ipc_tcp,
+                direct_upgrade: options.direct_upgrade,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,
@@ -180,6 +189,8 @@ impl NodeRuntime {
             peer_catalog,
             nat_state,
             dial_book: Arc::new(DashMap::new()),
+            bootstrap_dial_dedupe: Arc::new(Mutex::new(HashSet::new())),
+            bootstrap_dial_ok_ms: Arc::new(Mutex::new(HashMap::new())),
             descriptor_version: Arc::new(AtomicU64::new(1)),
             router: None,
             incoming_sessions_tx: None,
@@ -594,11 +605,21 @@ impl NodeRuntime {
     pub async fn start(&mut self) -> Result<()> {
         let (incoming_sessions_tx, incoming_sessions_rx) = mpsc::channel(ROUTER_INCOMING_QUEUE_CAP);
         let signing_key = Some(Arc::new(self.keypair.signing_key().clone()));
+        let du_cfg = self._options.direct_upgrade.clone();
+        let upgrade_sink = if du_cfg.enabled {
+            let (tx, rx) = mpsc::channel(du_cfg.event_queue_cap.max(64));
+            Some((DirectUpgradeRouterSink { enabled: true, tx }, rx, du_cfg))
+        } else {
+            None
+        };
         let (router_raw, mut incoming_packets_rx) = Router::new(
             self.session_manager.clone(),
             self.packet_processor.clone(),
             signing_key,
             self.keypair.peer_id(),
+            upgrade_sink
+                .as_ref()
+                .map(|(sink, _rx, _cfg)| sink.clone()),
         );
         let router = Arc::new(router_raw);
         {
@@ -631,6 +652,56 @@ impl NodeRuntime {
             });
         }
         self.router = Some(router.clone());
+        if let Some((_sink, rx, du_cfg)) = upgrade_sink {
+            let mut obf_protocols: Vec<String> = self
+                ._options
+                .transport_obfuscation
+                .keys()
+                .cloned()
+                .collect();
+            obf_protocols.sort();
+            let listens: HashMap<String, SocketAddr> = self
+                ._options
+                .listens
+                .iter()
+                .map(|r| (r.key().clone(), *r.value()))
+                .collect();
+            let advertise = self._options.advertise_addrs.clone();
+            let dialer = Arc::new(CoreDirectDialer {
+                router: router.clone(),
+                transports: self.transports.clone(),
+                keypair: self.keypair.clone(),
+                obfuscation_protocols: obf_protocols,
+            });
+            let nat = if du_cfg.try_nat_traversal {
+                Some(nat_trigger_from_parts(
+                    router.clone(),
+                    self.keypair.clone(),
+                    self.transports.clone(),
+                    listens.clone(),
+                    self.nat_state.clone(),
+                ))
+            } else {
+                None
+            };
+            let tracker = Arc::new(TrafficDemandTracker::new(du_cfg.max_tracker_peers));
+            spawn_direct_upgrade_loop(
+                rx,
+                DirectUpgradeContext {
+                    config: du_cfg,
+                    our_peer_id: self.keypair.peer_id().to_string(),
+                    router: router.clone(),
+                    session_manager: self.session_manager.clone(),
+                    peer_catalog: self.peer_catalog.clone(),
+                    dial_book: self.dial_book.clone(),
+                    listens,
+                    advertise,
+                    dialer,
+                    nat,
+                    tracker,
+                },
+            );
+        }
         FlowTraceService::spawn(
             &router,
             self._options.node_role,
@@ -783,8 +854,15 @@ impl NodeRuntime {
             .collect();
         obf_protocols.sort();
         let handshake_payload = handshake::encode_hello(obf_protocols);
+        let bootstrap_dedupe_startup = self.bootstrap_dial_dedupe.clone();
+        let bootstrap_ok_startup = self.bootstrap_dial_ok_ms.clone();
         tokio::spawn(async move {
             for target in bootstrap_targets {
+                let dedupe_ctx = BootstrapDialDedupe {
+                    active_peers: 0,
+                    set: bootstrap_dedupe_startup.clone(),
+                };
+                let ts = crate::topology::now_ms();
                 dial_bootstrap_address(
                     &transports,
                     &router_outgoing,
@@ -792,6 +870,8 @@ impl NodeRuntime {
                     &our_peer_id,
                     &target,
                     &handshake_payload,
+                    Some(&dedupe_ctx),
+                    Some((&bootstrap_ok_startup, ts)),
                 )
                 .await;
             }
@@ -838,6 +918,8 @@ impl NodeRuntime {
         maint_obf_protocols.sort();
         let maintenance_handshake_payload = handshake::encode_hello(maint_obf_protocols);
         let nat_state_maint = self.nat_state.clone();
+        let bootstrap_dial_dedupe_maint = self.bootstrap_dial_dedupe.clone();
+        let bootstrap_dial_ok_maint = self.bootstrap_dial_ok_ms.clone();
 
         let health_maint = self.health.clone();
         tokio::spawn(async move {
@@ -866,6 +948,8 @@ impl NodeRuntime {
                     maintenance_handshake_payload.clone(),
                     bootstrap_targets_maint.clone(),
                     nat_state_maint.clone(),
+                    bootstrap_dial_dedupe_maint.clone(),
+                    bootstrap_dial_ok_maint.clone(),
                 ))
                 .catch_unwind()
                 .await;

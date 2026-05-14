@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::node::options::{BootstrapNode, TopologyTuning};
 use crate::protocol::control::NetworkControlPayload;
@@ -14,12 +14,12 @@ use crate::topology::{
 use crate::transport::Transport;
 use crate::types::PeerId;
 
-use super::dial_bootstrap_address;
+use super::{
+    dial_bootstrap_address, BootstrapDialDedupe, SHEPHERD_FINAL_PEERS_LIMIT, SHEPHERD_GRACE_MS,
+    SHEPHERD_MIN_MESH, SHEPHERD_SKIP_IF_CONNECTED_AT_MOST, SHEPHERD_SWEEP_INTERVAL_MS,
+};
 use super::packet_helpers::control_packet;
 use super::policy::AdaptiveTickPolicy;
-use super::{
-    SHEPHERD_FINAL_PEERS_LIMIT, SHEPHERD_GRACE_MS, SHEPHERD_MIN_MESH, SHEPHERD_SWEEP_INTERVAL_MS,
-};
 use crate::node::options::NodeRole;
 
 fn bootstrap_identity(target: &BootstrapNode) -> String {
@@ -65,6 +65,8 @@ pub(super) async fn handle_bootstrap_reseed(
     router_maint: &Arc<Router>,
     incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
     maintenance_handshake_payload: &[u8],
+    bootstrap_dial_dedupe: &Arc<Mutex<HashSet<(String, SocketAddr)>>>,
+    bootstrap_dial_ok_ms: &Arc<Mutex<HashMap<SocketAddr, u64>>>,
 ) -> bool {
     if bootstrap_targets_maint.is_empty() || !(reseed_for_low || reseed_for_bridge) {
         return false;
@@ -103,6 +105,10 @@ pub(super) async fn handle_bootstrap_reseed(
             continue;
         }
         attempted = attempted.saturating_add(1);
+        let dedupe_ctx = BootstrapDialDedupe {
+            active_peers: n,
+            set: bootstrap_dial_dedupe.clone(),
+        };
         let ok = dial_bootstrap_address(
             transports_maint,
             router_maint,
@@ -110,6 +116,8 @@ pub(super) async fn handle_bootstrap_reseed(
             our_peer_maint,
             &target,
             maintenance_handshake_payload,
+            Some(&dedupe_ctx),
+            Some((bootstrap_dial_ok_ms, now)),
         )
         .await;
         if ok {
@@ -143,6 +151,9 @@ pub(super) async fn run_bootstrap_shepherd(
     let connected = router_maint.connected_peers();
     for pid in connected.iter() {
         peer_admission_ms.entry(pid.clone()).or_insert(now);
+    }
+    if connected.len() <= SHEPHERD_SKIP_IF_CONNECTED_AT_MOST {
+        return (true, 0);
     }
     let tracked: Vec<PeerId> = peer_admission_ms.keys().cloned().collect();
     for pid in tracked {

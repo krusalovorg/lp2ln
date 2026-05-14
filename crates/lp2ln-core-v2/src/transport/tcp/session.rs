@@ -18,7 +18,7 @@ fn tcp_peer_display(peer_id: &Option<String>, session_id: &str) -> String {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
             let short: String = session_id.chars().take(8).collect();
-            format!("unknown peer, session {short}")
+            format!("outbound-tcp session {short}")
         }
     }
 }

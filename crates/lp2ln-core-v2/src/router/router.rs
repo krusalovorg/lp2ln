@@ -8,8 +8,11 @@ use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    crypto::secure_channel::{derive_shared_key, encode_secure_envelope, is_secure_envelope},
+    crypto::secure_channel::{
+        derive_shared_key, encode_secure_envelope, is_secure_envelope,
+    },
     crypto::signature::sign_packet,
+    node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
     packet::Packet,
     packet_processor::{ChunkAssembler, ChunkAssemblerResult, PacketProcessor},
     protocol::control::NetworkControlPayload,
@@ -35,6 +38,8 @@ pub struct Router {
     next_request_id: AtomicU64,
     next_secure_seq: AtomicU64,
     our_peer_id: String,
+    direct_upgrade: Option<DirectUpgradeRouterSink>,
+    direct_upgrade_channel_full: AtomicU64,
 }
 
 impl Router {
@@ -43,6 +48,7 @@ impl Router {
         packet_processor: Arc<dyn PacketProcessor>,
         signing_key: Option<Arc<SigningKey>>,
         our_peer_id: impl Into<String>,
+        direct_upgrade: Option<DirectUpgradeRouterSink>,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id = our_peer_id.into();
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
@@ -61,6 +67,8 @@ impl Router {
                 next_request_id: AtomicU64::new(start_id),
                 next_secure_seq: AtomicU64::new(1),
                 our_peer_id,
+                direct_upgrade,
+                direct_upgrade_channel_full: AtomicU64::new(0),
             },
             incoming_rx,
         )
@@ -92,12 +100,48 @@ impl Router {
         Ok(packet)
     }
 
+    fn try_record_direct_upgrade_fallback(&self, peer_id: &PeerId, bytes: u64) {
+        let Some(ref sink) = self.direct_upgrade else {
+            return;
+        };
+        if !sink.enabled {
+            return;
+        }
+        match sink.tx.try_send(DirectUpgradeEvent::FallbackTraffic {
+            peer_id: peer_id.clone(),
+            bytes,
+        }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let n = self
+                    .direct_upgrade_channel_full
+                    .fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n % 256 == 0 {
+                    let total = n.saturating_add(1);
+                    crate::warn!(
+                        "[Router] direct_upgrade event queue full (dropped {} events total)",
+                        total
+                    );
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    pub fn direct_upgrade_queue_drops(&self) -> u64 {
+        self.direct_upgrade_channel_full.load(Ordering::Relaxed)
+    }
+
     pub fn incoming_sender(&self) -> mpsc::Sender<IncomingPacket> {
         self.incoming_tx.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<IncomingPacket> {
         self.incoming_broadcast_tx.subscribe()
+    }
+
+    pub(crate) fn broadcast_incoming_after_decrypt(&self, incoming: IncomingPacket) {
+        let _ = self.incoming_broadcast_tx.send(incoming);
     }
 
     pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
@@ -182,6 +226,7 @@ impl Router {
                 peer_id
             ));
         }
+        self.try_record_direct_upgrade_fallback(&peer_id, packet.wire_size_estimate());
         let mut any_ok = false;
         let mut sent_count = 0usize;
         let mut last_err = None;
@@ -296,11 +341,20 @@ impl Router {
                 Some(incoming)
             };
 
-            let Some(incoming) = to_process else {
+            let Some(mut incoming) = to_process else {
                 continue;
             };
 
-            let _ = self.incoming_broadcast_tx.send(incoming.clone());
+            if incoming.from_node.is_none() && !incoming.packet.sender.is_empty() {
+                incoming.from_node = Some(incoming.packet.sender.clone());
+            }
+
+            let skip_early_ipc = is_secure_envelope(&incoming.packet.data)
+                && (incoming.packet.receiver == self.our_peer_id
+                    || incoming.packet.receiver.is_empty());
+            if !skip_early_ipc {
+                let _ = self.incoming_broadcast_tx.send(incoming.clone());
+            }
 
             let processor = self.packet_processor.clone();
             let router = self.clone();

@@ -153,6 +153,16 @@ pub(super) async fn execute_dial_plan(
         if pid.as_str() == our_peer_maint || sm.is_connected_to_peer(&pid) {
             continue;
         }
+        if matches!(node_role, NodeRole::Regular) {
+            let mesh_peer = plan
+                .desc_by_peer
+                .get(&pid)
+                .map(|d| !d.capabilities.bootstrap_entry)
+                .unwrap_or(!catalog.peer_is_bootstrap_entry(&pid));
+            if mesh_peer && our_peer_maint >= pid.as_str() {
+                continue;
+            }
+        }
         if let Some(until) = dial_cooldown_until.get(&pid).copied() {
             if now < until {
                 continue;
@@ -221,6 +231,9 @@ pub(super) async fn execute_dial_plan(
             {
                 if !t.is_listener() {
                     continue;
+                }
+                if sm.is_connected_to_peer(&pid) {
+                    break;
                 }
                 endpoint_attempts = endpoint_attempts.saturating_add(1);
                 dial_attempts_left = dial_attempts_left.saturating_sub(1);

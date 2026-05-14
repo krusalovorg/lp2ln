@@ -116,6 +116,11 @@ impl PacketProcessor for DefaultPacketProcessor {
                 return;
             }
             packet.data = plaintext;
+            router.broadcast_incoming_after_decrypt(IncomingPacket {
+                session_id: incoming_packet.session_id.clone(),
+                from_node: incoming_packet.from_node.clone(),
+                packet: packet.clone(),
+            });
         }
 
         let from = incoming_packet

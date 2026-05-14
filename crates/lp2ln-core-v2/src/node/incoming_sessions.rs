@@ -667,6 +667,7 @@ mod tests {
             Arc::new(NoopProcessor),
             Some(Arc::new(local_key.signing_key().clone())),
             local_peer_id.clone(),
+            None,
         );
         let router = Arc::new(router);
         let catalog = Arc::new(PeerCatalog::new());
