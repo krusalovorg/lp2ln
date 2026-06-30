@@ -254,6 +254,12 @@ impl SessionManager {
         self.sessions.len()
     }
 
+    /// All registered session IDs, including sessions not yet bound to a
+    /// PeerId (handshake/redirect). Used for full drain at node shutdown.
+    pub fn all_session_ids(&self) -> Vec<SessionId> {
+        self.sessions.iter().map(|e| e.key().clone()).collect()
+    }
+
     pub fn debug_sessions(&self) -> Vec<SessionDebugEntry> {
         self.sessions
             .iter()
@@ -470,16 +476,8 @@ mod link_kind_rank_tests {
             kind: LinkKind::DirectTcp,
             peer: peer.as_str().to_string(),
         }) as Arc<dyn Session + Send + Sync>;
-        mgr.register(
-            peer.clone(),
-            SessionId::from("t1"),
-            tun.clone(),
-        );
-        mgr.register(
-            peer.clone(),
-            SessionId::from("d1"),
-            dir.clone(),
-        );
+        mgr.register(peer.clone(), SessionId::from("t1"), tun.clone());
+        mgr.register(peer.clone(), SessionId::from("d1"), dir.clone());
         let best = mgr.get_best_session_for_peer(&peer).expect("session");
         assert_eq!(best.kind(), LinkKind::DirectTcp);
     }

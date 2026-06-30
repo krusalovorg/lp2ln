@@ -36,9 +36,9 @@ impl StunClient {
                     port,
                     e
                 );
-                Client::new("0.0.0.0:0", None)
-                    .await
-                    .map_err(|e2| anyhow::anyhow!("Failed to create STUN client (fallback): {:?}", e2))?
+                Client::new("0.0.0.0:0", None).await.map_err(|e2| {
+                    anyhow::anyhow!("Failed to create STUN client (fallback): {:?}", e2)
+                })?
             }
             Err(e) => return Err(anyhow::anyhow!("Failed to create STUN client: {:?}", e)),
         };

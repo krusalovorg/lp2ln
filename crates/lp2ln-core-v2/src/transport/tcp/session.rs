@@ -67,6 +67,9 @@ pub struct TcpSession {
 
     read: tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>,
     obfuscator: Arc<Obfuscator>,
+    // Cancelled by close(); reader and writer loops select on it so both
+    // tasks terminate even while blocked on socket read / channel recv.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -94,7 +97,7 @@ impl Session for TcpSession {
     }
 
     async fn close(&self) -> Result<()> {
-        drop(self.tx.clone());
+        self.shutdown.cancel();
         Ok(())
     }
 
@@ -105,10 +108,15 @@ impl Session for TcpSession {
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
         let link_kind = self.kind();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             loop {
-                match self.read_packet().await {
+                let read_result = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = self.read_packet() => result,
+                };
+                match read_result {
                     Ok(pkt) => {
                         match incoming_packets_tx
                             .send(IncomingPacket {
@@ -157,6 +165,7 @@ impl TcpSession {
         let (read_half, write_half) = stream.into_split();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let shutdown = tokio_util::sync::CancellationToken::new();
 
         let session = Arc::new(Self {
             id,
@@ -165,6 +174,7 @@ impl TcpSession {
             tx,
             read: tokio::sync::Mutex::new(read_half),
             obfuscator: obfuscator.clone(),
+            shutdown: shutdown.clone(),
         });
 
         let write_half_arc = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -175,7 +185,14 @@ impl TcpSession {
         let writer_kind = session.kind;
 
         tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
+            loop {
+                let data = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    maybe = rx.recv() => match maybe {
+                        Some(data) => data,
+                        None => break,
+                    },
+                };
                 let mut writer = write_half_clone.lock().await;
 
                 if let Err(e) = obfuscator_clone.write_frame(&mut *writer, &data).await {

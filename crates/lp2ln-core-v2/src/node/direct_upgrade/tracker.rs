@@ -118,8 +118,7 @@ impl TrafficDemandTracker {
         e.events.push_back((now, bytes));
 
         let (pkts, total_bytes) = e.window_stats();
-        let meets =
-            pkts >= cfg.min_packets_per_window && total_bytes >= cfg.min_bytes_per_window;
+        let meets = pkts >= cfg.min_packets_per_window && total_bytes >= cfg.min_bytes_per_window;
         let eff = e.effective_state(now);
         if matches!(eff, UpgradeState::Dialing | UpgradeState::NatTraversal) {
             return;

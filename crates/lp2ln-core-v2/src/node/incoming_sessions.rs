@@ -161,6 +161,7 @@ pub async fn send_discovery_redirect_and_close_with_preamble(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_incoming_session_handler(
+    cancel: tokio_util::sync::CancellationToken,
     incoming_sessions_rx: &mut tokio::sync::mpsc::Receiver<Arc<dyn Session>>,
     session_manager: Arc<SessionManager>,
     router_for_incoming: Arc<Router>,
@@ -180,7 +181,24 @@ pub(crate) async fn run_incoming_session_handler(
     let mut recent_bootstrap_hints: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut fairness_window_started_ms = now_ms();
-    while let Some(session) = incoming_sessions_rx.recv().await {
+    loop {
+        let session = tokio::select! {
+            _ = cancel.cancelled() => {
+                // The sender has live clones in transports/bootstrap/topology,
+                // so dropping one clone never closes the channel. Close the
+                // receiver explicitly and drain buffered sessions so accepted
+                // but unprocessed connections do not leak past shutdown.
+                incoming_sessions_rx.close();
+                while let Ok(buffered) = incoming_sessions_rx.try_recv() {
+                    let _ = buffered.close().await;
+                }
+                return Ok(());
+            }
+            maybe = incoming_sessions_rx.recv() => match maybe {
+                Some(session) => session,
+                None => break,
+            },
+        };
         let incoming_policy = NodeOptions::effective_peer_connection_policy_for(
             policy_live_incoming.read().unwrap().clone(),
             incoming_node_role,
@@ -687,6 +705,7 @@ mod tests {
             let score_store = score_store.clone();
             async move {
                 run_incoming_session_handler(
+                    tokio_util::sync::CancellationToken::new(),
                     &mut incoming_rx,
                     session_manager,
                     router,

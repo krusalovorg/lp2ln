@@ -4,7 +4,9 @@ use crate::stun::StunClient;
 use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::transport::transport::{PublicAddress, TransportContext, TunnelPunchParams};
 use crate::transport::udp::session::UdpSession;
-use crate::transport::{Transport, bind_with_port_fallback};
+use crate::transport::{
+    ACCEPT_TASK_JOIN_TIMEOUT, Transport, bind_with_port_fallback, join_accept_task,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -16,6 +18,7 @@ use tokio::time::{Duration, timeout};
 pub struct UdpTransport {
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    accept_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stun_client: StunClient,
     is_listener: bool,
     obfuscator: Arc<Obfuscator>,
@@ -26,6 +29,7 @@ impl UdpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::plain()),
@@ -36,6 +40,7 @@ impl UdpTransport {
         Self {
             listen_addr,
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::plain()),
@@ -46,6 +51,7 @@ impl UdpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: false,
             obfuscator: Arc::new(Obfuscator::plain()),
@@ -59,6 +65,7 @@ impl UdpTransport {
         Self {
             listen_addr,
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::from_config(config)),
@@ -69,6 +76,7 @@ impl UdpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             stun_client: StunClient::new(),
             is_listener: false,
             obfuscator: Arc::new(Obfuscator::from_config(config)),
@@ -130,7 +138,7 @@ impl Transport for UdpTransport {
             *shutdown_tx_guard = Some(shutdown_tx);
         }
 
-        tokio::spawn(async move {
+        let accept_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65507];
 
             loop {
@@ -187,6 +195,11 @@ impl Transport for UdpTransport {
             }
         });
 
+        {
+            let mut accept_task_guard = self.accept_task.lock().await;
+            *accept_task_guard = Some(accept_handle);
+        }
+
         Ok(Some(actual_addr))
     }
 
@@ -198,10 +211,16 @@ impl Transport for UdpTransport {
 
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
-            crate::info!("[UdpTransport] Stopped");
         } else {
             crate::info!("[UdpTransport] Already stopped or not started");
         }
+
+        let accept_handle = {
+            let mut accept_task_guard = self.accept_task.lock().await;
+            accept_task_guard.take()
+        };
+        join_accept_task("UdpTransport", accept_handle, ACCEPT_TASK_JOIN_TIMEOUT).await;
+        crate::info!("[UdpTransport] Stopped");
 
         Ok(())
     }

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::node::options::DirectUpgradeConfig;
 use crate::router::Router;
@@ -30,9 +31,10 @@ pub struct DirectUpgradeContext {
     pub tracker: Arc<TrafficDemandTracker>,
 }
 
-pub fn spawn_direct_upgrade_loop(
+pub async fn run_direct_upgrade_loop(
     mut rx: mpsc::Receiver<DirectUpgradeEvent>,
     ctx: DirectUpgradeContext,
+    cancel: CancellationToken,
 ) {
     if !ctx.config.enabled {
         return;
@@ -49,78 +51,75 @@ pub fn spawn_direct_upgrade_loop(
     let nat = ctx.nat.clone();
     let tracker = ctx.tracker.clone();
     let our_peer_id = ctx.our_peer_id.clone();
-    let parallel = Arc::new(Semaphore::new(
-        cfg.max_parallel_attempts.max(1).min(32),
-    ));
+    let parallel = Arc::new(Semaphore::new(cfg.max_parallel_attempts.max(1).min(32)));
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                ev = rx.recv() => {
-                    match ev {
-                        Some(DirectUpgradeEvent::FallbackTraffic { peer_id, bytes }) => {
-                            if !session_manager.get_all_for_peer(&peer_id).is_empty() {
-                                continue;
-                            }
-                            tracker.record_fallback(peer_id, bytes, &cfg);
-                        }
-                        None => break,
-                    }
-                }
-                _ = interval.tick() => {
-                    if !cfg.enabled {
-                        continue;
-                    }
-                    loop {
-                        let Ok(permit) = parallel.clone().try_acquire_owned() else {
-                            break;
-                        };
-                        let Some(peer_id) = tracker.pick_candidate(&cfg) else {
-                            drop(permit);
-                            break;
-                        };
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            ev = rx.recv() => {
+                match ev {
+                    Some(DirectUpgradeEvent::FallbackTraffic { peer_id, bytes }) => {
                         if !session_manager.get_all_for_peer(&peer_id).is_empty() {
-                            tracker.mark_satisfied_by_existing_session(&peer_id);
-                            drop(permit);
                             continue;
                         }
-                        tracker.mark_dialing(&peer_id);
-                        let router2 = router.clone();
-                        let session_manager2 = session_manager.clone();
-                        let catalog2 = catalog.clone();
-                        let dial_book2 = dial_book.clone();
-                        let listens2 = listens.clone();
-                        let advertise2 = advertise.clone();
-                        let dialer2 = dialer.clone();
-                        let nat2 = nat.clone();
-                        let tracker2 = tracker.clone();
-                        let cfg2 = cfg.clone();
-                        let our_id = our_peer_id.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            run_one_upgrade_attempt(
-                                peer_id,
-                                our_id.as_str(),
-                                &cfg2,
-                                &tracker2,
-                                &router2,
-                                &session_manager2,
-                                &catalog2,
-                                &dial_book2,
-                                &listens2,
-                                &advertise2,
-                                dialer2.as_ref(),
-                                nat2.as_deref(),
-                            )
-                            .await;
-                        });
+                        tracker.record_fallback(peer_id, bytes, &cfg);
                     }
+                    None => break,
+                }
+            }
+            _ = interval.tick() => {
+                if !cfg.enabled {
+                    continue;
+                }
+                loop {
+                    let Ok(permit) = parallel.clone().try_acquire_owned() else {
+                        break;
+                    };
+                    let Some(peer_id) = tracker.pick_candidate(&cfg) else {
+                        drop(permit);
+                        break;
+                    };
+                    if !session_manager.get_all_for_peer(&peer_id).is_empty() {
+                        tracker.mark_satisfied_by_existing_session(&peer_id);
+                        drop(permit);
+                        continue;
+                    }
+                    tracker.mark_dialing(&peer_id);
+                    let router2 = router.clone();
+                    let session_manager2 = session_manager.clone();
+                    let catalog2 = catalog.clone();
+                    let dial_book2 = dial_book.clone();
+                    let listens2 = listens.clone();
+                    let advertise2 = advertise.clone();
+                    let dialer2 = dialer.clone();
+                    let nat2 = nat.clone();
+                    let tracker2 = tracker.clone();
+                    let cfg2 = cfg.clone();
+                    let our_id = our_peer_id.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        run_one_upgrade_attempt(
+                            peer_id,
+                            our_id.as_str(),
+                            &cfg2,
+                            &tracker2,
+                            &router2,
+                            &session_manager2,
+                            &catalog2,
+                            &dial_book2,
+                            &listens2,
+                            &advertise2,
+                            dialer2.as_ref(),
+                            nat2.as_deref(),
+                        )
+                        .await;
+                    });
                 }
             }
         }
-    });
+    }
 }
 
 async fn run_one_upgrade_attempt(
@@ -163,10 +162,7 @@ async fn run_one_upgrade_attempt(
             tracker.mark_satisfied_by_existing_session(&peer_id);
             return;
         }
-        tracker.mark_failure(
-            &peer_id,
-            Duration::from_secs(cfg.cooldown_secs.max(1)),
-        );
+        tracker.mark_failure(&peer_id, Duration::from_secs(cfg.cooldown_secs.max(1)));
         return;
     }
 
@@ -235,10 +231,7 @@ async fn run_one_upgrade_attempt(
         tracker.mark_satisfied_by_existing_session(&peer_id);
         return;
     }
-    tracker.mark_failure(
-        &peer_id,
-        Duration::from_secs(cfg.cooldown_secs.max(1)),
-    );
+    tracker.mark_failure(&peer_id, Duration::from_secs(cfg.cooldown_secs.max(1)));
 }
 
 pub fn nat_trigger_from_parts(
@@ -261,18 +254,18 @@ pub fn nat_trigger_from_parts(
 mod service_tests {
     use super::run_one_upgrade_attempt;
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use anyhow::Result;
     use async_trait::async_trait;
 
     use crate::packet::Packet;
     use crate::packet_processor::PacketProcessor;
-    use crate::sessions::session::{IncomingPacket, LinkKind};
-    use crate::sessions::Session;
     use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
+    use crate::sessions::Session;
     use crate::sessions::manager::SessionManager;
+    use crate::sessions::session::{IncomingPacket, LinkKind};
     use crate::types::SessionId;
 
     struct NoopProc;
@@ -313,13 +306,7 @@ mod service_tests {
     fn test_router() -> (Arc<Router>, Arc<SessionManager>) {
         let store = Arc::new(PeerScoreStore::new());
         let mgr = Arc::new(SessionManager::new(store, PeerScoreWeights::default()));
-        let (router, _rx) = Router::new(
-            mgr.clone(),
-            Arc::new(NoopProc),
-            None,
-            "self-peer",
-            None,
-        );
+        let (router, _rx) = Router::new(mgr.clone(), Arc::new(NoopProc), None, "self-peer", None);
         (Arc::new(router), mgr)
     }
 

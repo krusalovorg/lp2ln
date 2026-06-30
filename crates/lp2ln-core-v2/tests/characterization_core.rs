@@ -89,9 +89,7 @@ impl PacketProcessor for NoopProcessor {
     async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {}
 }
 
-fn test_router_with_sink(
-    sink: Option<DirectUpgradeRouterSink>,
-) -> (Router, Arc<SessionManager>) {
+fn test_router_with_sink(sink: Option<DirectUpgradeRouterSink>) -> (Router, Arc<SessionManager>) {
     let store = Arc::new(PeerScoreStore::new());
     let manager = Arc::new(SessionManager::new(store, PeerScoreWeights::default()));
     let (router, _rx) = Router::new(
@@ -330,11 +328,7 @@ async fn router_fallback_emits_direct_upgrade_event() {
     );
 
     router
-        .send_to_peer(
-            PeerId::from("missing-target"),
-            packet(b"x".to_vec()),
-            None,
-        )
+        .send_to_peer(PeerId::from("missing-target"), packet(b"x".to_vec()), None)
         .await
         .expect("fallback send");
 
@@ -365,19 +359,11 @@ async fn router_fallback_continues_when_direct_upgrade_queue_full() {
     }
 
     router
-        .send_to_peer(
-            PeerId::from("missing-target"),
-            packet(b"a".to_vec()),
-            None,
-        )
+        .send_to_peer(PeerId::from("missing-target"), packet(b"a".to_vec()), None)
         .await
         .expect("first fallback send");
     router
-        .send_to_peer(
-            PeerId::from("missing-target"),
-            packet(b"b".to_vec()),
-            None,
-        )
+        .send_to_peer(PeerId::from("missing-target"), packet(b"b".to_vec()), None)
         .await
         .expect("second fallback when upgrade queue saturated");
 

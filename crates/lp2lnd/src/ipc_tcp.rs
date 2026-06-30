@@ -53,10 +53,7 @@ fn ipc_recv_summary(frame_len: usize, value: &Value) -> String {
 }
 
 fn ipc_reply_summary(reply: &Value) -> String {
-    let ev = reply
-        .get("event")
-        .and_then(|e| e.as_str())
-        .unwrap_or("?");
+    let ev = reply.get("event").and_then(|e| e.as_str()).unwrap_or("?");
     let mut s = format!("event={}", ev);
     if let Some(cmd) = reply.get("cmd").and_then(|c| c.as_str()) {
         s.push_str(&format!(" cmd={}", cmd));
@@ -105,11 +102,7 @@ pub fn spawn_ipc_tcp_server(
         let bind_addr: SocketAddr = match cfg.bind_addr.parse() {
             Ok(v) => v,
             Err(e) => {
-                lp2ln_core_v2::error!(
-                    "[IpcTcp] invalid bind_addr '{}': {}",
-                    cfg.bind_addr,
-                    e
-                );
+                lp2ln_core_v2::error!("[IpcTcp] invalid bind_addr '{}': {}", cfg.bind_addr, e);
                 return;
             }
         };
@@ -137,8 +130,8 @@ pub fn spawn_ipc_tcp_server(
                     let max_frame = cfg.max_frame_bytes;
                     let push = cfg.push_incoming_packets;
                     tokio::spawn(async move {
-                        if let Err(e) = handle_tcp_client(stream, peer, node, db, max_frame, push)
-                            .await
+                        if let Err(e) =
+                            handle_tcp_client(stream, peer, node, db, max_frame, push).await
                         {
                             lp2ln_core_v2::warn!("[IpcTcp] client {} disconnected: {}", peer, e);
                         }
@@ -195,10 +188,7 @@ async fn handle_tcp_client(
     let mut push_task = None;
     if push_incoming_packets {
         if let Some(router) = node.router() {
-            lp2ln_core_v2::info!(
-                "[IpcTcp] {} subscribed to incoming_packet push",
-                peer
-            );
+            lp2ln_core_v2::info!("[IpcTcp] {} subscribed to incoming_packet push", peer);
             let mut sub = router.subscribe();
             let out_push = out_tx.clone();
             let peer_push = peer;
@@ -260,18 +250,15 @@ async fn handle_tcp_client(
         let body = match read_frame(&mut read_half, max_frame_bytes).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                lp2ln_core_v2::info!(
-                    "[IpcTcp] {} client closed TCP write side (clean EOF)",
-                    peer
-                );
+                lp2ln_core_v2::info!("[IpcTcp] {} client closed TCP write side (clean EOF)", peer);
                 break;
             }
             Err(e) => return Err(e.into()),
         };
 
         let text = std::str::from_utf8(&body).map_err(|e| anyhow::anyhow!("utf8: {}", e))?;
-        let value: Value = serde_json::from_str(text)
-            .map_err(|e| anyhow::anyhow!("invalid json frame: {}", e))?;
+        let value: Value =
+            serde_json::from_str(text).map_err(|e| anyhow::anyhow!("invalid json frame: {}", e))?;
 
         lp2ln_core_v2::info!(
             "[IpcTcp] {} recv {}",
@@ -285,16 +272,9 @@ async fn handle_tcp_client(
                 "ts_ms": now_ms(),
             });
             attach_client_request_id(&mut reply, &value);
-            lp2ln_core_v2::info!(
-                "[IpcTcp] {} reply {}",
-                peer,
-                ipc_reply_summary(&reply)
-            );
+            lp2ln_core_v2::info!("[IpcTcp] {} reply {}", peer, ipc_reply_summary(&reply));
             if out_tx.send(reply.to_string().into_bytes()).await.is_err() {
-                lp2ln_core_v2::warn!(
-                    "[IpcTcp] {} out channel closed while sending pong",
-                    peer
-                );
+                lp2ln_core_v2::warn!("[IpcTcp] {} out channel closed while sending pong", peer);
                 break;
             }
             continue;
@@ -317,11 +297,7 @@ async fn handle_tcp_client(
             }
         };
 
-        lp2ln_core_v2::info!(
-            "[IpcTcp] {} reply {}",
-            peer,
-            ipc_reply_summary(&reply)
-        );
+        lp2ln_core_v2::info!("[IpcTcp] {} reply {}", peer, ipc_reply_summary(&reply));
 
         let bytes = reply.to_string().into_bytes();
         if bytes.len() > max_frame_bytes as usize {
@@ -347,10 +323,7 @@ async fn handle_tcp_client(
             continue;
         }
         if out_tx.send(bytes).await.is_err() {
-            lp2ln_core_v2::warn!(
-                "[IpcTcp] {} out channel closed while sending reply",
-                peer
-            );
+            lp2ln_core_v2::warn!("[IpcTcp] {} out channel closed while sending reply", peer);
             break;
         }
     }
@@ -415,7 +388,10 @@ async fn read_frame(
     if n > max_frame_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("frame length {} exceeds max_frame_bytes {}", n, max_frame_bytes),
+            format!(
+                "frame length {} exceeds max_frame_bytes {}",
+                n, max_frame_bytes
+            ),
         ));
     }
     let mut body = vec![0u8; n as usize];
@@ -423,10 +399,7 @@ async fn read_frame(
     Ok(body)
 }
 
-async fn write_frame(
-    w: &mut tokio::net::tcp::OwnedWriteHalf,
-    body: &[u8],
-) -> std::io::Result<()> {
+async fn write_frame(w: &mut tokio::net::tcp::OwnedWriteHalf, body: &[u8]) -> std::io::Result<()> {
     let n: u32 = body
         .len()
         .try_into()

@@ -67,3 +67,5 @@ deploy.sh
 copy-to-server.bat
 temp_configs/
 temp_db/
+.cursor/
+crates/lp2lnd/options-*.json

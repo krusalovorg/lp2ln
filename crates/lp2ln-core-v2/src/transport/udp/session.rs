@@ -19,6 +19,9 @@ pub struct UdpSession {
 
     peer_addr: SocketAddr,
     obfuscator: Arc<Obfuscator>,
+    // Cancelled by close(); reader and writer loops select on it so both
+    // tasks terminate even while blocked on socket recv / channel recv.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -46,7 +49,7 @@ impl Session for UdpSession {
     }
 
     async fn close(&self) -> Result<()> {
-        drop(self.tx.clone());
+        self.shutdown.cancel();
         Ok(())
     }
 
@@ -56,10 +59,15 @@ impl Session for UdpSession {
     ) {
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             loop {
-                match self.read_packet().await {
+                let read_result = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = self.read_packet() => result,
+                };
+                match read_result {
                     Ok(pkt) => {
                         match incoming_packets_tx
                             .send(IncomingPacket {
@@ -100,6 +108,7 @@ impl UdpSession {
         let id = Uuid::new_v4().to_string();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+        let shutdown = tokio_util::sync::CancellationToken::new();
 
         let session = Arc::new(Self {
             id,
@@ -109,12 +118,20 @@ impl UdpSession {
             socket: socket.clone(),
             peer_addr,
             obfuscator: obfuscator.clone(),
+            shutdown: shutdown.clone(),
         });
 
         let socket_clone = socket.clone();
         let obfuscator_clone = obfuscator.clone();
         tokio::spawn(async move {
-            while let Some((data, addr)) = rx.recv().await {
+            loop {
+                let (data, addr) = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    maybe = rx.recv() => match maybe {
+                        Some(item) => item,
+                        None => break,
+                    },
+                };
                 let encoded = match obfuscator_clone.encode_datagram(&data) {
                     Ok(v) => v,
                     Err(e) => {

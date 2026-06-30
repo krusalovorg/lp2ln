@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
@@ -6,11 +7,11 @@ use async_trait::async_trait;
 use k256::ecdsa::SigningKey;
 use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::{
-    crypto::secure_channel::{
-        derive_shared_key, encode_secure_envelope, is_secure_envelope,
-    },
+    crypto::secure_channel::{derive_shared_key, encode_secure_envelope, is_secure_envelope},
     crypto::signature::sign_packet,
     node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
     packet::Packet,
@@ -33,13 +34,15 @@ pub struct Router {
     packet_processor: Arc<dyn PacketProcessor>,
     signing_key: Option<Arc<SigningKey>>,
     chunk_assembler: Arc<ChunkAssembler>,
-    incoming_tx: mpsc::Sender<IncomingPacket>,
+    incoming_tx: Arc<Mutex<Option<mpsc::Sender<IncomingPacket>>>>,
     incoming_broadcast_tx: broadcast::Sender<IncomingPacket>,
     next_request_id: AtomicU64,
     next_secure_seq: AtomicU64,
     our_peer_id: String,
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
+    packet_tasks: TaskTracker,
+    packet_cancel: CancellationToken,
 }
 
 impl Router {
@@ -54,6 +57,7 @@ impl Router {
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
         let (incoming_broadcast_tx, _rx) =
             broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
+        let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
         (
@@ -69,6 +73,8 @@ impl Router {
                 our_peer_id,
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
+                packet_tasks: TaskTracker::new(),
+                packet_cancel: CancellationToken::new(),
             },
             incoming_rx,
         )
@@ -133,7 +139,50 @@ impl Router {
     }
 
     pub fn incoming_sender(&self) -> mpsc::Sender<IncomingPacket> {
-        self.incoming_tx.clone()
+        if let Ok(guard) = self.incoming_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                return tx.clone();
+            }
+        }
+        // Ingress is closed: hand out a sender whose receiver is already
+        // dropped so callers get a send error instead of a panic.
+        let (tx, _rx) = mpsc::channel(1);
+        tx
+    }
+
+    pub fn close_incoming(&self) {
+        if let Ok(mut guard) = self.incoming_tx.lock() {
+            guard.take();
+        }
+    }
+
+    pub fn is_ingress_closed(&self) -> bool {
+        self.incoming_tx
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true)
+    }
+
+    /// Bounded drain of in-flight per-packet processing tasks.
+    ///
+    /// Lets tasks finish within `drain_timeout`; tasks still running after
+    /// that are cancelled via the packet cancellation token and awaited
+    /// briefly so they do not outlive shutdown.
+    pub async fn shutdown_packet_tasks(&self, drain_timeout: std::time::Duration) {
+        self.packet_tasks.close();
+        if tokio::time::timeout(drain_timeout, self.packet_tasks.wait())
+            .await
+            .is_err()
+        {
+            crate::warn!(
+                "[Router] packet tasks did not drain within {:?}, cancelling",
+                drain_timeout
+            );
+            self.packet_cancel.cancel();
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(1), self.packet_tasks.wait())
+                    .await;
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<IncomingPacket> {
@@ -316,12 +365,20 @@ impl Router {
     pub async fn run(
         self: Arc<Self>,
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
+        cancel: CancellationToken,
     ) -> Result<()> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(
             ROUTER_PROCESS_SEMAPHORE_PERMITS,
         ));
 
-        while let Some(incoming) = incoming_rx.recv().await {
+        loop {
+            let incoming = tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                maybe = incoming_rx.recv() => match maybe {
+                    Some(incoming) => incoming,
+                    None => break,
+                },
+            };
             let session_id = SessionId::from(incoming.session_id.clone());
             let bytes_estimate = incoming.packet.wire_size_estimate();
             MetricsProvider::record_packets_received(
@@ -359,13 +416,23 @@ impl Router {
             let processor = self.packet_processor.clone();
             let router = self.clone();
             let semaphore = semaphore.clone();
-            tokio::spawn(async move {
-                let Ok(permit) = semaphore.acquire_owned().await else {
-                    return;
-                };
-                let _permit = permit;
-                processor.process(incoming, router).await;
+            let packet_cancel = self.packet_cancel.clone();
+            self.packet_tasks.spawn(async move {
+                tokio::select! {
+                    _ = packet_cancel.cancelled() => {}
+                    _ = async move {
+                        let Ok(permit) = semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        let _permit = permit;
+                        processor.process(incoming, router).await;
+                    } => {}
+                }
             });
+        }
+        if self.is_ingress_closed() {
+            // Intentional shutdown: ingress was closed by NodeRuntime::stop().
+            return Ok(());
         }
         Err(anyhow::anyhow!(
             "router incoming channel closed; router loop stopped"

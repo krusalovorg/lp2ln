@@ -18,14 +18,15 @@ use crate::logger;
 use crate::nat::NatTraversalState;
 use crate::node::addressing::{detect_lan_advertise_ip, ordered_bootstrap_targets};
 use crate::node::direct_upgrade::{
-    nat_trigger_from_parts, spawn_direct_upgrade_loop, CoreDirectDialer, DirectUpgradeContext,
-    DirectUpgradeRouterSink, TrafficDemandTracker,
+    CoreDirectDialer, DirectUpgradeContext, DirectUpgradeRouterSink, TrafficDemandTracker,
+    nat_trigger_from_parts, run_direct_upgrade_loop,
 };
 use crate::node::flow_trace::FlowTraceService;
 use crate::node::incoming_sessions::run_incoming_session_handler;
 use crate::node::options::{NodeOptions, NodeRole};
+use crate::node::supervisor::NodeSupervisor;
 use crate::node::topology_maintenance::{
-    dial_bootstrap_address, run_topology_maintenance_loop, BootstrapDialDedupe,
+    BootstrapDialDedupe, dial_bootstrap_address, run_topology_maintenance_loop,
 };
 use crate::packet::Packet;
 use crate::packet_processor::{DefaultPacketProcessor, PacketProcessor};
@@ -40,6 +41,33 @@ use crate::sessions::{LinkKind, Session, SessionMetrics};
 use crate::topology::PeerCatalog;
 use crate::transport::{Transport, TransportContext};
 use crate::types::{PeerId, SessionId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeLifecycleState {
+    Created,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeLifecycleError {
+    AlreadyStarted,
+    RestartNotSupported,
+}
+
+impl std::fmt::Display for NodeLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyStarted => write!(f, "node is already running"),
+            Self::RestartNotSupported => {
+                write!(f, "node restart is not supported; build a new NodeRuntime")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeLifecycleError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -117,7 +145,13 @@ pub struct NodeRuntime {
     bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
     descriptor_version: Arc<AtomicU64>,
     router: Option<Arc<Router>>,
-    incoming_sessions_tx: Option<mpsc::Sender<Arc<dyn Session>>>,
+    incoming_sessions_tx: Mutex<Option<mpsc::Sender<Arc<dyn Session>>>>,
+    lifecycle: Mutex<NodeLifecycleState>,
+    supervisor: Mutex<Option<NodeSupervisor>>,
+    // Child token of the supervisor root token; cancelled first during
+    // shutdown to stop producer services (accept/dial/maintenance) before
+    // sessions are drained and the router ingress is closed.
+    producer_cancel: Mutex<Option<tokio_util::sync::CancellationToken>>,
     health: Arc<RuntimeHealthState>,
 }
 
@@ -193,8 +227,35 @@ impl NodeRuntime {
             bootstrap_dial_ok_ms: Arc::new(Mutex::new(HashMap::new())),
             descriptor_version: Arc::new(AtomicU64::new(1)),
             router: None,
-            incoming_sessions_tx: None,
+            incoming_sessions_tx: Mutex::new(None),
+            lifecycle: Mutex::new(NodeLifecycleState::Created),
+            supervisor: Mutex::new(None),
+            producer_cancel: Mutex::new(None),
             health: Arc::new(RuntimeHealthState::default()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn lifecycle_state(&self) -> NodeLifecycleState {
+        self.lifecycle
+            .lock()
+            .map(|state| *state)
+            .unwrap_or(NodeLifecycleState::Stopped)
+    }
+
+    #[doc(hidden)]
+    pub fn lifecycle_active_tasks(&self) -> usize {
+        self.supervisor
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(NodeSupervisor::active_task_count))
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn test_close_router_ingress(&self) {
+        if let Some(router) = self.router.as_ref() {
+            router.close_incoming();
         }
     }
 
@@ -603,6 +664,42 @@ impl NodeRuntime {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node lifecycle lock poisoned"))?;
+            match *lifecycle {
+                NodeLifecycleState::Created => {}
+                NodeLifecycleState::Running | NodeLifecycleState::Stopping => {
+                    return Err(NodeLifecycleError::AlreadyStarted.into());
+                }
+                NodeLifecycleState::Stopped => {
+                    return Err(NodeLifecycleError::RestartNotSupported.into());
+                }
+            }
+            *lifecycle = NodeLifecycleState::Running;
+        }
+
+        if self.transports.is_empty() {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                *lifecycle = NodeLifecycleState::Created;
+            }
+            crate::error!("[NodeRuntime] No transports registered");
+            return Err(anyhow::anyhow!("No transports registered"));
+        }
+
+        let supervisor = NodeSupervisor::new();
+        let cancel = supervisor.cancellation();
+        // Producer services (accept/dial/maintenance) get a child token so
+        // stop() can halt them first, before sessions are drained and the
+        // router ingress is closed. Cancelling the root token still cancels
+        // producers as a fallback.
+        let producer_cancel = cancel.child_token();
+        if let Ok(mut guard) = self.producer_cancel.lock() {
+            *guard = Some(producer_cancel.clone());
+        }
+
         let (incoming_sessions_tx, incoming_sessions_rx) = mpsc::channel(ROUTER_INCOMING_QUEUE_CAP);
         let signing_key = Some(Arc::new(self.keypair.signing_key().clone()));
         let du_cfg = self._options.direct_upgrade.clone();
@@ -617,24 +714,34 @@ impl NodeRuntime {
             self.packet_processor.clone(),
             signing_key,
             self.keypair.peer_id(),
-            upgrade_sink
-                .as_ref()
-                .map(|(sink, _rx, _cfg)| sink.clone()),
+            upgrade_sink.as_ref().map(|(sink, _rx, _cfg)| sink.clone()),
         );
         let router = Arc::new(router_raw);
         {
             let router_loop = router.clone();
             let health = self.health.clone();
-            tokio::spawn(async move {
+            let cancel_router = cancel.clone();
+            supervisor.spawn("router", async move {
                 let mut backoff = Duration::from_millis(500);
                 loop {
-                    let result =
-                        AssertUnwindSafe(router_loop.clone().run(&mut incoming_packets_rx))
-                            .catch_unwind()
-                            .await;
+                    if cancel_router.is_cancelled() {
+                        break;
+                    }
+                    let result = AssertUnwindSafe(
+                        router_loop
+                            .clone()
+                            .run(&mut incoming_packets_rx, cancel_router.clone()),
+                    )
+                    .catch_unwind()
+                    .await;
                     match result {
                         Ok(Ok(_)) => {
                             health.mark_healthy();
+                            if router_loop.is_ingress_closed() {
+                                // Clean exit during shutdown: ingress is closed,
+                                // restarting the loop would spin on an empty queue.
+                                break;
+                            }
                             backoff = Duration::from_millis(500);
                         }
                         Ok(Err(err)) => {
@@ -646,7 +753,10 @@ impl NodeRuntime {
                             health.record_error("router", "panic in router loop");
                         }
                     }
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = cancel_router.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                     backoff = (backoff * 2).min(Duration::from_secs(15));
                 }
             });
@@ -685,41 +795,59 @@ impl NodeRuntime {
                 None
             };
             let tracker = Arc::new(TrafficDemandTracker::new(du_cfg.max_tracker_peers));
-            spawn_direct_upgrade_loop(
-                rx,
-                DirectUpgradeContext {
-                    config: du_cfg,
-                    our_peer_id: self.keypair.peer_id().to_string(),
-                    router: router.clone(),
-                    session_manager: self.session_manager.clone(),
-                    peer_catalog: self.peer_catalog.clone(),
-                    dial_book: self.dial_book.clone(),
-                    listens,
-                    advertise,
-                    dialer,
-                    nat,
-                    tracker,
-                },
-            );
+            let cancel_du = producer_cancel.clone();
+            let router_du = router.clone();
+            let session_manager_du = self.session_manager.clone();
+            let peer_catalog_du = self.peer_catalog.clone();
+            let dial_book_du = self.dial_book.clone();
+            let our_peer_id_du = self.keypair.peer_id().to_string();
+            supervisor.spawn("direct_upgrade", async move {
+                run_direct_upgrade_loop(
+                    rx,
+                    DirectUpgradeContext {
+                        config: du_cfg,
+                        our_peer_id: our_peer_id_du,
+                        router: router_du,
+                        session_manager: session_manager_du,
+                        peer_catalog: peer_catalog_du,
+                        dial_book: dial_book_du,
+                        listens,
+                        advertise,
+                        dialer,
+                        nat,
+                        tracker,
+                    },
+                    cancel_du,
+                )
+                .await;
+            });
         }
-        FlowTraceService::spawn(
-            &router,
-            self._options.node_role,
-            self.keypair.peer_id().to_string(),
-            &self._options.flow_trace,
-        );
+        if FlowTraceService::is_enabled(&self._options.flow_trace) {
+            let cancel_trace = cancel.clone();
+            let node_role = self._options.node_role;
+            let our_peer_id_trace = self.keypair.peer_id().to_string();
+            let flow_trace = self._options.flow_trace.clone();
+            let router_trace = router.clone();
+            supervisor.spawn("flow_trace", async move {
+                FlowTraceService::run(
+                    &router_trace,
+                    node_role,
+                    our_peer_id_trace,
+                    &flow_trace,
+                    cancel_trace,
+                )
+                .await;
+            });
+        }
 
-        self.incoming_sessions_tx = Some(incoming_sessions_tx.clone());
+        if let Ok(mut guard) = self.incoming_sessions_tx.lock() {
+            *guard = Some(incoming_sessions_tx.clone());
+        }
         let ctx = TransportContext {
             incoming_sessions_tx: incoming_sessions_tx.clone(),
             incoming_packets_tx: router.incoming_sender(),
             listen_addr: None,
         };
-
-        if self.transports.is_empty() {
-            crate::error!("[NodeRuntime] No transports registered");
-            return Err(anyhow::anyhow!("No transports registered"));
-        }
 
         for transport in &self.transports {
             if !transport.is_listener() {
@@ -734,11 +862,24 @@ impl NodeRuntime {
             let transport_clone = transport.clone();
             let transport_name = transport.name();
             let health = self.health.clone();
+            let cancel_transport = producer_cancel.clone();
+            let service_name: &'static str = match transport_name {
+                "tcp" => "transport:tcp",
+                "udp" => "transport:udp",
+                _ => "transport:other",
+            };
 
-            tokio::spawn(async move {
+            supervisor.spawn(service_name, async move {
                 let mut backoff = Duration::from_millis(500);
                 loop {
-                    match transport_clone.start(ctx_clone.clone()).await {
+                    if cancel_transport.is_cancelled() {
+                        break;
+                    }
+                    let start_result = tokio::select! {
+                        _ = cancel_transport.cancelled() => break,
+                        result = transport_clone.start(ctx_clone.clone()) => result,
+                    };
+                    match start_result {
                         Ok(bound) => {
                             let started_addr = bound.or(listen_addr);
                             if let Some(addr) = started_addr {
@@ -773,7 +914,10 @@ impl NodeRuntime {
                                     backoff
                                 );
                             }
-                            tokio::time::sleep(backoff).await;
+                            tokio::select! {
+                                _ = cancel_transport.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
                             backoff = (backoff * 2).min(Duration::from_secs(15));
                         }
                     }
@@ -793,26 +937,33 @@ impl NodeRuntime {
         let incoming_topology_tuning = self._options.topology_tuning.clone();
         let incoming_discovery_random_fraction = self._options.peer_discovery_random_fraction;
         let health_incoming = self.health.clone();
-        tokio::spawn(async move {
+        let cancel_incoming = producer_cancel.clone();
+        supervisor.spawn("incoming", async move {
             let mut incoming_sessions_rx = incoming_sessions_rx;
             let mut backoff = Duration::from_millis(500);
             loop {
-                let result = AssertUnwindSafe(run_incoming_session_handler(
-                    &mut incoming_sessions_rx,
-                    session_manager.clone(),
-                    router_for_incoming.clone(),
-                    our_peer_id_for_incoming.clone(),
-                    policy_live_incoming.clone(),
-                    incoming_catalog.clone(),
-                    incoming_peer_store.clone(),
-                    incoming_weights.clone(),
-                    incoming_node_role,
-                    incoming_topology_tuning.clone(),
-                    incoming_discovery_random_fraction,
-                    incoming_packets_tx_for_sessions.clone(),
-                ))
-                .catch_unwind()
-                .await;
+                if cancel_incoming.is_cancelled() {
+                    break;
+                }
+                let result = tokio::select! {
+                    _ = cancel_incoming.cancelled() => break,
+                    result = AssertUnwindSafe(run_incoming_session_handler(
+                        cancel_incoming.clone(),
+                        &mut incoming_sessions_rx,
+                        session_manager.clone(),
+                        router_for_incoming.clone(),
+                        our_peer_id_for_incoming.clone(),
+                        policy_live_incoming.clone(),
+                        incoming_catalog.clone(),
+                        incoming_peer_store.clone(),
+                        incoming_weights.clone(),
+                        incoming_node_role,
+                        incoming_topology_tuning.clone(),
+                        incoming_discovery_random_fraction,
+                        incoming_packets_tx_for_sessions.clone(),
+                    ))
+                    .catch_unwind() => result,
+                };
                 match result {
                     Ok(Ok(_)) => {
                         backoff = Duration::from_millis(500);
@@ -831,7 +982,10 @@ impl NodeRuntime {
                         health_incoming.record_error("incoming_loop", "panic in incoming loop");
                     }
                 }
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = cancel_incoming.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(15));
             }
         });
@@ -856,24 +1010,30 @@ impl NodeRuntime {
         let handshake_payload = handshake::encode_hello(obf_protocols);
         let bootstrap_dedupe_startup = self.bootstrap_dial_dedupe.clone();
         let bootstrap_ok_startup = self.bootstrap_dial_ok_ms.clone();
-        tokio::spawn(async move {
+        let cancel_bootstrap = producer_cancel.clone();
+        supervisor.spawn("bootstrap", async move {
             for target in bootstrap_targets {
+                if cancel_bootstrap.is_cancelled() {
+                    break;
+                }
                 let dedupe_ctx = BootstrapDialDedupe {
                     active_peers: 0,
                     set: bootstrap_dedupe_startup.clone(),
                 };
                 let ts = crate::topology::now_ms();
-                dial_bootstrap_address(
-                    &transports,
-                    &router_outgoing,
-                    &incoming_packets_tx_outgoing,
-                    &our_peer_id,
-                    &target,
-                    &handshake_payload,
-                    Some(&dedupe_ctx),
-                    Some((&bootstrap_ok_startup, ts)),
-                )
-                .await;
+                tokio::select! {
+                    _ = cancel_bootstrap.cancelled() => break,
+                    _ = dial_bootstrap_address(
+                        &transports,
+                        &router_outgoing,
+                        &incoming_packets_tx_outgoing,
+                        &our_peer_id,
+                        &target,
+                        &handshake_payload,
+                        Some(&dedupe_ctx),
+                        Some((&bootstrap_ok_startup, ts)),
+                    ) => {}
+                }
             }
         });
 
@@ -922,37 +1082,44 @@ impl NodeRuntime {
         let bootstrap_dial_ok_maint = self.bootstrap_dial_ok_ms.clone();
 
         let health_maint = self.health.clone();
-        tokio::spawn(async move {
+        let cancel_topology = producer_cancel.clone();
+        supervisor.spawn("topology", async move {
             let mut backoff = Duration::from_millis(500);
             loop {
-                let result = AssertUnwindSafe(run_topology_maintenance_loop(
-                    policy_live_maint.clone(),
-                    node_role,
-                    weights.clone(),
-                    sm.clone(),
-                    dial_book.clone(),
-                    peer_store.clone(),
-                    catalog.clone(),
-                    db.clone(),
-                    listens.clone(),
-                    advertise_addrs.clone(),
-                    advertise_fallback_ip,
-                    transports_maint.clone(),
-                    router_maint.clone(),
-                    incoming_maint.clone(),
-                    our_peer_maint.clone(),
-                    descriptor_ver.clone(),
-                    signing_key.clone(),
-                    log_peer_scores,
-                    topology_tuning.clone(),
-                    maintenance_handshake_payload.clone(),
-                    bootstrap_targets_maint.clone(),
-                    nat_state_maint.clone(),
-                    bootstrap_dial_dedupe_maint.clone(),
-                    bootstrap_dial_ok_maint.clone(),
-                ))
-                .catch_unwind()
-                .await;
+                if cancel_topology.is_cancelled() {
+                    break;
+                }
+                let result = tokio::select! {
+                    _ = cancel_topology.cancelled() => break,
+                    result = AssertUnwindSafe(run_topology_maintenance_loop(
+                        cancel_topology.clone(),
+                        policy_live_maint.clone(),
+                        node_role,
+                        weights.clone(),
+                        sm.clone(),
+                        dial_book.clone(),
+                        peer_store.clone(),
+                        catalog.clone(),
+                        db.clone(),
+                        listens.clone(),
+                        advertise_addrs.clone(),
+                        advertise_fallback_ip,
+                        transports_maint.clone(),
+                        router_maint.clone(),
+                        incoming_maint.clone(),
+                        our_peer_maint.clone(),
+                        descriptor_ver.clone(),
+                        signing_key.clone(),
+                        log_peer_scores,
+                        topology_tuning.clone(),
+                        maintenance_handshake_payload.clone(),
+                        bootstrap_targets_maint.clone(),
+                        nat_state_maint.clone(),
+                        bootstrap_dial_dedupe_maint.clone(),
+                        bootstrap_dial_ok_maint.clone(),
+                    ))
+                    .catch_unwind() => result,
+                };
                 match result {
                     Ok(Ok(_)) => {
                         backoff = Duration::from_millis(500);
@@ -971,19 +1138,95 @@ impl NodeRuntime {
                         health_maint.record_error("topology_loop", "panic in topology loop");
                     }
                 }
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = cancel_topology.cancelled() => break,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(15));
             }
         });
 
+        if let Ok(mut guard) = self.supervisor.lock() {
+            *guard = Some(supervisor);
+        }
+
         Ok(())
     }
 
+    /// Phased shutdown:
+    /// 1. lifecycle guard (idempotent / concurrent-safe);
+    /// 2. cancel producer services (bootstrap, topology dial, direct
+    ///    upgrade, transport restart loops, incoming handler) and drop our
+    ///    clone of the incoming-sessions sender;
+    /// 3. stop transports — sends the shutdown signal and joins the accept
+    ///    task, so no new connections appear past this point;
+    /// 4. close every registered session by registry ID (covers unbound
+    ///    handshake/redirect sessions without a PeerId);
+    /// 5. close router ingress — the router loop drains buffered packets
+    ///    and exits cleanly;
+    /// 6. bounded drain of in-flight per-packet processing tasks;
+    /// 7. cancel remaining services (router loop, flow trace) and join all
+    ///    supervised handles; hung tasks are aborted after the timeout and
+    ///    their handles awaited.
     pub async fn stop(&self) -> Result<()> {
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("node lifecycle lock poisoned"))?;
+            match *lifecycle {
+                NodeLifecycleState::Created | NodeLifecycleState::Stopped => return Ok(()),
+                NodeLifecycleState::Stopping => return Ok(()),
+                NodeLifecycleState::Running => *lifecycle = NodeLifecycleState::Stopping,
+            }
+        }
+
+        // Phase 2: stop producers. The general (root) cancellation is NOT
+        // triggered here: the router must stay alive to drain its queue.
+        let producer_cancel = self
+            .producer_cancel
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(token) = producer_cancel {
+            token.cancel();
+        }
+        if let Ok(mut guard) = self.incoming_sessions_tx.lock() {
+            guard.take();
+        }
+
+        // Phase 3: no new incoming connections.
         for transport in &self.transports {
             transport.stop().await?;
             crate::info!("[NodeRuntime] Stopped transport: {}", transport.name());
         }
+
+        // Phase 4: close active sessions by full registry, not by peer map,
+        // so sessions without a bound PeerId are closed too.
+        for session_id in self.session_manager.all_session_ids() {
+            let _ = self.session_manager.close_session(&session_id).await;
+        }
+
+        // Phases 5–6: close ingress, then bounded drain of packet tasks.
+        if let Some(router) = self.router.as_ref() {
+            router.close_incoming();
+            router.shutdown_packet_tasks(Duration::from_secs(3)).await;
+        }
+
+        // Phase 7: cancel remaining services and join everything.
+        let supervisor = self
+            .supervisor
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(supervisor) = supervisor {
+            supervisor.shutdown().await;
+        }
+
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
+            *lifecycle = NodeLifecycleState::Stopped;
+        }
+
         Ok(())
     }
 }

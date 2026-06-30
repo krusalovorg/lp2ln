@@ -57,7 +57,8 @@ impl TopologyDecisionAdapter for BasicHeuristicAdapter {
                 plan.request_peer_exchange = true;
                 return plan;
             }
-            let start = (observation.node_id ^ observation.now_ms) as usize % candidates_ordered.len();
+            let start =
+                (observation.node_id ^ observation.now_ms) as usize % candidates_ordered.len();
 
             for offset in 0..candidates_ordered.len() {
                 let idx = (start + offset) % candidates_ordered.len();

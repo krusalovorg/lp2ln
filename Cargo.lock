@@ -1610,6 +1610,7 @@ dependencies = [
  "sha2",
  "stun-client",
  "tokio",
+ "tokio-util",
  "toml",
  "uuid",
 ]
@@ -2775,6 +2776,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

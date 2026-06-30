@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
 
 mod bootstrap;
 mod descriptor;
@@ -68,15 +69,14 @@ fn effective_bootstrap_connected_count(
             }
         }
         if let Some(entry) = dial_book.get(p) {
-            let hinted = bootstrap_targets.iter().any(|t| t.peer_id_hint.as_ref() == Some(p));
+            let hinted = bootstrap_targets
+                .iter()
+                .any(|t| t.peer_id_hint.as_ref() == Some(p));
             let addr_match = bootstrap_targets.iter().any(|t| {
                 entry.value().iter().any(|(proto, addr)| {
                     *addr == t.addr
                         && (t.protocols.is_empty()
-                            || t
-                                .protocols
-                                .iter()
-                                .any(|tp| tp.eq_ignore_ascii_case(proto)))
+                            || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(proto)))
                 })
             });
             if hinted || addr_match {
@@ -94,11 +94,7 @@ fn effective_bootstrap_connected_count(
             .map(|ts| now.saturating_sub(ts) < BOOTSTRAP_DIAL_OK_TTL_MS)
             .unwrap_or(false)
     });
-    if any_recent_dial {
-        1
-    } else {
-        0
-    }
+    if any_recent_dial { 1 } else { 0 }
 }
 
 fn descriptor_announces_bootstrap_target(
@@ -215,8 +211,11 @@ struct TopologyMaintenanceCtx<'a> {
     dial_book: &'a Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
 }
 
-async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>) {
+async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &CancellationToken) {
     for nat_job in ctx.nat_state.take_punch_jobs() {
+        if cancel.is_cancelled() {
+            return;
+        }
         let mut success = false;
         let mut selected_addr: Option<String> = None;
         let mut failure_reason: Option<String> = None;
@@ -227,7 +226,10 @@ async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>) {
         {
             let start_after = nat_job.start_after_ms.unwrap_or(0);
             if start_after > 0 {
-                tokio::time::sleep(Duration::from_millis(start_after)).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(start_after)) => {}
+                }
             }
             for candidate in nat_job.remote_candidates.iter() {
                 if !candidate.protocol.eq_ignore_ascii_case("udp") {
@@ -364,6 +366,7 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_topology_maintenance_loop(
+    cancel: CancellationToken,
     policy_live_maint: Arc<RwLock<PeerConnectionPolicy>>,
     node_role: NodeRole,
     weights: PeerScoreWeights,
@@ -394,7 +397,10 @@ pub(crate) async fn run_topology_maintenance_loop(
         .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
         % MAINTENANCE_START_JITTER_MS)
         + 1;
-    tokio::time::sleep(Duration::from_millis(initial_jitter)).await;
+    tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        _ = tokio::time::sleep(Duration::from_millis(initial_jitter)) => {}
+    }
     let mut interval = tokio::time::interval(Duration::from_secs(MAINTENANCE_INTERVAL_SECS));
     let descriptor_ttl_secs = 120u64;
     let descriptor_interval = Duration::from_secs(30);
@@ -415,8 +421,14 @@ pub(crate) async fn run_topology_maintenance_loop(
     };
 
     loop {
-        interval.tick().await;
-        process_nat_jobs(&loop_ctx).await;
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = interval.tick() => {}
+        }
+        process_nat_jobs(&loop_ctx, &cancel).await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let policy = NodeOptions::effective_peer_connection_policy_for(
             policy_live_maint.read().unwrap().clone(),
             node_role,

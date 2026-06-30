@@ -3,7 +3,9 @@ use crate::sessions::session::LinkKind;
 use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::transport::tcp::session::TcpSession;
 use crate::transport::transport::TransportContext;
-use crate::transport::{Transport, bind_with_port_fallback};
+use crate::transport::{
+    ACCEPT_TASK_JOIN_TIMEOUT, Transport, bind_with_port_fallback, join_accept_task,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -14,6 +16,7 @@ use tokio::sync::Mutex;
 pub struct TcpTransport {
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    accept_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     is_listener: bool,
     obfuscator: Arc<Obfuscator>,
 }
@@ -23,6 +26,7 @@ impl TcpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::plain()),
         }
@@ -32,6 +36,7 @@ impl TcpTransport {
         Self {
             listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::plain()),
         }
@@ -41,6 +46,7 @@ impl TcpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             is_listener: false,
             obfuscator: Arc::new(Obfuscator::plain()),
         }
@@ -53,6 +59,7 @@ impl TcpTransport {
         Self {
             listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             is_listener: true,
             obfuscator: Arc::new(Obfuscator::from_config(config)),
         }
@@ -62,6 +69,7 @@ impl TcpTransport {
         Self {
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            accept_task: Arc::new(Mutex::new(None)),
             is_listener: false,
             obfuscator: Arc::new(Obfuscator::from_config(config)),
         }
@@ -117,7 +125,7 @@ impl Transport for TcpTransport {
             *shutdown_tx_guard = Some(shutdown_tx);
         }
 
-        tokio::spawn(async move {
+        let accept_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => {
@@ -168,6 +176,11 @@ impl Transport for TcpTransport {
             }
         });
 
+        {
+            let mut accept_task_guard = self.accept_task.lock().await;
+            *accept_task_guard = Some(accept_handle);
+        }
+
         Ok(Some(actual_addr))
     }
 
@@ -179,10 +192,16 @@ impl Transport for TcpTransport {
 
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
-            crate::info!("[TcpTransport] Stopped");
         } else {
             crate::info!("[TcpTransport] Already stopped or not started");
         }
+
+        let accept_handle = {
+            let mut accept_task_guard = self.accept_task.lock().await;
+            accept_task_guard.take()
+        };
+        join_accept_task("TcpTransport", accept_handle, ACCEPT_TASK_JOIN_TIMEOUT).await;
+        crate::info!("[TcpTransport] Stopped");
 
         Ok(())
     }

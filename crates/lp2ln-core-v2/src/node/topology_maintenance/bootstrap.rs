@@ -14,12 +14,12 @@ use crate::topology::{
 use crate::transport::Transport;
 use crate::types::PeerId;
 
-use super::{
-    dial_bootstrap_address, BootstrapDialDedupe, SHEPHERD_FINAL_PEERS_LIMIT, SHEPHERD_GRACE_MS,
-    SHEPHERD_MIN_MESH, SHEPHERD_SKIP_IF_CONNECTED_AT_MOST, SHEPHERD_SWEEP_INTERVAL_MS,
-};
 use super::packet_helpers::control_packet;
 use super::policy::AdaptiveTickPolicy;
+use super::{
+    BootstrapDialDedupe, SHEPHERD_FINAL_PEERS_LIMIT, SHEPHERD_GRACE_MS, SHEPHERD_MIN_MESH,
+    SHEPHERD_SKIP_IF_CONNECTED_AT_MOST, SHEPHERD_SWEEP_INTERVAL_MS, dial_bootstrap_address,
+};
 use crate::node::options::NodeRole;
 
 fn bootstrap_identity(target: &BootstrapNode) -> String {

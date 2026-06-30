@@ -34,6 +34,33 @@ where
     }
 }
 
+/// Joins a transport accept task after the shutdown signal was sent.
+/// Aborts (and then awaits) the task if it does not finish in time, so the
+/// accept loop never outlives `Transport::stop()`.
+pub(crate) async fn join_accept_task(
+    name: &str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) {
+    let Some(mut handle) = handle else {
+        return;
+    };
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            crate::warn!(
+                "[{}] accept task did not stop within {:?}, aborting",
+                name,
+                timeout
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+pub(crate) const ACCEPT_TASK_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct TransportContext {
     pub incoming_sessions_tx: mpsc::Sender<Arc<dyn Session>>,

@@ -47,6 +47,13 @@
         "tcp"
       ],
       "peer_id_hint": null
+    },
+    {
+      "addr": "83.136.233.187:18080",
+      "protocols": [
+        "tcp"
+      ],
+      "peer_id_hint": null
     }
   ],
   "database_dir": "./db/bootstrap-1",

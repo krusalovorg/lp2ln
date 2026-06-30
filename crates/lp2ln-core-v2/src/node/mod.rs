@@ -1,7 +1,7 @@
 pub mod addressing;
 pub mod autonomy;
-pub mod direct_upgrade;
 pub mod builder;
+pub mod direct_upgrade;
 pub mod distribution;
 pub mod flow_trace;
 pub mod health_server;
@@ -10,6 +10,7 @@ pub mod nat_traversal;
 pub mod options;
 mod options_file;
 pub mod runtime;
+mod supervisor;
 pub mod topology_maintenance;
 
 pub mod connection_strategy {
@@ -20,4 +21,6 @@ pub mod connection_strategy {
 pub use autonomy::{ConfigAutonomy, StartupConfigResult, StartupConfigSource, ValidationReport};
 pub use builder::NodeBuilder;
 pub use options::{DirectUpgradeConfig, IpcTcpOptions, NodeOptions, NodeRole};
-pub use runtime::{NodeRuntime, RuntimeHealthSnapshot, RuntimeMode};
+pub use runtime::{
+    NodeLifecycleError, NodeLifecycleState, NodeRuntime, RuntimeHealthSnapshot, RuntimeMode,
+};

@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use dashmap::DashMap;
 
-use crate::topology::{parse_observed_addr_line, PeerCatalog};
+use crate::topology::{PeerCatalog, parse_observed_addr_line};
 use crate::types::PeerId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,11 +72,7 @@ fn lan_match_score(addr: SocketAddr, locals: &[Ipv4Addr]) -> u8 {
     u8::from(ip.is_private())
 }
 
-fn tier_for_observed(
-    addr: SocketAddr,
-    prefer_lan: bool,
-    locals: &[Ipv4Addr],
-) -> AddrRankTier {
+fn tier_for_observed(addr: SocketAddr, prefer_lan: bool, locals: &[Ipv4Addr]) -> AddrRankTier {
     let IpAddr::V4(ip) = addr.ip() else {
         return AddrRankTier::GlobalRoutable;
     };
@@ -235,10 +231,7 @@ mod tests {
             SocketAddr::from_str("192.168.1.50:9002").unwrap(),
             "LAN before global when prefer_lan_addrs"
         );
-        assert_eq!(
-            r[1].1,
-            SocketAddr::from_str("198.51.100.10:9001").unwrap()
-        );
+        assert_eq!(r[1].1, SocketAddr::from_str("198.51.100.10:9001").unwrap());
     }
 
     #[test]
@@ -252,7 +245,10 @@ mod tests {
 
         dial.insert(
             remote.clone(),
-            vec![("tcp".into(), local_tcp), ("tcp".into(), "10.0.0.5:1".parse().unwrap())],
+            vec![
+                ("tcp".into(), local_tcp),
+                ("tcp".into(), "10.0.0.5:1".parse().unwrap()),
+            ],
         );
 
         let r = ranked_dial_targets(

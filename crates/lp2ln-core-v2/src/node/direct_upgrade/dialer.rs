@@ -75,7 +75,9 @@ impl DirectDialer for CoreDirectDialer {
             chunk_index: None,
             total_chunks: None,
         };
-        self.router.send_to_session(session_id.clone(), handshake).await?;
+        self.router
+            .send_to_session(session_id.clone(), handshake)
+            .await?;
         Ok(session_id)
     }
 }
