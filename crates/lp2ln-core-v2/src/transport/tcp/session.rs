@@ -13,6 +13,11 @@ use anyhow::Result;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
+/// Upper bound for a single frame write before the writer task gives up and
+/// tears down the session. Guards against indefinite blocking under TCP
+/// backpressure when the peer stops reading.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn tcp_peer_display(peer_id: &Option<String>, session_id: &str) -> String {
     match peer_id {
         Some(id) if !id.is_empty() => id.clone(),
@@ -70,6 +75,9 @@ pub struct TcpSession {
     // Cancelled by close(); reader and writer loops select on it so both
     // tasks terminate even while blocked on socket read / channel recv.
     shutdown: tokio_util::sync::CancellationToken,
+    // Tracks the reader and writer tasks so close_session() can join them
+    // during shutdown instead of leaving them detached.
+    task_tracker: tokio_util::task::TaskTracker,
 }
 
 #[async_trait::async_trait]
@@ -101,6 +109,11 @@ impl Session for TcpSession {
         Ok(())
     }
 
+    async fn join_tasks(&self) {
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
+    }
+
     fn spawn_reader(
         self: Arc<Self>,
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
@@ -109,8 +122,9 @@ impl Session for TcpSession {
         let peer_id = self.peer_id().map(|s| s.to_string());
         let link_kind = self.kind();
         let shutdown = self.shutdown.clone();
+        let task_tracker = self.task_tracker.clone();
 
-        tokio::spawn(async move {
+        task_tracker.spawn(async move {
             loop {
                 let read_result = tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -166,6 +180,7 @@ impl TcpSession {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
         let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_tracker = tokio_util::task::TaskTracker::new();
 
         let session = Arc::new(Self {
             id,
@@ -175,6 +190,7 @@ impl TcpSession {
             read: tokio::sync::Mutex::new(read_half),
             obfuscator: obfuscator.clone(),
             shutdown: shutdown.clone(),
+            task_tracker: task_tracker.clone(),
         });
 
         let write_half_arc = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -184,7 +200,7 @@ impl TcpSession {
         let writer_session_id = session.id.clone();
         let writer_kind = session.kind;
 
-        tokio::spawn(async move {
+        task_tracker.spawn(async move {
             loop {
                 let data = tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -195,22 +211,42 @@ impl TcpSession {
                 };
                 let mut writer = write_half_clone.lock().await;
 
-                if let Err(e) = obfuscator_clone.write_frame(&mut *writer, &data).await {
-                    if is_benign_tcp_disconnect(&e) {
-                        log_tcp_session_disconnect(
-                            writer_kind,
-                            &writer_peer_id,
-                            &writer_session_id,
-                            "on write",
-                        );
-                    } else {
-                        crate::error!(
-                            "[TcpSession] Write error for {}: {}",
-                            tcp_peer_display(&writer_peer_id, &writer_session_id),
-                            e
-                        );
+                // Bound the write: under TCP backpressure write_frame().await can
+                // block indefinitely (it runs outside the select!), which would
+                // wedge this task even after shutdown is requested. On timeout we
+                // cancel the session so the reader half also unwinds.
+                let write_result = tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    obfuscator_clone.write_frame(&mut *writer, &data),
+                )
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if is_benign_tcp_disconnect(&e) {
+                            log_tcp_session_disconnect(
+                                writer_kind,
+                                &writer_peer_id,
+                                &writer_session_id,
+                                "on write",
+                            );
+                        } else {
+                            crate::error!(
+                                "[TcpSession] Write error for {}: {}",
+                                tcp_peer_display(&writer_peer_id, &writer_session_id),
+                                e
+                            );
+                        }
+                        break;
                     }
-                    break;
+                    Err(_) => {
+                        crate::warn!(
+                            "[TcpSession] Write timed out for {}, closing session",
+                            tcp_peer_display(&writer_peer_id, &writer_session_id)
+                        );
+                        shutdown.cancel();
+                        break;
+                    }
                 }
             }
         });
@@ -262,5 +298,41 @@ impl TcpSession {
         };
         let bytes = encode_packet(handshake_packet)?;
         Obfuscator::plain().write_frame(stream, &bytes).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::session::Session;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn close_then_join_tasks_finishes_promptly() {
+        // After close() cancels the session, join_tasks() must observe both
+        // the reader and writer tasks terminating without leaking them.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let connect = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (server, _peer_addr) = listener.accept().await.expect("accept");
+        let _client = connect.await.expect("join connect").expect("connect");
+
+        let session = TcpSession::new_from_stream(
+            server,
+            Some("peer".to_string()),
+            LinkKind::DirectTcp,
+            Arc::new(Obfuscator::plain()),
+        )
+        .expect("session");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        session.clone().spawn_reader(tx);
+
+        session.close().await.expect("close");
+        tokio::time::timeout(std::time::Duration::from_secs(2), session.join_tasks())
+            .await
+            .expect("reader/writer tasks joined promptly");
     }
 }

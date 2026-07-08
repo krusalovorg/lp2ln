@@ -93,8 +93,13 @@ impl TrafficDemandTracker {
         if map.len() < max {
             return;
         }
+        // Never evict a peer that is mid-attempt (Dialing / NatTraversal):
+        // its entry is awaited by an in-flight upgrade task, and removing it
+        // would make the subsequent mark_success/mark_failure silently no-op,
+        // leaking the slot and stranding the attempt.
         if let Some(oldest) = map
             .iter()
+            .filter(|(_, e)| !matches!(e.state, UpgradeState::Dialing | UpgradeState::NatTraversal))
             .min_by_key(|(_, e)| e.last_seen)
             .map(|(k, _)| k.clone())
         {

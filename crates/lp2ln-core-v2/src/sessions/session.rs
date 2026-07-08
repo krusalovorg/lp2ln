@@ -47,4 +47,12 @@ pub trait Session: Send + Sync {
         self: std::sync::Arc<Self>,
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
     );
+
+    /// Waits for this session's background tasks (reader/writer) to finish.
+    ///
+    /// Must be called only after `close()` has signalled cancellation, and
+    /// always under a bounded timeout by the caller: a writer blocked
+    /// mid-write can take up to its own write timeout to unwind. Sessions
+    /// that spawn no tasks (fakes, relays) keep the default no-op.
+    async fn join_tasks(&self) {}
 }

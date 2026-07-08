@@ -65,35 +65,28 @@ impl NodeSupervisor {
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
         };
 
-        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
-
-        for mut task in tasks {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() && !task.handle.is_finished() {
-                crate::warn!(
-                    "[NodeSupervisor] shutdown timeout elapsed, aborting service '{}'",
-                    task.name
-                );
-                task.handle.abort();
-                Self::log_join_result(task.name, task.handle.await);
-                continue;
-            }
-
-            match tokio::time::timeout(remaining, &mut task.handle).await {
-                Ok(result) => Self::log_join_result(task.name, result),
+        // Join every task in parallel: each gets the full `shutdown_timeout`
+        // budget concurrently. A single hung task no longer eats the budget
+        // of the others, and the timeout log is accurate per task.
+        let shutdown_timeout = self.shutdown_timeout;
+        let joins = tasks.into_iter().map(|task| async move {
+            let ServiceTask { name, mut handle } = task;
+            match tokio::time::timeout(shutdown_timeout, &mut handle).await {
+                Ok(result) => Self::log_join_result(name, result),
                 Err(_) => {
                     crate::warn!(
                         "[NodeSupervisor] service '{}' timed out after {:?}, aborting",
-                        task.name,
-                        self.shutdown_timeout
+                        name,
+                        shutdown_timeout
                     );
-                    task.handle.abort();
+                    handle.abort();
                     // Aborted handles must still be awaited to observe the
                     // JoinError and ensure the task has fully terminated.
-                    Self::log_join_result(task.name, task.handle.await);
+                    Self::log_join_result(name, handle.await);
                 }
             }
-        }
+        });
+        futures::future::join_all(joins).await;
     }
 
     fn log_join_result(name: &'static str, result: Result<(), tokio::task::JoinError>) {
@@ -109,5 +102,54 @@ impl NodeSupervisor {
                 crate::warn!("[NodeSupervisor] service '{}' join error: {:?}", name, err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn parallel_join_does_not_sum_per_task_timeouts() {
+        let timeout = Duration::from_millis(300);
+        let supervisor = NodeSupervisor::with_shutdown_timeout(timeout);
+        // Three tasks that ignore cancellation: each is aborted after its own
+        // timeout. With parallel join the total is ~one timeout, not three.
+        for _ in 0..3 {
+            supervisor.spawn("hung", async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            });
+        }
+
+        let started = Instant::now();
+        supervisor.shutdown().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timeout * 2,
+            "parallel shutdown summed per-task timeouts: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_cooperative_tasks_quickly() {
+        let supervisor = NodeSupervisor::with_shutdown_timeout(Duration::from_secs(5));
+        let cancel = supervisor.cancellation();
+        for _ in 0..3 {
+            let token = cancel.clone();
+            supervisor.spawn("coop", async move {
+                token.cancelled().await;
+            });
+        }
+
+        let started = Instant::now();
+        supervisor.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cooperative tasks were not joined promptly"
+        );
     }
 }

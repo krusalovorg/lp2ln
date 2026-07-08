@@ -29,6 +29,29 @@ const ROUTER_BROADCAST_CAP: usize = 4096;
 const ROUTER_PROCESS_SEMAPHORE_PERMITS: usize = 256;
 const ROUTER_FALLBACK_FANOUT: usize = 4;
 
+/// Max idle wait between packets while draining the ingress buffer at
+/// shutdown. If no packet arrives within this window the queue is treated
+/// as drained.
+const ROUTER_DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Overall budget for the shutdown drain. Kept below the supervisor's
+/// per-task join timeout so the router still finishes within shutdown.
+const ROUTER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Outcome of [`Router::run`]. Replaces the previous `Result<()>` plus
+/// `is_ingress_closed()` side-channel so the supervised loop decides whether
+/// to restart from a typed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterRunOutcome {
+    /// Cancellation token fired (intentional shutdown). Buffered packets were
+    /// drained before returning.
+    Cancelled,
+    /// `recv()` returned `None` while ingress was closed: clean shutdown.
+    IngressClosed,
+    /// `recv()` returned `None` while ingress was still open: unexpected, the
+    /// supervised loop restarts the router.
+    ChannelClosedUnexpectedly,
+}
+
 pub struct Router {
     session_manager: Arc<SessionManager>,
     packet_processor: Arc<dyn PacketProcessor>,
@@ -362,81 +385,121 @@ impl Router {
         self.session_manager.get_all_peers()
     }
 
+    /// Routes a single received packet: records metrics, runs chunk
+    /// reassembly, broadcasts to subscribers, and spawns the bounded
+    /// per-packet processing task.
+    fn dispatch_incoming(
+        self: &Arc<Self>,
+        incoming: IncomingPacket,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+    ) {
+        let session_id = SessionId::from(incoming.session_id.clone());
+        let bytes_estimate = incoming.packet.wire_size_estimate();
+        MetricsProvider::record_packets_received(
+            self.session_manager.as_ref(),
+            &session_id,
+            bytes_estimate,
+        );
+
+        let to_process = if ChunkAssembler::is_chunk_packet(&incoming.packet) {
+            match self.chunk_assembler.add(incoming) {
+                ChunkAssemblerResult::Merged(ip) | ChunkAssemblerResult::PassThrough(ip) => {
+                    Some(ip)
+                }
+                ChunkAssemblerResult::Collecting => None,
+            }
+        } else {
+            Some(incoming)
+        };
+
+        let Some(mut incoming) = to_process else {
+            return;
+        };
+
+        if incoming.from_node.is_none() && !incoming.packet.sender.is_empty() {
+            incoming.from_node = Some(incoming.packet.sender.clone());
+        }
+
+        let skip_early_ipc = is_secure_envelope(&incoming.packet.data)
+            && (incoming.packet.receiver == self.our_peer_id
+                || incoming.packet.receiver.is_empty());
+        if !skip_early_ipc {
+            let _ = self.incoming_broadcast_tx.send(incoming.clone());
+        }
+
+        let processor = self.packet_processor.clone();
+        let router = self.clone();
+        let semaphore = semaphore.clone();
+        let packet_cancel = self.packet_cancel.clone();
+        self.packet_tasks.spawn(async move {
+            tokio::select! {
+                _ = packet_cancel.cancelled() => {}
+                _ = async move {
+                    let Ok(permit) = semaphore.acquire_owned().await else {
+                        return;
+                    };
+                    let _permit = permit;
+                    processor.process(incoming, router).await;
+                } => {}
+            }
+        });
+    }
+
+    /// Bounded drain of the ingress buffer at shutdown. Producers are already
+    /// cancelled by this point, so the queue only shrinks. Pulls and
+    /// dispatches packets until the queue stays idle for `ROUTER_DRAIN_IDLE`,
+    /// the channel closes, or `ROUTER_DRAIN_BUDGET` elapses — so buffered
+    /// packets are processed instead of silently dropped.
+    async fn drain_incoming(
+        self: &Arc<Self>,
+        incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+    ) {
+        let drain_deadline = tokio::time::Instant::now() + ROUTER_DRAIN_BUDGET;
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let idle = ROUTER_DRAIN_IDLE.min(remaining);
+            match tokio::time::timeout(idle, incoming_rx.recv()).await {
+                Ok(Some(incoming)) => self.dispatch_incoming(incoming, semaphore),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
     pub async fn run(
         self: Arc<Self>,
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
         cancel: CancellationToken,
-    ) -> Result<()> {
+    ) -> RouterRunOutcome {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(
             ROUTER_PROCESS_SEMAPHORE_PERMITS,
         ));
 
         loop {
             let incoming = tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => {
+                    // Intentional shutdown: drain whatever readers already
+                    // enqueued before exiting so the buffer is not dropped.
+                    self.drain_incoming(incoming_rx, &semaphore).await;
+                    return RouterRunOutcome::Cancelled;
+                }
                 maybe = incoming_rx.recv() => match maybe {
                     Some(incoming) => incoming,
                     None => break,
                 },
             };
-            let session_id = SessionId::from(incoming.session_id.clone());
-            let bytes_estimate = incoming.packet.wire_size_estimate();
-            MetricsProvider::record_packets_received(
-                self.session_manager.as_ref(),
-                &session_id,
-                bytes_estimate,
-            );
-
-            let to_process = if ChunkAssembler::is_chunk_packet(&incoming.packet) {
-                match self.chunk_assembler.add(incoming) {
-                    ChunkAssemblerResult::Merged(ip) | ChunkAssemblerResult::PassThrough(ip) => {
-                        Some(ip)
-                    }
-                    ChunkAssemblerResult::Collecting => None,
-                }
-            } else {
-                Some(incoming)
-            };
-
-            let Some(mut incoming) = to_process else {
-                continue;
-            };
-
-            if incoming.from_node.is_none() && !incoming.packet.sender.is_empty() {
-                incoming.from_node = Some(incoming.packet.sender.clone());
-            }
-
-            let skip_early_ipc = is_secure_envelope(&incoming.packet.data)
-                && (incoming.packet.receiver == self.our_peer_id
-                    || incoming.packet.receiver.is_empty());
-            if !skip_early_ipc {
-                let _ = self.incoming_broadcast_tx.send(incoming.clone());
-            }
-
-            let processor = self.packet_processor.clone();
-            let router = self.clone();
-            let semaphore = semaphore.clone();
-            let packet_cancel = self.packet_cancel.clone();
-            self.packet_tasks.spawn(async move {
-                tokio::select! {
-                    _ = packet_cancel.cancelled() => {}
-                    _ = async move {
-                        let Ok(permit) = semaphore.acquire_owned().await else {
-                            return;
-                        };
-                        let _permit = permit;
-                        processor.process(incoming, router).await;
-                    } => {}
-                }
-            });
+            self.dispatch_incoming(incoming, &semaphore);
         }
         if self.is_ingress_closed() {
             // Intentional shutdown: ingress was closed by NodeRuntime::stop().
-            return Ok(());
+            RouterRunOutcome::IngressClosed
+        } else {
+            RouterRunOutcome::ChannelClosedUnexpectedly
         }
-        Err(anyhow::anyhow!(
-            "router incoming channel closed; router loop stopped"
-        ))
     }
 }
 

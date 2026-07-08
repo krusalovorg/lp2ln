@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use anyhow::Result;
@@ -22,7 +22,7 @@ use lp2ln_core_v2::{
     packet_processor::PacketProcessor,
     peer_score::{PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights},
     protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload},
-    router::Router,
+    router::{Router, RouterRunOutcome},
     sessions::{IncomingPacket, LinkKind, Session, manager::SessionManager},
     topology::{NodeCapabilities, NodeDescriptor, NodeDynamicStatus},
 };
@@ -87,6 +87,17 @@ struct NoopProcessor;
 #[async_trait]
 impl PacketProcessor for NoopProcessor {
     async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {}
+}
+
+struct CountingProcessor {
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl PacketProcessor for CountingProcessor {
+    async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn test_router_with_sink(sink: Option<DirectUpgradeRouterSink>) -> (Router, Arc<SessionManager>) {
@@ -502,6 +513,57 @@ fn distribution_mesh_first_places_regular_candidates_before_bootstrap_candidates
         .filter_map(|(idx, p)| (p != &bootstrap_high).then_some(idx))
         .collect();
     assert!(regular_indexes.into_iter().all(|idx| idx < bootstrap_index));
+}
+
+#[tokio::test]
+async fn router_drains_buffered_packets_on_cancel() {
+    // Regression for the shutdown packet-loss bug: when the router is
+    // cancelled it must drain whatever is already buffered in the ingress
+    // queue instead of dropping it.
+    let store = Arc::new(PeerScoreStore::new());
+    let manager = Arc::new(SessionManager::new(store, PeerScoreWeights::default()));
+    let count = Arc::new(AtomicUsize::new(0));
+    let (router, mut rx) = Router::new(
+        manager.clone(),
+        Arc::new(CountingProcessor {
+            count: count.clone(),
+        }),
+        None,
+        "router-self",
+        None,
+    );
+    let router = Arc::new(router);
+
+    const N: usize = 1000;
+    let sender = router.incoming_sender();
+    for i in 0..N {
+        sender
+            .send(IncomingPacket {
+                session_id: format!("sess-{i}"),
+                from_node: Some("peer".to_string()),
+                packet: packet(vec![1, 2, 3]),
+            })
+            .await
+            .expect("buffer packet");
+    }
+
+    // Request shutdown before run starts: the cancel branch must drain.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = router.clone().run(&mut rx, cancel).await;
+    assert_eq!(outcome, RouterRunOutcome::Cancelled);
+
+    // Let the per-packet processing tasks spawned during the drain finish.
+    router
+        .shutdown_packet_tasks(std::time::Duration::from_secs(3))
+        .await;
+
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        N,
+        "router dropped buffered packets on shutdown"
+    );
 }
 
 #[test]

@@ -1,3 +1,3 @@
 mod router;
 
-pub use router::{ROUTER_INCOMING_QUEUE_CAP, Router};
+pub use router::{ROUTER_INCOMING_QUEUE_CAP, Router, RouterRunOutcome};

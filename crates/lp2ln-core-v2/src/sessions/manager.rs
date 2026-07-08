@@ -10,6 +10,12 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::{Session, SessionMetrics};
 use crate::types::{PeerId, SessionId};
 
+/// Upper bound for joining a session's reader/writer tasks in
+/// `close_session`. The reader exits immediately on cancellation; a writer
+/// blocked mid-write is bounded by its own write timeout, so this guards
+/// against a hung writer stalling shutdown.
+const SESSION_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct SessionManager {
     sessions: Arc<DashMap<SessionId, Arc<dyn Session + Send + Sync>>>,
     by_peer: Arc<DashMap<PeerId, Vec<SessionId>>>,
@@ -333,7 +339,22 @@ impl SessionManager {
         if let Some(mut list) = self.by_protocol.get_mut(&kind) {
             list.retain(|id| id != session_id);
         }
-        session.close().await
+        let close_result = session.close().await;
+        // Join the session's reader/writer tasks so they do not outlive the
+        // session. The reader holds an ingress-channel sender clone, so
+        // joining it before shutdown closes the router ingress lets the
+        // router drain cleanly. Bounded: a hung writer must not stall us.
+        if tokio::time::timeout(SESSION_JOIN_TIMEOUT, session.join_tasks())
+            .await
+            .is_err()
+        {
+            crate::warn!(
+                "[SessionManager] session '{}' tasks did not finish within {:?}",
+                session_id,
+                SESSION_JOIN_TIMEOUT
+            );
+        }
+        close_result
     }
 
     pub async fn close_all_sessions_for_peer(&self, peer_id: &PeerId) -> Result<()> {

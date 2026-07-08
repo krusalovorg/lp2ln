@@ -34,7 +34,7 @@ use crate::peer_score::PeerConnectionPolicy;
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::protocol::handshake;
-use crate::router::{ROUTER_INCOMING_QUEUE_CAP, Router};
+use crate::router::{ROUTER_INCOMING_QUEUE_CAP, Router, RouterRunOutcome};
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::sessions::{LinkKind, Session, SessionMetrics};
@@ -735,18 +735,18 @@ impl NodeRuntime {
                     .catch_unwind()
                     .await;
                     match result {
-                        Ok(Ok(_)) => {
+                        Ok(RouterRunOutcome::Cancelled | RouterRunOutcome::IngressClosed) => {
+                            // Intentional shutdown: ingress drained/closed.
+                            // Restarting would spin on an empty queue.
                             health.mark_healthy();
-                            if router_loop.is_ingress_closed() {
-                                // Clean exit during shutdown: ingress is closed,
-                                // restarting the loop would spin on an empty queue.
-                                break;
-                            }
-                            backoff = Duration::from_millis(500);
+                            break;
                         }
-                        Ok(Err(err)) => {
+                        Ok(RouterRunOutcome::ChannelClosedUnexpectedly) => {
                             health.router_restarts.fetch_add(1, Ordering::Relaxed);
-                            health.record_error("router", err.to_string());
+                            health.record_error(
+                                "router",
+                                "router incoming channel closed unexpectedly",
+                            );
                         }
                         Err(_) => {
                             health.router_restarts.fetch_add(1, Ordering::Relaxed);
@@ -1161,13 +1161,14 @@ impl NodeRuntime {
     /// 3. stop transports — sends the shutdown signal and joins the accept
     ///    task, so no new connections appear past this point;
     /// 4. close every registered session by registry ID (covers unbound
-    ///    handshake/redirect sessions without a PeerId);
-    /// 5. close router ingress — the router loop drains buffered packets
-    ///    and exits cleanly;
-    /// 6. bounded drain of in-flight per-packet processing tasks;
-    /// 7. cancel remaining services (router loop, flow trace) and join all
-    ///    supervised handles; hung tasks are aborted after the timeout and
-    ///    their handles awaited.
+    ///    handshake/redirect sessions without a PeerId) and join their
+    ///    reader/writer tasks, dropping the reader-held ingress senders;
+    /// 5. close router ingress — drops our own retained ingress sender;
+    /// 6. cancel remaining services and join all supervised handles in
+    ///    parallel; the router's cancellation triggers a bounded drain of
+    ///    the ingress buffer, so buffered packets are processed, not dropped;
+    /// 7. bounded drain of in-flight per-packet processing tasks (including
+    ///    those the router spawned during its drain).
     pub async fn stop(&self) -> Result<()> {
         {
             let mut lifecycle = self
@@ -1207,13 +1208,17 @@ impl NodeRuntime {
             let _ = self.session_manager.close_session(&session_id).await;
         }
 
-        // Phases 5–6: close ingress, then bounded drain of packet tasks.
+        // Phase 5: close ingress (drop our own retained sender clone). Reader
+        // clones were already dropped in Phase 4, so the ingress buffer can
+        // only shrink from here on.
         if let Some(router) = self.router.as_ref() {
             router.close_incoming();
-            router.shutdown_packet_tasks(Duration::from_secs(3)).await;
         }
 
-        // Phase 7: cancel remaining services and join everything.
+        // Phase 6: cancel remaining services and join everything in parallel.
+        // The router's cancellation triggers its bounded ingress drain, so
+        // buffered packets are dispatched (spawning per-packet tasks) before
+        // it exits.
         let supervisor = self
             .supervisor
             .lock()
@@ -1221,6 +1226,12 @@ impl NodeRuntime {
             .and_then(|mut guard| guard.take());
         if let Some(supervisor) = supervisor {
             supervisor.shutdown().await;
+        }
+
+        // Phase 7: bounded drain of per-packet processing tasks, including any
+        // the router spawned while draining its ingress buffer in Phase 6.
+        if let Some(router) = self.router.as_ref() {
+            router.shutdown_packet_tasks(Duration::from_secs(3)).await;
         }
 
         if let Ok(mut lifecycle) = self.lifecycle.lock() {

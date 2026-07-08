@@ -100,6 +100,16 @@ pub async fn run_direct_upgrade_loop(
                     let our_id = our_peer_id.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
+                        // If the attempt panics, run_one_upgrade_attempt never
+                        // reaches its mark_success/mark_failure calls, leaving the
+                        // peer stuck in Dialing forever. The guard releases it on
+                        // an unwind; on normal completion we disarm it.
+                        let mut guard = DialingAbortGuard {
+                            tracker: &tracker2,
+                            peer_id: peer_id.clone(),
+                            cooldown: Duration::from_secs(cfg2.cooldown_secs.max(1)),
+                            armed: true,
+                        };
                         run_one_upgrade_attempt(
                             peer_id,
                             our_id.as_str(),
@@ -115,9 +125,28 @@ pub async fn run_direct_upgrade_loop(
                             nat2.as_deref(),
                         )
                         .await;
+                        guard.armed = false;
                     });
                 }
             }
+        }
+    }
+}
+
+/// Releases a peer from the `Dialing`/`NatTraversal` state if the upgrade task
+/// is dropped before completing normally (e.g. on a panic). On a clean run the
+/// caller sets `armed = false` so this becomes a no-op.
+struct DialingAbortGuard<'a> {
+    tracker: &'a TrafficDemandTracker,
+    peer_id: PeerId,
+    cooldown: Duration,
+    armed: bool,
+}
+
+impl Drop for DialingAbortGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.tracker.mark_failure(&self.peer_id, self.cooldown);
         }
     }
 }
