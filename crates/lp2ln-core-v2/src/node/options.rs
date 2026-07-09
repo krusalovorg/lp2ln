@@ -300,6 +300,10 @@ pub struct NodeOptions {
     pub direct_upgrade: DirectUpgradeConfig,
     pub session_join_timeout_secs: u64,
     pub supervisor_shutdown_timeout_secs: u64,
+    pub router_incoming_queue_cap: usize,
+    pub router_broadcast_cap: usize,
+    /// When false the topology-maintenance task is not started (useful for test nodes).
+    pub enable_topology_maintenance: bool,
 }
 
 impl NodeOptions {
@@ -327,6 +331,9 @@ impl NodeOptions {
             direct_upgrade: DirectUpgradeConfig::default(),
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
+            router_incoming_queue_cap: 16384,
+            router_broadcast_cap: 4096,
+            enable_topology_maintenance: true,
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -364,6 +371,9 @@ impl NodeOptions {
             direct_upgrade: DirectUpgradeConfig::default(),
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
+            router_incoming_queue_cap: 16384,
+            router_broadcast_cap: 4096,
+            enable_topology_maintenance: true,
             logger_options: Some(LoggerOptions::default()),
         }
     }

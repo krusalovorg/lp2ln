@@ -217,6 +217,9 @@ impl NodeRuntime {
                 direct_upgrade: options.direct_upgrade,
                 session_join_timeout_secs: options.session_join_timeout_secs,
                 supervisor_shutdown_timeout_secs: options.supervisor_shutdown_timeout_secs,
+                router_incoming_queue_cap: options.router_incoming_queue_cap,
+                router_broadcast_cap: options.router_broadcast_cap,
+                enable_topology_maintenance: options.enable_topology_maintenance,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,
@@ -714,12 +717,14 @@ impl NodeRuntime {
         } else {
             None
         };
-        let (router_raw, mut incoming_packets_rx) = Router::new(
+        let (router_raw, mut incoming_packets_rx) = Router::new_with_caps(
             self.session_manager.clone(),
             self.packet_processor.clone(),
             signing_key,
             self.keypair.peer_id(),
             upgrade_sink.as_ref().map(|(sink, _rx, _cfg)| sink.clone()),
+            self._options.router_incoming_queue_cap,
+            self._options.router_broadcast_cap,
         );
         let router = Arc::new(router_raw);
         {
@@ -1088,6 +1093,7 @@ impl NodeRuntime {
 
         let health_maint = self.health.clone();
         let cancel_topology = producer_cancel.clone();
+        if self._options.enable_topology_maintenance {
         supervisor.spawn("topology", async move {
             let mut backoff = Duration::from_millis(500);
             loop {
@@ -1150,6 +1156,7 @@ impl NodeRuntime {
                 backoff = (backoff * 2).min(Duration::from_secs(15));
             }
         });
+        } // enable_topology_maintenance
 
         if let Ok(mut guard) = self.supervisor.lock() {
             *guard = Some(supervisor);

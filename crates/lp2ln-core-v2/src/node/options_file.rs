@@ -96,6 +96,20 @@ struct NodeOptionsFile {
     ipc_tcp: IpcTcpOptions,
     #[serde(default)]
     direct_upgrade: DirectUpgradeConfig,
+    #[serde(default = "default_router_incoming_queue_cap")]
+    router_incoming_queue_cap: usize,
+    #[serde(default = "default_router_broadcast_cap")]
+    router_broadcast_cap: usize,
+    #[serde(default = "super::options::default_true")]
+    enable_topology_maintenance: bool,
+}
+
+fn default_router_incoming_queue_cap() -> usize {
+    16384
+}
+
+fn default_router_broadcast_cap() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +206,9 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             direct_upgrade: file.direct_upgrade,
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
+            router_incoming_queue_cap: file.router_incoming_queue_cap,
+            router_broadcast_cap: file.router_broadcast_cap,
+            enable_topology_maintenance: file.enable_topology_maintenance,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -335,6 +352,9 @@ impl From<&NodeOptions> for NodeOptionsFile {
             debug_server: opts.debug_server.clone(),
             ipc_tcp: opts.ipc_tcp.clone(),
             direct_upgrade: opts.direct_upgrade.clone(),
+            router_incoming_queue_cap: opts.router_incoming_queue_cap,
+            router_broadcast_cap: opts.router_broadcast_cap,
+            enable_topology_maintenance: opts.enable_topology_maintenance,
         }
     }
 }

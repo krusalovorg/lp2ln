@@ -76,10 +76,30 @@ impl Router {
         our_peer_id: impl Into<String>,
         direct_upgrade: Option<DirectUpgradeRouterSink>,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
+        Self::new_with_caps(
+            session_manager,
+            packet_processor,
+            signing_key,
+            our_peer_id,
+            direct_upgrade,
+            ROUTER_INCOMING_QUEUE_CAP,
+            ROUTER_BROADCAST_CAP,
+        )
+    }
+
+    pub fn new_with_caps(
+        session_manager: Arc<SessionManager>,
+        packet_processor: Arc<dyn PacketProcessor>,
+        signing_key: Option<Arc<SigningKey>>,
+        our_peer_id: impl Into<String>,
+        direct_upgrade: Option<DirectUpgradeRouterSink>,
+        incoming_cap: usize,
+        broadcast_cap: usize,
+    ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id = our_peer_id.into();
-        let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(ROUTER_INCOMING_QUEUE_CAP);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
         let (incoming_broadcast_tx, _rx) =
-            broadcast::channel::<IncomingPacket>(ROUTER_BROADCAST_CAP);
+            broadcast::channel::<IncomingPacket>(broadcast_cap);
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
