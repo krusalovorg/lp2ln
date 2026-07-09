@@ -190,6 +190,8 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             debug_server: file.debug_server,
             ipc_tcp: file.ipc_tcp,
             direct_upgrade: file.direct_upgrade,
+            session_join_timeout_secs: 2,
+            supervisor_shutdown_timeout_secs: 10,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str

@@ -298,6 +298,8 @@ pub struct NodeOptions {
     pub debug_server: DebugServerOptions,
     pub ipc_tcp: IpcTcpOptions,
     pub direct_upgrade: DirectUpgradeConfig,
+    pub session_join_timeout_secs: u64,
+    pub supervisor_shutdown_timeout_secs: u64,
 }
 
 impl NodeOptions {
@@ -323,6 +325,8 @@ impl NodeOptions {
             debug_server: DebugServerOptions::default(),
             ipc_tcp: IpcTcpOptions::default(),
             direct_upgrade: DirectUpgradeConfig::default(),
+            session_join_timeout_secs: 2,
+            supervisor_shutdown_timeout_secs: 10,
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -358,6 +362,8 @@ impl NodeOptions {
             debug_server: DebugServerOptions::default(),
             ipc_tcp: IpcTcpOptions::default(),
             direct_upgrade: DirectUpgradeConfig::default(),
+            session_join_timeout_secs: 2,
+            supervisor_shutdown_timeout_secs: 10,
             logger_options: Some(LoggerOptions::default()),
         }
     }

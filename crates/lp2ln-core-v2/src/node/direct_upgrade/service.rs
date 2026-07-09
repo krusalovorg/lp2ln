@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::node::options::DirectUpgradeConfig;
 use crate::router::Router;
+use crate::services::SessionRegistry;
 use crate::sessions::manager::SessionManager;
 use crate::topology::PeerCatalog;
 use crate::types::PeerId;
@@ -15,12 +16,12 @@ use crate::types::PeerId;
 use super::addrs::ranked_dial_targets;
 use super::dialer::{CoreNatTraversalTrigger, DirectDialer, NatTraversalTrigger};
 use super::event::DirectUpgradeEvent;
-use super::tracker::TrafficDemandTracker;
+use super::tracker::TrafficDemandPolicy;
 
 pub struct DirectUpgradeContext {
     pub config: DirectUpgradeConfig,
     pub our_peer_id: String,
-    pub router: Arc<Router>,
+    pub registry: Arc<dyn SessionRegistry>,
     pub session_manager: Arc<SessionManager>,
     pub peer_catalog: Arc<PeerCatalog>,
     pub dial_book: Arc<DashMap<PeerId, Vec<(String, std::net::SocketAddr)>>>,
@@ -28,7 +29,7 @@ pub struct DirectUpgradeContext {
     pub advertise: HashMap<String, std::net::SocketAddr>,
     pub dialer: Arc<dyn DirectDialer>,
     pub nat: Option<Arc<dyn NatTraversalTrigger>>,
-    pub tracker: Arc<TrafficDemandTracker>,
+    pub tracker: Arc<dyn TrafficDemandPolicy>,
 }
 
 pub async fn run_direct_upgrade_loop(
@@ -41,7 +42,7 @@ pub async fn run_direct_upgrade_loop(
     }
     let tick = Duration::from_millis(ctx.config.tick_interval_ms.max(50));
     let cfg = ctx.config.clone();
-    let router = ctx.router.clone();
+    let router = ctx.registry.clone();
     let session_manager = ctx.session_manager.clone();
     let catalog = ctx.peer_catalog.clone();
     let dial_book = ctx.dial_book.clone();
@@ -87,7 +88,7 @@ pub async fn run_direct_upgrade_loop(
                         continue;
                     }
                     tracker.mark_dialing(&peer_id);
-                    let router2 = router.clone();
+                    let router2: Arc<dyn SessionRegistry> = router.clone();
                     let session_manager2 = session_manager.clone();
                     let catalog2 = catalog.clone();
                     let dial_book2 = dial_book.clone();
@@ -105,7 +106,7 @@ pub async fn run_direct_upgrade_loop(
                         // peer stuck in Dialing forever. The guard releases it on
                         // an unwind; on normal completion we disarm it.
                         let mut guard = DialingAbortGuard {
-                            tracker: &tracker2,
+                            tracker: tracker2.as_ref(),
                             peer_id: peer_id.clone(),
                             cooldown: Duration::from_secs(cfg2.cooldown_secs.max(1)),
                             armed: true,
@@ -114,8 +115,8 @@ pub async fn run_direct_upgrade_loop(
                             peer_id,
                             our_id.as_str(),
                             &cfg2,
-                            &tracker2,
-                            &router2,
+                            tracker2.as_ref(),
+                            router2.as_ref(),
                             &session_manager2,
                             &catalog2,
                             &dial_book2,
@@ -137,7 +138,7 @@ pub async fn run_direct_upgrade_loop(
 /// is dropped before completing normally (e.g. on a panic). On a clean run the
 /// caller sets `armed = false` so this becomes a no-op.
 struct DialingAbortGuard<'a> {
-    tracker: &'a TrafficDemandTracker,
+    tracker: &'a dyn TrafficDemandPolicy,
     peer_id: PeerId,
     cooldown: Duration,
     armed: bool,
@@ -155,8 +156,8 @@ async fn run_one_upgrade_attempt(
     peer_id: PeerId,
     our_peer_id: &str,
     cfg: &DirectUpgradeConfig,
-    tracker: &TrafficDemandTracker,
-    router: &Router,
+    tracker: &dyn TrafficDemandPolicy,
+    router: &dyn SessionRegistry,
     session_manager: &SessionManager,
     catalog: &PeerCatalog,
     dial_book: &DashMap<PeerId, Vec<(String, std::net::SocketAddr)>>,
@@ -285,6 +286,8 @@ mod service_tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::node::direct_upgrade::TrafficDemandTracker;
 
     use anyhow::Result;
     use async_trait::async_trait;

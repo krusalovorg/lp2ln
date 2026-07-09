@@ -21,6 +21,7 @@ use crate::node::direct_upgrade::{
     CoreDirectDialer, DirectUpgradeContext, DirectUpgradeRouterSink, TrafficDemandTracker,
     nat_trigger_from_parts, run_direct_upgrade_loop,
 };
+use crate::services::SessionRegistry;
 use crate::node::flow_trace::FlowTraceService;
 use crate::node::incoming_sessions::run_incoming_session_handler;
 use crate::node::options::{NodeOptions, NodeRole};
@@ -185,10 +186,10 @@ impl NodeRuntime {
             )) as Arc<dyn PacketProcessor>
         });
         let peer_scores = Arc::new(PeerScoreStore::new());
-        let session_manager = Arc::new(SessionManager::new(
-            peer_scores,
-            options.peer_score_weights.clone(),
-        ));
+        let session_manager = Arc::new(
+            SessionManager::new(peer_scores, options.peer_score_weights.clone())
+                .with_join_timeout(Duration::from_secs(options.session_join_timeout_secs)),
+        );
         let peer_policy_init = options.peer_connection_policy.normalized();
         Self {
             _db: db,
@@ -214,6 +215,8 @@ impl NodeRuntime {
                 debug_server: options.debug_server,
                 ipc_tcp: options.ipc_tcp,
                 direct_upgrade: options.direct_upgrade,
+                session_join_timeout_secs: options.session_join_timeout_secs,
+                supervisor_shutdown_timeout_secs: options.supervisor_shutdown_timeout_secs,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,
@@ -689,7 +692,9 @@ impl NodeRuntime {
             return Err(anyhow::anyhow!("No transports registered"));
         }
 
-        let supervisor = NodeSupervisor::new();
+        let supervisor = NodeSupervisor::with_shutdown_timeout(Duration::from_secs(
+            self._options.supervisor_shutdown_timeout_secs,
+        ));
         let cancel = supervisor.cancellation();
         // Producer services (accept/dial/maintenance) get a child token so
         // stop() can halt them first, before sessions are drained and the
@@ -807,7 +812,7 @@ impl NodeRuntime {
                     DirectUpgradeContext {
                         config: du_cfg,
                         our_peer_id: our_peer_id_du,
-                        router: router_du,
+                        registry: router_du as Arc<dyn SessionRegistry>,
                         session_manager: session_manager_du,
                         peer_catalog: peer_catalog_du,
                         dial_book: dial_book_du,

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,11 +11,45 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::{Session, SessionMetrics};
 use crate::types::{PeerId, SessionId};
 
-/// Upper bound for joining a session's reader/writer tasks in
-/// `close_session`. The reader exits immediately on cancellation; a writer
-/// blocked mid-write is bounded by its own write timeout, so this guards
-/// against a hung writer stalling shutdown.
-const SESSION_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub trait SessionSelectionStrategy: Send + Sync {
+    fn rank(
+        &self,
+        peer_id: &PeerId,
+        session_id: &SessionId,
+        kind: LinkKind,
+        metrics: &SessionMetrics,
+    ) -> f32;
+}
+
+pub struct DefaultSessionStrategy {
+    peer_scores: Arc<PeerScoreStore>,
+    weights: PeerScoreWeights,
+}
+
+impl SessionSelectionStrategy for DefaultSessionStrategy {
+    fn rank(
+        &self,
+        peer_id: &PeerId,
+        _session_id: &SessionId,
+        kind: LinkKind,
+        metrics: &SessionMetrics,
+    ) -> f32 {
+        let peer_score = self.peer_scores.get(peer_id);
+        let base = total_score(&peer_score, &self.weights);
+        let packets = metrics.total_packets().max(1) as f32;
+        let err_rate = (metrics.total_errors() as f32 / packets).min(1.0);
+        let stale = (metrics.time_since_last_activity().as_secs_f32() / 120.0).min(1.0);
+        let priority =
+            base - self.weights.w_latency * stale * 0.35 - self.weights.w_load * err_rate;
+        let damp = (1.0 - err_rate).clamp(0.0, 1.0);
+        let link_bonus = match kind {
+            LinkKind::DirectTcp | LinkKind::DirectUdp => 0.08 * damp,
+            LinkKind::TunnelTcp | LinkKind::TunnelUdp => 0.03 * damp,
+            LinkKind::Relay => 0.0,
+        };
+        priority + link_bonus
+    }
+}
 
 pub struct SessionManager {
     sessions: Arc<DashMap<SessionId, Arc<dyn Session + Send + Sync>>>,
@@ -24,6 +59,8 @@ pub struct SessionManager {
     by_protocol: Arc<DashMap<LinkKind, Vec<SessionId>>>,
     peer_scores: Arc<PeerScoreStore>,
     peer_weights: PeerScoreWeights,
+    strategy: Arc<dyn SessionSelectionStrategy>,
+    session_join_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -44,21 +81,11 @@ pub struct SessionDebugEntry {
 }
 
 impl SessionManager {
-    fn prune_stale_peer_index(&self) {
-        let peers: Vec<PeerId> = self.by_peer.iter().map(|r| r.key().clone()).collect();
-        for pid in peers {
-            let mut remove = false;
-            if let Some(mut ids) = self.by_peer.get_mut(&pid) {
-                ids.retain(|id| self.sessions.contains_key(id));
-                remove = ids.is_empty();
-            }
-            if remove {
-                self.by_peer.remove(&pid);
-            }
-        }
-    }
-
     pub fn new(peer_scores: Arc<PeerScoreStore>, peer_weights: PeerScoreWeights) -> Self {
+        let strategy = Arc::new(DefaultSessionStrategy {
+            peer_scores: peer_scores.clone(),
+            weights: peer_weights.clone(),
+        });
         Self {
             sessions: Arc::new(DashMap::new()),
             by_peer: Arc::new(DashMap::new()),
@@ -67,7 +94,19 @@ impl SessionManager {
             by_protocol: Arc::new(DashMap::new()),
             peer_scores,
             peer_weights,
+            strategy,
+            session_join_timeout: Duration::from_secs(2),
         }
+    }
+
+    pub fn with_join_timeout(mut self, d: Duration) -> Self {
+        self.session_join_timeout = d;
+        self
+    }
+
+    pub fn with_strategy(mut self, strategy: Arc<dyn SessionSelectionStrategy>) -> Self {
+        self.strategy = strategy;
+        self
     }
 
     pub fn peer_score_store(&self) -> Arc<PeerScoreStore> {
@@ -120,12 +159,10 @@ impl SessionManager {
     }
 
     pub fn get_session_ids(&self, peer_id: &PeerId) -> Option<Vec<SessionId>> {
-        self.prune_stale_peer_index();
         self.by_peer.get(peer_id).map(|v| v.clone())
     }
 
     pub fn get_all_for_peer(&self, peer_id: &PeerId) -> Vec<Arc<dyn Session + Send + Sync>> {
-        self.prune_stale_peer_index();
         let Some(ids_ref) = self.by_peer.get(peer_id) else {
             return vec![];
         };
@@ -136,40 +173,12 @@ impl SessionManager {
     }
 
     pub fn get_all_peers(&self) -> Vec<PeerId> {
-        self.prune_stale_peer_index();
         self.by_peer.iter().map(|r| r.key().clone()).collect()
     }
 
     pub fn get_all_peers_sorted_by_score(&self) -> Vec<PeerId> {
         let peers = self.get_all_peers();
         crate::peer_score::rank_peers(&peers, |p| self.peer_scores.get(p), &self.peer_weights)
-    }
-
-    fn session_send_priority(
-        &self,
-        peer_id: &PeerId,
-        _session_id: &SessionId,
-        metrics: &SessionMetrics,
-    ) -> f32 {
-        let peer_score = self.peer_scores.get(peer_id);
-        let base = total_score(&peer_score, &self.peer_weights);
-        let packets = metrics.total_packets().max(1) as f32;
-        let err_rate = (metrics.total_errors() as f32 / packets).min(1.0);
-        let stale_secs = metrics.time_since_last_activity().as_secs_f32();
-        let stale = (stale_secs / 120.0).min(1.0);
-        base - self.peer_weights.w_latency * stale * 0.35 - self.peer_weights.w_load * err_rate
-    }
-
-    fn link_kind_bonus(kind: LinkKind, metrics: &SessionMetrics) -> f32 {
-        let packets = metrics.total_packets().max(1) as f32;
-        let err_rate = (metrics.total_errors() as f32 / packets).min(1.0);
-        let damp = (1.0 - err_rate).clamp(0.0, 1.0);
-        let raw = match kind {
-            LinkKind::DirectTcp | LinkKind::DirectUdp => 0.08,
-            LinkKind::TunnelTcp | LinkKind::TunnelUdp => 0.03,
-            LinkKind::Relay => 0.0,
-        };
-        raw * damp
     }
 
     pub fn get_best_session_for_peer(
@@ -189,8 +198,7 @@ impl SessionManager {
             let Some(metrics) = self.get_metrics(&session_id) else {
                 continue;
             };
-            let rank = self.session_send_priority(peer_id, &session_id, &metrics)
-                + Self::link_kind_bonus(session.kind(), &metrics);
+            let rank = self.strategy.rank(peer_id, &session_id, session.kind(), &metrics);
             let better = match &best {
                 None => true,
                 Some((_, prev)) => rank > *prev,
@@ -298,12 +306,10 @@ impl SessionManager {
 
     /// Distinct remote peers with at least one registered session.
     pub fn distinct_peer_count(&self) -> usize {
-        self.prune_stale_peer_index();
         self.by_peer.len()
     }
 
     pub fn is_connected_to_peer(&self, peer_id: &PeerId) -> bool {
-        self.prune_stale_peer_index();
         self.by_peer.contains_key(peer_id)
     }
 
@@ -344,14 +350,14 @@ impl SessionManager {
         // session. The reader holds an ingress-channel sender clone, so
         // joining it before shutdown closes the router ingress lets the
         // router drain cleanly. Bounded: a hung writer must not stall us.
-        if tokio::time::timeout(SESSION_JOIN_TIMEOUT, session.join_tasks())
+        if tokio::time::timeout(self.session_join_timeout, session.join_tasks())
             .await
             .is_err()
         {
             crate::warn!(
                 "[SessionManager] session '{}' tasks did not finish within {:?}",
                 session_id,
-                SESSION_JOIN_TIMEOUT
+                self.session_join_timeout
             );
         }
         close_result

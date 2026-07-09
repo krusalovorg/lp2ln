@@ -5,6 +5,16 @@ use std::time::{Duration, Instant};
 use crate::node::options::DirectUpgradeConfig;
 use crate::types::PeerId;
 
+pub trait TrafficDemandPolicy: Send + Sync {
+    fn record_fallback(&self, peer_id: PeerId, bytes: u64, cfg: &DirectUpgradeConfig);
+    fn pick_candidate(&self, cfg: &DirectUpgradeConfig) -> Option<PeerId>;
+    fn mark_dialing(&self, peer_id: &PeerId);
+    fn mark_nat_traversal(&self, peer_id: &PeerId);
+    fn mark_success(&self, peer_id: &PeerId);
+    fn mark_failure(&self, peer_id: &PeerId, cooldown: Duration);
+    fn mark_satisfied_by_existing_session(&self, peer_id: &PeerId);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpgradeState {
     Idle,
@@ -247,6 +257,36 @@ impl TrafficDemandTracker {
         e.normalize_cooldown(now);
         e.prune(window, now);
         e.window_stats()
+    }
+}
+
+impl TrafficDemandPolicy for TrafficDemandTracker {
+    fn record_fallback(&self, peer_id: PeerId, bytes: u64, cfg: &DirectUpgradeConfig) {
+        TrafficDemandTracker::record_fallback(self, peer_id, bytes, cfg);
+    }
+
+    fn pick_candidate(&self, cfg: &DirectUpgradeConfig) -> Option<PeerId> {
+        TrafficDemandTracker::pick_candidate(self, cfg)
+    }
+
+    fn mark_dialing(&self, peer_id: &PeerId) {
+        TrafficDemandTracker::mark_dialing(self, peer_id);
+    }
+
+    fn mark_nat_traversal(&self, peer_id: &PeerId) {
+        TrafficDemandTracker::mark_nat_traversal(self, peer_id);
+    }
+
+    fn mark_success(&self, peer_id: &PeerId) {
+        TrafficDemandTracker::mark_success(self, peer_id);
+    }
+
+    fn mark_failure(&self, peer_id: &PeerId, cooldown: Duration) {
+        TrafficDemandTracker::mark_failure(self, peer_id, cooldown);
+    }
+
+    fn mark_satisfied_by_existing_session(&self, peer_id: &PeerId) {
+        TrafficDemandTracker::mark_satisfied_by_existing_session(self, peer_id);
     }
 }
 

@@ -16,16 +16,6 @@ pub(crate) struct NodeSupervisor {
 }
 
 impl NodeSupervisor {
-    pub fn new() -> Self {
-        Self {
-            cancellation: CancellationToken::new(),
-            tasks: Mutex::new(Vec::new()),
-            shutdown_timeout: Duration::from_secs(10),
-        }
-    }
-
-    #[allow(dead_code)]
-    #[cfg(test)]
     pub fn with_shutdown_timeout(shutdown_timeout: Duration) -> Self {
         Self {
             cancellation: CancellationToken::new(),
