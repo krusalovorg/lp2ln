@@ -7,6 +7,7 @@ use std::fmt;
 pub enum LinkKind {
     DirectTcp,
     DirectUdp,
+    DirectQuic,
     TunnelTcp,
     TunnelUdp,
     Relay,
@@ -17,6 +18,7 @@ impl fmt::Display for LinkKind {
         match self {
             LinkKind::DirectTcp => write!(f, "tcp"),
             LinkKind::DirectUdp => write!(f, "udp"),
+            LinkKind::DirectQuic => write!(f, "quic"),
             LinkKind::TunnelTcp => write!(f, "tunnel_tcp"),
             LinkKind::TunnelUdp => write!(f, "tunnel_udp"),
             LinkKind::Relay => write!(f, "relay"),

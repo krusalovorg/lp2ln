@@ -10,6 +10,7 @@ use crate::crypto::NodeKeypair;
 use crate::logger::LoggerOptions;
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
 use crate::transport::obfuscation::ObfuscationConfig;
+use crate::transport::quic::QuicTransportOptions;
 use crate::types::PeerId;
 
 use super::options::{
@@ -86,6 +87,8 @@ struct NodeOptionsFile {
     transport_obfuscation: HashMap<String, ObfuscationConfig>,
     #[serde(default)]
     transport_obfuscation_enabled: HashMap<String, bool>,
+    #[serde(default)]
+    quic: QuicTransportOptions,
     #[serde(default)]
     topology_tuning: TopologyTuning,
     #[serde(default)]
@@ -209,6 +212,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
                 }
                 map
             },
+            quic: file.quic,
             topology_tuning: file.topology_tuning,
             flow_trace: file.flow_trace,
             debug_server: file.debug_server,
@@ -360,6 +364,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
                 .keys()
                 .map(|k| (k.clone(), true))
                 .collect(),
+            quic: opts.quic.clone(),
             topology_tuning: opts.topology_tuning.clone(),
             flow_trace: opts.flow_trace.clone(),
             debug_server: opts.debug_server.clone(),

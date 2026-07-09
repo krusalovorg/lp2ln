@@ -1,8 +1,10 @@
 pub mod obfuscation;
+pub mod quic;
 pub mod tcp;
 mod transport;
 pub mod udp;
 
+pub use quic::{QuicTransport, QuicTransportOptions};
 pub use transport::Transport;
 pub use transport::TransportContext;
 pub use transport::TunnelPunchParams;

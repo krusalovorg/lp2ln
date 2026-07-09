@@ -45,6 +45,7 @@ impl SessionSelectionStrategy for DefaultSessionStrategy {
             base - self.weights.w_latency * stale * 0.35 - self.weights.w_load * err_rate;
         let damp = (1.0 - err_rate).clamp(0.0, 1.0);
         let link_bonus = match kind {
+            LinkKind::DirectQuic => 0.10 * damp,
             LinkKind::DirectTcp | LinkKind::DirectUdp => 0.08 * damp,
             LinkKind::TunnelTcp | LinkKind::TunnelUdp => 0.03 * damp,
             LinkKind::Relay => 0.0,
@@ -112,6 +113,7 @@ impl SessionManager {
         match kind {
             LinkKind::DirectTcp | LinkKind::TunnelTcp => TransportProtocol::Tcp,
             LinkKind::DirectUdp | LinkKind::TunnelUdp => TransportProtocol::Udp,
+            LinkKind::DirectQuic => TransportProtocol::Quic,
             LinkKind::Relay => TransportProtocol::Relay,
         }
     }

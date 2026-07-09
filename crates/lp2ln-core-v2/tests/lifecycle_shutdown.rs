@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use lp2ln_core_v2::node::{
     NodeBuilder, NodeLifecycleError, NodeLifecycleState, NodeOptions, NodeRuntime,
 };
+use lp2ln_core_v2::transport::quic::{QuicTransport, QuicTransportOptions};
 use lp2ln_core_v2::transport::tcp::TcpTransport;
 
 fn test_options() -> NodeOptions {
@@ -21,6 +22,35 @@ async fn start_test_node() -> NodeRuntime {
     let mut node = build_test_node();
     node.start().await.expect("start node");
     node
+}
+
+#[tokio::test]
+async fn stop_terminates_quic_listener() {
+    let options = QuicTransportOptions::default();
+    let mut opts = NodeOptions::empty()
+        .with_listen("quic", "127.0.0.1:0".parse().expect("valid addr"));
+    opts.quic = options;
+    opts.enable_topology_maintenance = false;
+
+    let mut node = NodeBuilder::new()
+        .add_transport(Arc::new(QuicTransport::new_listener(
+            Some("127.0.0.1:0".parse().expect("valid addr")),
+            opts.quic.clone(),
+        )) as Arc<dyn lp2ln_core_v2::transport::Transport>)
+        .build(opts)
+        .expect("build node");
+
+    node.start().await.expect("start node");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let stop_started = Instant::now();
+    node.stop().await.expect("stop node");
+    assert!(
+        stop_started.elapsed() < Duration::from_secs(5),
+        "QUIC stop took too long: {:?}",
+        stop_started.elapsed()
+    );
+    assert_eq!(node.lifecycle_state(), NodeLifecycleState::Stopped);
 }
 
 #[tokio::test]

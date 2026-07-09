@@ -9,6 +9,7 @@ use crate::crypto::NodeKeypair;
 use crate::logger::LoggerOptions;
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
 use crate::transport::obfuscation::ObfuscationConfig;
+use crate::transport::quic::QuicTransportOptions;
 use crate::types::PeerId;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +294,7 @@ pub struct NodeOptions {
     pub catalog_max_peers: Option<usize>,
     pub peer_discovery_random_fraction: f32,
     pub transport_obfuscation: HashMap<String, ObfuscationConfig>,
+    pub quic: QuicTransportOptions,
     pub topology_tuning: TopologyTuning,
     pub flow_trace: FlowTraceOptions,
     pub debug_server: DebugServerOptions,
@@ -330,6 +332,7 @@ impl NodeOptions {
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
             transport_obfuscation: default_transport_obfuscation(),
+            quic: QuicTransportOptions::default(),
             topology_tuning: TopologyTuning::default(),
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
@@ -373,6 +376,7 @@ impl NodeOptions {
             catalog_max_peers: None,
             peer_discovery_random_fraction: 0.33,
             transport_obfuscation: HashMap::new(),
+            quic: QuicTransportOptions::default(),
             topology_tuning: TopologyTuning::default(),
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
@@ -661,5 +665,6 @@ pub(super) fn default_transport_obfuscation() -> HashMap<String, ObfuscationConf
     HashMap::from([
         ("tcp".to_string(), ObfuscationConfig::default()),
         ("udp".to_string(), ObfuscationConfig::default()),
+        ("quic".to_string(), ObfuscationConfig::default()),
     ])
 }

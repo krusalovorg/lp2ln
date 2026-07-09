@@ -113,6 +113,7 @@ impl NodeRuntime {
                 catalog_max_peers: options.catalog_max_peers,
                 peer_discovery_random_fraction: options.peer_discovery_random_fraction,
                 transport_obfuscation: options.transport_obfuscation,
+                quic: options.quic,
                 topology_tuning: options.topology_tuning,
                 flow_trace: options.flow_trace,
                 debug_server: options.debug_server,

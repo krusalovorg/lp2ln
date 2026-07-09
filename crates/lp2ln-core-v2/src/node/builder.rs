@@ -4,6 +4,7 @@ use crate::node::runtime::NodeRuntime;
 use crate::packet_processor::PacketProcessor;
 use crate::transport::Transport;
 use crate::transport::tcp::TcpTransport;
+use crate::transport::quic::QuicTransport;
 use crate::transport::udp::UdpTransport;
 use anyhow::Result;
 use std::sync::Arc;
@@ -50,6 +51,16 @@ impl NodeBuilder {
             Arc::new(UdpTransport::new()) as Arc<dyn Transport>
         };
         self.transports.push(udp_transport);
+
+        if options.listens.contains_key("quic") {
+            let listen_addr = options.listens.get("quic").map(|r| *r);
+            let quic_transport = Arc::new(QuicTransport::new_listener(
+                listen_addr,
+                options.quic.clone(),
+            )) as Arc<dyn Transport>;
+            self.transports.push(quic_transport);
+        }
+
         self
     }
 

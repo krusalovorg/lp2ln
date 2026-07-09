@@ -55,6 +55,7 @@ pub(crate) fn spawn_listener_transports(
         let service_name: &'static str = match transport_name.as_str() {
             "tcp" => "transport:tcp",
             "udp" => "transport:udp",
+            "quic" => "transport:quic",
             _ => "transport:other",
         };
         let protocol = transport_protocol(&transport_name);
