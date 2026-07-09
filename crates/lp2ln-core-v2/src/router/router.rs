@@ -4,19 +4,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use k256::ecdsa::SigningKey;
 use rand::Rng;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::{
-    crypto::secure_channel::{derive_shared_key, encode_secure_envelope, is_secure_envelope},
-    crypto::signature::sign_packet,
     node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
     packet::Packet,
-    packet_processor::{ChunkAssembler, ChunkAssemblerResult, PacketProcessor},
+    packet_processor::PacketProcessor,
     protocol::control::NetworkControlPayload,
+    router::dispatch::PacketIngressDispatcher,
+    router::egress::PacketEgressSecurity,
     services::{MetricsProvider, PacketPublisher, SessionRegistry, SessionSelector},
     sessions::{
         LinkKind, Session, SessionMetrics, manager::SessionManager, session::IncomingPacket,
@@ -28,14 +27,6 @@ pub const ROUTER_INCOMING_QUEUE_CAP: usize = 16384;
 const ROUTER_BROADCAST_CAP: usize = 4096;
 const ROUTER_PROCESS_SEMAPHORE_PERMITS: usize = 256;
 const ROUTER_FALLBACK_FANOUT: usize = 4;
-
-/// Max idle wait between packets while draining the ingress buffer at
-/// shutdown. If no packet arrives within this window the queue is treated
-/// as drained.
-const ROUTER_DRAIN_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
-/// Overall budget for the shutdown drain. Kept below the supervisor's
-/// per-task join timeout so the router still finishes within shutdown.
-const ROUTER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Outcome of [`Router::run`]. Replaces the previous `Result<()>` plus
 /// `is_ingress_closed()` side-channel so the supervised loop decides whether
@@ -54,25 +45,19 @@ pub enum RouterRunOutcome {
 
 pub struct Router {
     session_manager: Arc<SessionManager>,
-    packet_processor: Arc<dyn PacketProcessor>,
-    signing_key: Option<Arc<SigningKey>>,
-    chunk_assembler: Arc<ChunkAssembler>,
+    egress: PacketEgressSecurity,
+    ingress: PacketIngressDispatcher,
     incoming_tx: Arc<Mutex<Option<mpsc::Sender<IncomingPacket>>>>,
     incoming_broadcast_tx: broadcast::Sender<IncomingPacket>,
-    next_request_id: AtomicU64,
-    next_secure_seq: AtomicU64,
-    our_peer_id: String,
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
-    packet_tasks: TaskTracker,
-    packet_cancel: CancellationToken,
 }
 
 impl Router {
     pub fn new(
         session_manager: Arc<SessionManager>,
         packet_processor: Arc<dyn PacketProcessor>,
-        signing_key: Option<Arc<SigningKey>>,
+        signing_key: Option<Arc<k256::ecdsa::SigningKey>>,
         our_peer_id: impl Into<String>,
         direct_upgrade: Option<DirectUpgradeRouterSink>,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
@@ -90,7 +75,7 @@ impl Router {
     pub fn new_with_caps(
         session_manager: Arc<SessionManager>,
         packet_processor: Arc<dyn PacketProcessor>,
-        signing_key: Option<Arc<SigningKey>>,
+        signing_key: Option<Arc<k256::ecdsa::SigningKey>>,
         our_peer_id: impl Into<String>,
         direct_upgrade: Option<DirectUpgradeRouterSink>,
         incoming_cap: usize,
@@ -98,55 +83,42 @@ impl Router {
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id = our_peer_id.into();
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
-        let (incoming_broadcast_tx, _rx) =
-            broadcast::channel::<IncomingPacket>(broadcast_cap);
+        let (incoming_broadcast_tx, _rx) = broadcast::channel::<IncomingPacket>(broadcast_cap);
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
+        let packet_tasks = TaskTracker::new();
+        let packet_cancel = CancellationToken::new();
+        let chunk_assembler = Arc::new(crate::packet_processor::ChunkAssembler::new(
+            our_peer_id.clone(),
+        ));
+        let ingress = PacketIngressDispatcher::new(
+            session_manager.clone(),
+            packet_processor,
+            chunk_assembler,
+            incoming_broadcast_tx.clone(),
+            our_peer_id.clone(),
+            packet_tasks,
+            packet_cancel,
+        );
+        let egress = PacketEgressSecurity::new(signing_key, our_peer_id.clone(), start_id);
+
         (
             Self {
                 session_manager,
-                packet_processor,
-                signing_key,
-                chunk_assembler: Arc::new(ChunkAssembler::new(our_peer_id.clone())),
+                egress,
+                ingress,
                 incoming_tx,
                 incoming_broadcast_tx,
-                next_request_id: AtomicU64::new(start_id),
-                next_secure_seq: AtomicU64::new(1),
-                our_peer_id,
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
-                packet_tasks: TaskTracker::new(),
-                packet_cancel: CancellationToken::new(),
             },
             incoming_rx,
         )
     }
 
-    fn prepare_outgoing(&self, mut packet: Packet) -> Result<Packet> {
-        if packet.request_id.is_none() {
-            let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            packet.request_id = Some(id);
-        }
-        if !packet.data.is_empty()
-            && !packet.receiver.is_empty()
-            && packet.receiver != self.our_peer_id
-            && !is_secure_envelope(&packet.data)
-        {
-            let key = derive_shared_key(
-                self.signing_key
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Secure transport requires signing key"))?
-                    .as_ref(),
-                &packet.receiver,
-            )?;
-            let seq = self.next_secure_seq.fetch_add(1, Ordering::Relaxed);
-            packet.data = encode_secure_envelope(&packet.data, key, seq)?;
-        }
-        if let Some(ref key) = self.signing_key {
-            sign_packet(&mut packet, key).map_err(anyhow::Error::msg)?;
-        }
-        Ok(packet)
+    fn prepare_outgoing(&self, packet: Packet) -> Result<Packet> {
+        self.egress.prepare_outgoing(packet)
     }
 
     fn try_record_direct_upgrade_fallback(&self, peer_id: &PeerId, bytes: u64) {
@@ -187,8 +159,6 @@ impl Router {
                 return tx.clone();
             }
         }
-        // Ingress is closed: hand out a sender whose receiver is already
-        // dropped so callers get a send error instead of a panic.
         let (tx, _rx) = mpsc::channel(1);
         tx
     }
@@ -206,14 +176,9 @@ impl Router {
             .unwrap_or(true)
     }
 
-    /// Bounded drain of in-flight per-packet processing tasks.
-    ///
-    /// Lets tasks finish within `drain_timeout`; tasks still running after
-    /// that are cancelled via the packet cancellation token and awaited
-    /// briefly so they do not outlive shutdown.
     pub async fn shutdown_packet_tasks(&self, drain_timeout: std::time::Duration) {
-        self.packet_tasks.close();
-        if tokio::time::timeout(drain_timeout, self.packet_tasks.wait())
+        self.ingress.packet_tasks().close();
+        if tokio::time::timeout(drain_timeout, self.ingress.packet_tasks().wait())
             .await
             .is_err()
         {
@@ -221,10 +186,12 @@ impl Router {
                 "[Router] packet tasks did not drain within {:?}, cancelling",
                 drain_timeout
             );
-            self.packet_cancel.cancel();
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(1), self.packet_tasks.wait())
-                    .await;
+            self.ingress.packet_cancel().cancel();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.ingress.packet_tasks().wait(),
+            )
+            .await;
         }
     }
 
@@ -233,7 +200,7 @@ impl Router {
     }
 
     pub(crate) fn broadcast_incoming_after_decrypt(&self, incoming: IncomingPacket) {
-        let _ = self.incoming_broadcast_tx.send(incoming);
+        self.ingress.broadcast_incoming_after_decrypt(incoming);
     }
 
     pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
@@ -301,9 +268,6 @@ impl Router {
             }
         }
 
-        // Control packets should not use flood fallback.
-        // If we lost a direct session temporarily (e.g. during pruning), flooding
-        // creates many duplicate forwards and max_hops noise.
         if is_control_packet {
             return Err(anyhow::anyhow!(
                 "No direct session for control packet to '{}'",
@@ -405,91 +369,6 @@ impl Router {
         self.session_manager.get_all_peers()
     }
 
-    /// Routes a single received packet: records metrics, runs chunk
-    /// reassembly, broadcasts to subscribers, and spawns the bounded
-    /// per-packet processing task.
-    fn dispatch_incoming(
-        self: &Arc<Self>,
-        incoming: IncomingPacket,
-        semaphore: &Arc<tokio::sync::Semaphore>,
-    ) {
-        let session_id = SessionId::from(incoming.session_id.clone());
-        let bytes_estimate = incoming.packet.wire_size_estimate();
-        MetricsProvider::record_packets_received(
-            self.session_manager.as_ref(),
-            &session_id,
-            bytes_estimate,
-        );
-
-        let to_process = if ChunkAssembler::is_chunk_packet(&incoming.packet) {
-            match self.chunk_assembler.add(incoming) {
-                ChunkAssemblerResult::Merged(ip) | ChunkAssemblerResult::PassThrough(ip) => {
-                    Some(ip)
-                }
-                ChunkAssemblerResult::Collecting => None,
-            }
-        } else {
-            Some(incoming)
-        };
-
-        let Some(mut incoming) = to_process else {
-            return;
-        };
-
-        if incoming.from_node.is_none() && !incoming.packet.sender.is_empty() {
-            incoming.from_node = Some(incoming.packet.sender.clone());
-        }
-
-        let skip_early_ipc = is_secure_envelope(&incoming.packet.data)
-            && (incoming.packet.receiver == self.our_peer_id
-                || incoming.packet.receiver.is_empty());
-        if !skip_early_ipc {
-            let _ = self.incoming_broadcast_tx.send(incoming.clone());
-        }
-
-        let processor = self.packet_processor.clone();
-        let router = self.clone();
-        let semaphore = semaphore.clone();
-        let packet_cancel = self.packet_cancel.clone();
-        self.packet_tasks.spawn(async move {
-            tokio::select! {
-                _ = packet_cancel.cancelled() => {}
-                _ = async move {
-                    let Ok(permit) = semaphore.acquire_owned().await else {
-                        return;
-                    };
-                    let _permit = permit;
-                    processor.process(incoming, router).await;
-                } => {}
-            }
-        });
-    }
-
-    /// Bounded drain of the ingress buffer at shutdown. Producers are already
-    /// cancelled by this point, so the queue only shrinks. Pulls and
-    /// dispatches packets until the queue stays idle for `ROUTER_DRAIN_IDLE`,
-    /// the channel closes, or `ROUTER_DRAIN_BUDGET` elapses — so buffered
-    /// packets are processed instead of silently dropped.
-    async fn drain_incoming(
-        self: &Arc<Self>,
-        incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
-        semaphore: &Arc<tokio::sync::Semaphore>,
-    ) {
-        let drain_deadline = tokio::time::Instant::now() + ROUTER_DRAIN_BUDGET;
-        loop {
-            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let idle = ROUTER_DRAIN_IDLE.min(remaining);
-            match tokio::time::timeout(idle, incoming_rx.recv()).await {
-                Ok(Some(incoming)) => self.dispatch_incoming(incoming, semaphore),
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-    }
-
     pub async fn run(
         self: Arc<Self>,
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
@@ -502,9 +381,9 @@ impl Router {
         loop {
             let incoming = tokio::select! {
                 _ = cancel.cancelled() => {
-                    // Intentional shutdown: drain whatever readers already
-                    // enqueued before exiting so the buffer is not dropped.
-                    self.drain_incoming(incoming_rx, &semaphore).await;
+                    self.ingress
+                        .drain_incoming(self.clone(), incoming_rx, &semaphore)
+                        .await;
                     return RouterRunOutcome::Cancelled;
                 }
                 maybe = incoming_rx.recv() => match maybe {
@@ -512,10 +391,10 @@ impl Router {
                     None => break,
                 },
             };
-            self.dispatch_incoming(incoming, &semaphore);
+            self.ingress
+                .dispatch_incoming(self.clone(), incoming, &semaphore);
         }
         if self.is_ingress_closed() {
-            // Intentional shutdown: ingress was closed by NodeRuntime::stop().
             RouterRunOutcome::IngressClosed
         } else {
             RouterRunOutcome::ChannelClosedUnexpectedly

@@ -11,6 +11,8 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::{Session, SessionMetrics};
 use crate::types::{PeerId, SessionId};
 
+use crate::event_core::prelude::{CoreBus, CoreEvent, SessionEvent, TransportProtocol};
+
 pub trait SessionSelectionStrategy: Send + Sync {
     fn rank(
         &self,
@@ -61,6 +63,7 @@ pub struct SessionManager {
     peer_weights: PeerScoreWeights,
     strategy: Arc<dyn SessionSelectionStrategy>,
     session_join_timeout: Duration,
+    session_events: Option<CoreBus>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +99,30 @@ impl SessionManager {
             peer_weights,
             strategy,
             session_join_timeout: Duration::from_secs(2),
+            session_events: None,
         }
+    }
+
+    pub fn with_event_bus(mut self, bus: CoreBus) -> Self {
+        self.session_events = Some(bus);
+        self
+    }
+
+    fn link_kind_to_protocol(kind: LinkKind) -> TransportProtocol {
+        match kind {
+            LinkKind::DirectTcp | LinkKind::TunnelTcp => TransportProtocol::Tcp,
+            LinkKind::DirectUdp | LinkKind::TunnelUdp => TransportProtocol::Udp,
+            LinkKind::Relay => TransportProtocol::Relay,
+        }
+    }
+
+    fn emit_session_event(&self, event: SessionEvent) {
+        let Some(bus) = self.session_events.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = bus.emit(CoreEvent::Session(event)).await;
+        });
     }
 
     pub fn with_join_timeout(mut self, d: Duration) -> Self {
@@ -128,20 +154,35 @@ impl SessionManager {
         session: Arc<dyn Session + Send + Sync>,
     ) {
         self.peer_scores.touch_peer(&peer_id);
-        self.add_to_protocol(session.kind(), session_id.clone());
+        let kind = session.kind();
+        self.add_to_protocol(kind, session_id.clone());
         self.sessions.insert(session_id.clone(), session);
         self.metrics
             .insert(session_id.clone(), SessionMetrics::new());
         self.session_to_peer
             .insert(session_id.clone(), peer_id.clone());
-        self.by_peer.entry(peer_id).or_default().push(session_id);
+        self.by_peer
+            .entry(peer_id.clone())
+            .or_default()
+            .push(session_id.clone());
+        self.emit_session_event(SessionEvent::Accepted {
+            session_id,
+            peer_id: Some(peer_id),
+            transport: Self::link_kind_to_protocol(kind),
+        });
     }
 
     pub fn register_session(&self, session_id: SessionId, session: Arc<dyn Session + Send + Sync>) {
-        self.add_to_protocol(session.kind(), session_id.clone());
+        let kind = session.kind();
+        self.add_to_protocol(kind, session_id.clone());
         self.sessions.insert(session_id.clone(), session);
         self.metrics
             .insert(session_id.clone(), SessionMetrics::new());
+        self.emit_session_event(SessionEvent::Accepted {
+            session_id,
+            peer_id: None,
+            transport: Self::link_kind_to_protocol(kind),
+        });
     }
 
     pub fn set_peer_for_session(&self, session_id: SessionId, peer_id: PeerId) {
@@ -151,7 +192,26 @@ impl SessionManager {
         self.peer_scores.touch_peer(&peer_id);
         self.session_to_peer
             .insert(session_id.clone(), peer_id.clone());
-        self.by_peer.entry(peer_id).or_default().push(session_id);
+        self.by_peer
+            .entry(peer_id.clone())
+            .or_default()
+            .push(session_id.clone());
+        self.emit_session_event(SessionEvent::BoundToPeer {
+            session_id,
+            peer_id,
+        });
+    }
+
+    pub fn peer_has_link_kind(&self, peer_id: &PeerId, kind: LinkKind) -> bool {
+        let Some(ids) = self.get_session_ids(peer_id) else {
+            return false;
+        };
+        ids.iter().any(|id| {
+            self.sessions
+                .get(id)
+                .map(|s| s.kind() == kind)
+                .unwrap_or(false)
+        })
     }
 
     pub fn get(&self, session_id: &SessionId) -> Option<Arc<dyn Session + Send + Sync>> {
@@ -198,7 +258,9 @@ impl SessionManager {
             let Some(metrics) = self.get_metrics(&session_id) else {
                 continue;
             };
-            let rank = self.strategy.rank(peer_id, &session_id, session.kind(), &metrics);
+            let rank = self
+                .strategy
+                .rank(peer_id, &session_id, session.kind(), &metrics);
             let better = match &best {
                 None => true,
                 Some((_, prev)) => rank > *prev,
@@ -360,6 +422,11 @@ impl SessionManager {
                 self.session_join_timeout
             );
         }
+        self.emit_session_event(SessionEvent::Closed {
+            session_id: session_id.clone(),
+            peer_id,
+            reason: None,
+        });
         close_result
     }
 

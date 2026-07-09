@@ -18,9 +18,21 @@ use crate::types::{PeerId, SessionId};
 pub const PING: &[u8] = b"ping";
 pub const PONG: &[u8] = b"pong";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessAction {
+    Delivered,
+    Dropped {
+        reason: &'static str,
+    },
+    CloseSession {
+        session_id: SessionId,
+        reason: &'static str,
+    },
+}
+
 #[async_trait]
 pub trait PacketProcessor: Send + Sync {
-    async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>);
+    async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>) -> ProcessAction;
 }
 
 pub struct DefaultPacketProcessor {
@@ -31,6 +43,7 @@ pub struct DefaultPacketProcessor {
     nat_state: Arc<NatTraversalState>,
     local_keypair: NodeKeypair,
     replay_windows: Arc<DashMap<String, ReplayWindow>>,
+    session_drop_counts: Arc<DashMap<SessionId, u32>>,
 }
 
 impl DefaultPacketProcessor {
@@ -50,14 +63,31 @@ impl DefaultPacketProcessor {
             nat_state,
             local_keypair,
             replay_windows: Arc::new(DashMap::new()),
+            session_drop_counts: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn record_drop(&self, session_id: SessionId, reason: &'static str) -> ProcessAction {
+        let count = self
+            .session_drop_counts
+            .entry(session_id.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        if *count >= 3 {
+            self.session_drop_counts.remove(&session_id);
+            ProcessAction::CloseSession { session_id, reason }
+        } else {
+            ProcessAction::Dropped { reason }
         }
     }
 }
 
 #[async_trait]
 impl PacketProcessor for DefaultPacketProcessor {
-    async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>) {
+    async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>) -> ProcessAction {
         let mut packet = incoming_packet.packet.clone();
+        let session_id = SessionId::from(incoming_packet.session_id.clone());
+
         if !self.allow_unsigned_packets {
             if let Err(e) = verify_packet(&packet) {
                 crate::processor!(
@@ -65,11 +95,9 @@ impl PacketProcessor for DefaultPacketProcessor {
                     packet.sender,
                     e
                 );
-                return;
+                return self.record_drop(session_id, "invalid signature");
             }
         }
-
-        let session_id = SessionId::from(incoming_packet.session_id.clone());
 
         if let Some(bound_peer) = incoming_packet.from_node.as_deref() {
             if bound_peer != packet.sender {
@@ -78,7 +106,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                     bound_peer,
                     packet.sender
                 );
-                return;
+                return self.record_drop(session_id, "session peer mismatch");
             }
         }
 
@@ -89,7 +117,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                 Ok(k) => k,
                 Err(e) => {
                     crate::processor!("Failed to derive secure key from {}: {}", packet.sender, e);
-                    return;
+                    return self.record_drop(session_id, "secure key derivation failed");
                 }
             };
             let (seq, plaintext) = match decode_secure_envelope(&packet.data, key) {
@@ -100,7 +128,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                         packet.sender,
                         e
                     );
-                    return;
+                    return self.record_drop(session_id, "decrypt failed");
                 }
             };
             let mut window = self
@@ -113,7 +141,7 @@ impl PacketProcessor for DefaultPacketProcessor {
                     packet.sender,
                     seq
                 );
-                return;
+                return self.record_drop(session_id, "replay detected");
             }
             packet.data = plaintext;
             router.broadcast_incoming_after_decrypt(IncomingPacket {
@@ -149,7 +177,8 @@ impl PacketProcessor for DefaultPacketProcessor {
             )
             .await
             {
-                return;
+                self.session_drop_counts.remove(&session_id);
+                return ProcessAction::Delivered;
             }
             super::local::handle_local_packet(
                 &packet.data,
@@ -173,5 +202,7 @@ impl PacketProcessor for DefaultPacketProcessor {
             )
             .await;
         }
+        self.session_drop_counts.remove(&session_id);
+        ProcessAction::Delivered
     }
 }

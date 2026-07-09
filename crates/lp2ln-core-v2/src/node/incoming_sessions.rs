@@ -580,7 +580,13 @@ mod tests {
 
     #[async_trait]
     impl PacketProcessor for NoopProcessor {
-        async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {}
+        async fn process(
+            &self,
+            _incoming_packet: IncomingPacket,
+            _router: Arc<Router>,
+        ) -> crate::packet_processor::ProcessAction {
+            crate::packet_processor::ProcessAction::Delivered
+        }
     }
 
     fn signed_bootstrap_descriptor(active_connections: u16) -> NodeDescriptor {

@@ -19,7 +19,7 @@ use lp2ln_core_v2::{
         nat_traversal::{NatSessionStage, NatTraversalState},
     },
     packet::Packet,
-    packet_processor::PacketProcessor,
+    packet_processor::{PacketProcessor, ProcessAction},
     peer_score::{PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights},
     protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload},
     router::{Router, RouterRunOutcome},
@@ -86,7 +86,13 @@ struct NoopProcessor;
 
 #[async_trait]
 impl PacketProcessor for NoopProcessor {
-    async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {}
+    async fn process(
+        &self,
+        _incoming_packet: IncomingPacket,
+        _router: Arc<Router>,
+    ) -> ProcessAction {
+        ProcessAction::Delivered
+    }
 }
 
 struct CountingProcessor {
@@ -95,8 +101,13 @@ struct CountingProcessor {
 
 #[async_trait]
 impl PacketProcessor for CountingProcessor {
-    async fn process(&self, _incoming_packet: IncomingPacket, _router: Arc<Router>) {
+    async fn process(
+        &self,
+        _incoming_packet: IncomingPacket,
+        _router: Arc<Router>,
+    ) -> ProcessAction {
         self.count.fetch_add(1, Ordering::Relaxed);
+        ProcessAction::Delivered
     }
 }
 

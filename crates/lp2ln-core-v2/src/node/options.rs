@@ -304,6 +304,12 @@ pub struct NodeOptions {
     pub router_broadcast_cap: usize,
     /// When false the topology-maintenance task is not started (useful for test nodes).
     pub enable_topology_maintenance: bool,
+    /// Broadcast capacity for the internal CoreBus observer channel.
+    pub event_bus_broadcast_cap: usize,
+    /// When true, permanent subsystem degradation triggers graceful `stop()`.
+    pub stop_on_permanent_degradation: bool,
+    /// When true, topology reacts to session-close events via CoreBus handlers.
+    pub topology_react_to_session_events: bool,
 }
 
 impl NodeOptions {
@@ -334,6 +340,9 @@ impl NodeOptions {
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
             enable_topology_maintenance: true,
+            event_bus_broadcast_cap: 4096,
+            stop_on_permanent_degradation: false,
+            topology_react_to_session_events: false,
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -374,6 +383,9 @@ impl NodeOptions {
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
             enable_topology_maintenance: true,
+            event_bus_broadcast_cap: 4096,
+            stop_on_permanent_degradation: false,
+            topology_react_to_session_events: false,
             logger_options: Some(LoggerOptions::default()),
         }
     }

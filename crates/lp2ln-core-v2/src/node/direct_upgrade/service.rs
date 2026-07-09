@@ -308,7 +308,8 @@ mod service_tests {
             &self,
             _incoming_packet: crate::sessions::session::IncomingPacket,
             _router: Arc<Router>,
-        ) {
+        ) -> crate::packet_processor::ProcessAction {
+            crate::packet_processor::ProcessAction::Delivered
         }
     }
 

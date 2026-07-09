@@ -12,6 +12,7 @@ mod descriptor;
 mod dialing;
 mod packet_helpers;
 mod policy;
+mod session_reactions;
 mod state;
 
 use self::policy::compute_policy_snapshot;
@@ -38,6 +39,7 @@ use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
 use dialing::{build_dial_plan, execute_dial_plan};
 use packet_helpers::{control_packet, handshake_packet, observe_failure_and_close};
+pub use session_reactions::{SessionRedialQueue, TopologySessionReactionHandler};
 
 #[derive(Clone)]
 pub(crate) struct BootstrapDialDedupe {
@@ -391,6 +393,8 @@ pub(crate) async fn run_topology_maintenance_loop(
     nat_state: Arc<NatTraversalState>,
     bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
     bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
+    session_redial_queue: Option<Arc<SessionRedialQueue>>,
+    react_to_session_events: bool,
 ) -> anyhow::Result<()> {
     let initial_jitter = (our_peer_maint
         .bytes()
@@ -424,6 +428,13 @@ pub(crate) async fn run_topology_maintenance_loop(
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = interval.tick() => {}
+        }
+        if react_to_session_events {
+            if let Some(queue) = session_redial_queue.as_ref() {
+                for peer_id in queue.drain_ready(now_ms()) {
+                    state.dial_cooldown_until.remove(&peer_id);
+                }
+            }
         }
         process_nat_jobs(&loop_ctx, &cancel).await;
         if cancel.is_cancelled() {
