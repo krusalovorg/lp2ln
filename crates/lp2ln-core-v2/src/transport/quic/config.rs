@@ -13,6 +13,36 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_QUIC_ALPN: &str = "lp2ln/1";
+pub const H3_ALPN: &[u8] = b"h3";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MasqueradeMode {
+    #[default]
+    Static404,
+    // ponytail: reverse_proxy not implemented — add when proxy_url is needed in production
+    ReverseProxy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MasqueradeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: MasqueradeMode,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+impl Default for MasqueradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: MasqueradeMode::Static404,
+            proxy_url: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuicTlsConfig {
@@ -48,6 +78,8 @@ pub struct QuicTransportOptions {
     pub initial_mtu: u16,
     #[serde(default)]
     pub tls: QuicTlsConfig,
+    #[serde(default)]
+    pub masquerade: MasqueradeConfig,
 }
 
 impl Default for QuicTransportOptions {
@@ -57,6 +89,7 @@ impl Default for QuicTransportOptions {
             max_concurrent_bidi_streams: default_max_concurrent_bidi_streams(),
             initial_mtu: default_initial_mtu(),
             tls: QuicTlsConfig::default(),
+            masquerade: MasqueradeConfig::default(),
         }
     }
 }
@@ -79,7 +112,11 @@ pub fn build_server_config(options: &QuicTransportOptions) -> Result<ServerConfi
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("invalid QUIC server TLS material")?;
-    rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn);
+    let mut alpn = alpn_bytes(&options.tls.alpn);
+    if options.masquerade.enabled && !alpn.contains(&H3_ALPN.to_vec()) {
+        alpn.push(H3_ALPN.to_vec());
+    }
+    rustls_config.alpn_protocols = alpn;
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(rustls_config).context("quic server crypto")?,

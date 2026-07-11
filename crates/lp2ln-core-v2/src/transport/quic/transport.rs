@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
-use crate::transport::quic::config::{QuicTransportOptions, build_client_config, build_server_config};
+use crate::transport::quic::config::{
+    MasqueradeConfig, QuicTransportOptions, build_client_config, build_server_config,
+};
+use crate::transport::quic::masquerade;
 use crate::transport::quic::session::QuicSession;
 use crate::transport::transport::TransportContext;
-use crate::transport::{
-    ACCEPT_TASK_JOIN_TIMEOUT, Transport, join_accept_task,
-};
+use crate::transport::{ACCEPT_TASK_JOIN_TIMEOUT, Transport, join_accept_task};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use quinn::Endpoint;
@@ -64,12 +65,41 @@ impl QuicTransport {
     }
 }
 
+fn connection_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    use quinn::crypto::rustls::HandshakeData;
+    conn.handshake_data()?
+        .downcast::<HandshakeData>()
+        .ok()
+        .and_then(|d| d.protocol.clone())
+}
+
 async fn handle_incoming_connection(
     endpoint: Arc<Endpoint>,
     connection: quinn::Connection,
     incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
+    masquerade_config: Option<MasqueradeConfig>,
 ) {
     let remote = connection.remote_address();
+    let alpn = connection_alpn(&connection);
+
+    // Route h3 active probes to masquerade handler; LP2LN traffic continues below.
+    if alpn.as_deref() == Some(b"h3") {
+        match masquerade_config {
+            Some(cfg) if cfg.enabled => {
+                crate::info!("[QuicTransport] h3 probe from {}, serving masquerade", remote);
+                masquerade::serve(connection, cfg).await;
+            }
+            _ => {
+                crate::warn!(
+                    "[QuicTransport] h3 probe from {} but masquerade disabled, dropping",
+                    remote
+                );
+                connection.close(0u32.into(), b"");
+            }
+        }
+        return;
+    }
+
     crate::info!("[QuicTransport] New incoming connection from {}", remote);
 
     let (send, recv) = match connection.accept_bi().await {
@@ -157,6 +187,12 @@ impl Transport for QuicTransport {
 
         let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
         let endpoint_for_accept = endpoint.clone();
+        let masquerade_cfg = if self.options.masquerade.enabled {
+            Some(self.options.masquerade.clone())
+        } else {
+            None
+        };
+
         let accept_handle = tokio::spawn(async move {
             loop {
                 let Some(incoming) = endpoint_for_accept.accept().await else {
@@ -164,6 +200,7 @@ impl Transport for QuicTransport {
                 };
                 let incoming_sessions_tx = incoming_sessions_tx.clone();
                 let endpoint = endpoint_for_accept.clone();
+                let masquerade_cfg = masquerade_cfg.clone();
                 tokio::spawn(async move {
                     let connection = match incoming.await {
                         Ok(conn) => conn,
@@ -172,7 +209,13 @@ impl Transport for QuicTransport {
                             return;
                         }
                     };
-                    handle_incoming_connection(endpoint, connection, incoming_sessions_tx).await;
+                    handle_incoming_connection(
+                        endpoint,
+                        connection,
+                        incoming_sessions_tx,
+                        masquerade_cfg,
+                    )
+                    .await;
                 });
             }
         });
