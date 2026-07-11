@@ -127,6 +127,7 @@ impl NodeRuntime {
                 event_bus_broadcast_cap: options.event_bus_broadcast_cap,
                 stop_on_permanent_degradation: options.stop_on_permanent_degradation,
                 topology_react_to_session_events: options.topology_react_to_session_events,
+                dial_policy: options.dial_policy,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,

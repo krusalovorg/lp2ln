@@ -338,6 +338,22 @@ impl SessionManager {
         self.sessions.iter().map(|e| e.key().clone()).collect()
     }
 
+    /// Returns (peer_id, session_id) for all sessions of the given link kind.
+    pub fn sessions_by_kind(&self, kind: LinkKind) -> Vec<(PeerId, SessionId)> {
+        let Some(guard) = self.by_protocol.get(&kind) else {
+            return vec![];
+        };
+        let ids: Vec<SessionId> = guard.value().clone();
+        drop(guard);
+        ids.into_iter()
+            .filter_map(|sid| {
+                self.session_to_peer
+                    .get(&sid)
+                    .map(|pid| (pid.clone(), sid))
+            })
+            .collect()
+    }
+
     pub fn debug_sessions(&self) -> Vec<SessionDebugEntry> {
         self.sessions
             .iter()

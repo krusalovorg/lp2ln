@@ -1,13 +1,20 @@
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::crypto::signature::verify_packet;
+use crate::event_core::prelude::{
+    CoreEvent, ServiceDescriptor, ServiceKind, TransportEvent, TransportProtocol,
+};
 use crate::packet::Packet;
 use crate::protocol::handshake::decode_hello;
 use crate::sessions::session::{IncomingPacket, LinkKind, Session};
+use crate::transport::quic::adaptive::AdaptiveLossConfig;
 use crate::transport::tcp::codec::{decode_packet, encode_packet, read_frame, write_frame};
 use anyhow::Result;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -47,8 +54,9 @@ pub struct QuicSession {
     connection: Connection,
     // Endpoint must outlive the connection (quinn requirement).
     _endpoint: Arc<Endpoint>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
     task_tracker: tokio_util::task::TaskTracker,
+    pub in_compensate: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -144,11 +152,17 @@ impl QuicSession {
         recv: RecvStream,
         peer_id: Option<String>,
         kind: LinkKind,
+        event_tx: Option<mpsc::Sender<CoreEvent>>,
+        adaptive: Option<AdaptiveLossConfig>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown = CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
+        let in_compensate = Arc::new(AtomicBool::new(false));
+
+        // Clone connection before it's moved into the struct (for monitor task).
+        let monitor_connection = connection.clone();
 
         let session = Arc::new(Self {
             id,
@@ -156,10 +170,11 @@ impl QuicSession {
             kind,
             tx,
             read: tokio::sync::Mutex::new(recv),
-            connection: connection.clone(),
+            connection,
             _endpoint: endpoint,
             shutdown: shutdown.clone(),
             task_tracker: task_tracker.clone(),
+            in_compensate: in_compensate.clone(),
         });
 
         let mut writer = send;
@@ -193,6 +208,25 @@ impl QuicSession {
             let _ = writer.finish();
         });
 
+        // Spawn loss monitor if adaptive loss is enabled and we have an event channel.
+        if let (Some(config), Some(tx)) = (adaptive, event_tx) {
+            if config.enabled {
+                let sid = session.id[..8.min(session.id.len())].to_string();
+                let mon_shutdown = shutdown.clone();
+                task_tracker.spawn(async move {
+                    run_loss_monitor(
+                        monitor_connection,
+                        config,
+                        tx,
+                        in_compensate,
+                        sid,
+                        mon_shutdown,
+                    )
+                    .await;
+                });
+            }
+        }
+
         Ok(session)
     }
 
@@ -217,6 +251,72 @@ impl QuicSession {
             return Err(anyhow::anyhow!("Handshake sender is empty"));
         }
         Ok(packet.sender)
+    }
+}
+
+async fn run_loss_monitor(
+    connection: Connection,
+    config: AdaptiveLossConfig,
+    event_tx: mpsc::Sender<CoreEvent>,
+    in_compensate: Arc<AtomicBool>,
+    session_id_short: String,
+    shutdown: CancellationToken,
+) {
+    let window = std::time::Duration::from_secs(config.window_secs);
+    let mut prev_sent = 0u64;
+    let mut prev_lost = 0u64;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(window) => {}
+        }
+
+        let stats = connection.stats();
+        let sent = stats.path.sent_packets;
+        let lost = stats.path.lost_packets;
+        let delta_sent = sent.saturating_sub(prev_sent);
+        let delta_lost = lost.saturating_sub(prev_lost);
+        prev_sent = sent;
+        prev_lost = lost;
+
+        if delta_sent == 0 {
+            continue;
+        }
+
+        let loss_rate = delta_lost as f64 / delta_sent as f64;
+        let was_compensating = in_compensate.load(Ordering::Relaxed);
+
+        if loss_rate > config.loss_threshold && !was_compensating {
+            in_compensate.store(true, Ordering::Relaxed);
+            crate::warn!(
+                "[QuicSession] Loss {:.1}% > threshold {:.1}% — compensate mode (session={})",
+                loss_rate * 100.0,
+                config.loss_threshold * 100.0,
+                session_id_short
+            );
+            let _ = event_tx
+                .try_send(CoreEvent::Transport(TransportEvent::Degraded {
+                    service: ServiceDescriptor::new(
+                        format!("quic-session:{}", session_id_short),
+                        ServiceKind::Transport,
+                    ),
+                    protocol: TransportProtocol::Quic,
+                    reason: format!(
+                        "packet loss {:.1}% exceeds threshold {:.1}%",
+                        loss_rate * 100.0,
+                        config.loss_threshold * 100.0,
+                    ),
+                    loss_rate,
+                }));
+        } else if loss_rate <= config.loss_threshold && was_compensating {
+            in_compensate.store(false, Ordering::Relaxed);
+            crate::info!(
+                "[QuicSession] Loss recovered to {:.1}% — normal mode (session={})",
+                loss_rate * 100.0,
+                session_id_short
+            );
+        }
     }
 }
 

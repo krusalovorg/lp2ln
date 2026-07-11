@@ -116,6 +116,8 @@ pub enum TransportEvent {
         service: ServiceDescriptor,
         protocol: TransportProtocol,
         reason: String,
+        /// Measured packet-loss fraction (0.0–1.0); 0.0 for non-loss degradation.
+        loss_rate: f64,
     },
     Stopped {
         service: ServiceDescriptor,

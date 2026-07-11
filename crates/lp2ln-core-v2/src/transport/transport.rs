@@ -1,3 +1,4 @@
+use crate::event_core::prelude::CoreEvent;
 use crate::{sessions::Session, sessions::session::IncomingPacket};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -66,6 +67,8 @@ pub struct TransportContext {
     pub incoming_sessions_tx: mpsc::Sender<Arc<dyn Session>>,
     pub incoming_packets_tx: mpsc::Sender<IncomingPacket>,
     pub listen_addr: Option<SocketAddr>,
+    /// Channel for transports to emit `CoreEvent`s (e.g. loss degradation) back to the node.
+    pub event_tx: Option<mpsc::Sender<CoreEvent>>,
 }
 
 #[derive(Debug, Clone)]

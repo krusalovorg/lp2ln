@@ -276,6 +276,36 @@ impl Default for DirectUpgradeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DialPolicy {
+    /// Preferred transport order when dialing a peer. First matching transport wins.
+    #[serde(default = "default_dial_policy_transport_order")]
+    pub transport_order: Vec<String>,
+    #[serde(default = "default_quic_connect_timeout_secs")]
+    pub quic_connect_timeout_secs: u64,
+    /// When true, QUIC transport degradation triggers session close + redial via fallback.
+    #[serde(default = "default_true")]
+    pub fallback_on_transport_degraded: bool,
+}
+
+fn default_dial_policy_transport_order() -> Vec<String> {
+    vec!["quic".into(), "udp".into(), "tcp".into()]
+}
+
+fn default_quic_connect_timeout_secs() -> u64 {
+    5
+}
+
+impl Default for DialPolicy {
+    fn default() -> Self {
+        Self {
+            transport_order: default_dial_policy_transport_order(),
+            quic_connect_timeout_secs: default_quic_connect_timeout_secs(),
+            fallback_on_transport_degraded: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeOptions {
     pub listens: DashMap<String, SocketAddr>,
@@ -312,6 +342,7 @@ pub struct NodeOptions {
     pub stop_on_permanent_degradation: bool,
     /// When true, topology reacts to session-close events via CoreBus handlers.
     pub topology_react_to_session_events: bool,
+    pub dial_policy: DialPolicy,
 }
 
 impl NodeOptions {
@@ -346,6 +377,7 @@ impl NodeOptions {
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,
             topology_react_to_session_events: false,
+            dial_policy: DialPolicy::default(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -390,6 +422,7 @@ impl NodeOptions {
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,
             topology_react_to_session_events: false,
+            dial_policy: DialPolicy::default(),
             logger_options: Some(LoggerOptions::default()),
         }
     }

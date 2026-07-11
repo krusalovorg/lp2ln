@@ -58,6 +58,7 @@ impl RuntimeService for TopologyService {
         let cancel_topology = ctx.producer_cancel.clone();
         let session_redial_queue = ctx.session_redial_queue.clone();
         let react_to_session_events = ctx.options.topology_react_to_session_events;
+        let dial_policy = ctx.options.dial_policy.clone();
         ctx.supervisor.spawn("topology", async move {
             let mut backoff = Duration::from_millis(500);
             loop {
@@ -94,6 +95,7 @@ impl RuntimeService for TopologyService {
                         bootstrap_ok.clone(),
                         Some(session_redial_queue.clone()),
                         react_to_session_events,
+                        dial_policy.clone(),
                     ))
                     .catch_unwind() => result,
                 };

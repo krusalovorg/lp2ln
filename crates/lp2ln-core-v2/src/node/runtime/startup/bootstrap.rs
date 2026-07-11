@@ -28,6 +28,7 @@ impl RuntimeService for TransportListenerService {
             incoming_sessions_tx,
             incoming_packets_tx: router.incoming_sender(),
             listen_addr: None,
+            event_tx: None,
         };
         spawn_listener_transports(
             ctx.supervisor,

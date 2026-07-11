@@ -136,6 +136,7 @@ pub(super) async fn execute_dial_plan(
     maintenance_handshake_payload: &[u8],
     dial_cooldown_until: &mut HashMap<PeerId, u64>,
     topology_tuning: &TopologyTuning,
+    transport_order: &[String],
     now: u64,
 ) -> DialExecutionResult {
     let dial_deficit = plan.dial_limit.saturating_sub(n).max(1);
@@ -208,8 +209,15 @@ pub(super) async fn execute_dial_plan(
         let Some(entry) = dial_book.get(&pid) else {
             continue;
         };
-        let endpoints = entry.value().to_vec();
+        let mut endpoints = entry.value().to_vec();
         drop(entry);
+        // Sort by preferred transport order (quic > udp > tcp by default).
+        endpoints.sort_by_key(|(proto, _)| {
+            transport_order
+                .iter()
+                .position(|o| o == proto)
+                .unwrap_or(usize::MAX)
+        });
         let max_endpoints = dial_endpoint_attempt_budget(
             active_peers,
             dial_target,

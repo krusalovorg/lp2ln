@@ -12,6 +12,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 
+use super::adaptive::AdaptiveLossConfig;
+use super::obfs::QuicObfsConfig;
+
 pub const DEFAULT_QUIC_ALPN: &str = "lp2ln/1";
 pub const H3_ALPN: &[u8] = b"h3";
 
@@ -68,7 +71,7 @@ fn default_quic_alpn() -> Vec<String> {
     vec![DEFAULT_QUIC_ALPN.to_string()]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuicTransportOptions {
     #[serde(default = "default_max_idle_timeout_secs")]
     pub max_idle_timeout_secs: u64,
@@ -80,6 +83,10 @@ pub struct QuicTransportOptions {
     pub tls: QuicTlsConfig,
     #[serde(default)]
     pub masquerade: MasqueradeConfig,
+    #[serde(default)]
+    pub obfs: QuicObfsConfig,
+    #[serde(default)]
+    pub adaptive_loss: AdaptiveLossConfig,
 }
 
 impl Default for QuicTransportOptions {
@@ -90,6 +97,8 @@ impl Default for QuicTransportOptions {
             initial_mtu: default_initial_mtu(),
             tls: QuicTlsConfig::default(),
             masquerade: MasqueradeConfig::default(),
+            obfs: QuicObfsConfig::default(),
+            adaptive_loss: AdaptiveLossConfig::default(),
         }
     }
 }
@@ -372,6 +381,8 @@ mod tests {
             client_streams.1,
             None,
             LinkKind::DirectQuic,
+            None,
+            None,
         )
         .expect("outbound");
 
@@ -397,6 +408,8 @@ mod tests {
             server_streams.1,
             None,
             LinkKind::DirectQuic,
+            None,
+            None,
         )
         .expect("inbound");
 

@@ -153,6 +153,9 @@ pub fn parse_observed_addr_line(s: &str) -> Option<(String, SocketAddr)> {
     if let Some(rest) = lower.strip_prefix("udp:") {
         return rest.trim().parse().ok().map(|a| ("udp".to_string(), a));
     }
+    if let Some(rest) = lower.strip_prefix("quic:") {
+        return rest.trim().parse().ok().map(|a| ("quic".to_string(), a));
+    }
     s.parse().ok().map(|a| ("tcp".to_string(), a))
 }
 

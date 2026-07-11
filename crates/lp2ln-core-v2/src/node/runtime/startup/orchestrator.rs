@@ -19,7 +19,9 @@ use crate::node::runtime::startup::incoming::IncomingService;
 use crate::node::runtime::startup::router::RouterService;
 use crate::node::runtime::startup::topology::TopologyService;
 use crate::node::supervisor::NodeSupervisor;
-use crate::node::topology_maintenance::TopologySessionReactionHandler;
+use crate::node::topology_maintenance::{
+    TopologySessionReactionHandler, TransportDegradedReactionHandler,
+};
 use crate::router::{ROUTER_INCOMING_QUEUE_CAP, Router};
 
 pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
@@ -134,6 +136,19 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
             runtime
                 .core_bus
                 .register_event_handler(CoreEventKind::Session, handler),
+        );
+    }
+
+    if runtime.options.dial_policy.fallback_on_transport_degraded {
+        let handler = Arc::new(TransportDegradedReactionHandler::new(
+            runtime.session_manager.clone(),
+            runtime.session_redial_queue.clone(),
+            5_000,
+        ));
+        runtime.event_handler_regs.push(
+            runtime
+                .core_bus
+                .register_event_handler(CoreEventKind::Transport, handler),
         );
     }
 

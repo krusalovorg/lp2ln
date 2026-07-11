@@ -302,6 +302,7 @@ async fn health_bridge_reflects_lifecycle_and_transport_degraded() {
         service: ServiceDescriptor::new("tcp", ServiceKind::Transport),
         protocol: lp2ln_core_v2::event_core::prelude::TransportProtocol::Tcp,
         reason: "listener restart loop".to_string(),
+        loss_rate: 0.0,
     }))
     .await
     .expect("emit transport degraded");

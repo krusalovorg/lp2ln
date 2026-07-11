@@ -1,12 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::event_core::prelude::CoreEvent;
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
+use crate::transport::quic::adaptive::AdaptiveLossConfig;
 use crate::transport::quic::config::{
     MasqueradeConfig, QuicTransportOptions, build_client_config, build_server_config,
 };
 use crate::transport::quic::masquerade;
+use crate::transport::quic::obfs::XorObfsSocket;
 use crate::transport::quic::session::QuicSession;
 use crate::transport::transport::TransportContext;
 use crate::transport::{ACCEPT_TASK_JOIN_TIMEOUT, Transport, join_accept_task};
@@ -14,6 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use quinn::Endpoint;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 pub struct QuicTransport {
     listen_addr: SocketAddr,
@@ -23,6 +27,8 @@ pub struct QuicTransport {
     client_endpoint: Arc<Mutex<Option<Arc<Endpoint>>>>,
     is_listener: bool,
     client_config: quinn::ClientConfig,
+    /// Set during start(); used by dial() to attach loss monitoring on outbound sessions.
+    event_tx: Arc<Mutex<Option<mpsc::Sender<CoreEvent>>>>,
 }
 
 impl QuicTransport {
@@ -36,6 +42,7 @@ impl QuicTransport {
             client_endpoint: Arc::new(Mutex::new(None)),
             is_listener: true,
             client_config,
+            event_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -49,6 +56,7 @@ impl QuicTransport {
             client_endpoint: Arc::new(Mutex::new(None)),
             is_listener: false,
             client_config,
+            event_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -56,8 +64,27 @@ impl QuicTransport {
         if let Some(endpoint) = self.client_endpoint.lock().await.clone() {
             return Ok(endpoint);
         }
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))
-            .context("create QUIC client endpoint")?;
+        let mut endpoint = if self.options.obfs.is_active() {
+            let password = self.options.obfs.password.as_deref().unwrap();
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC obfs client"))?;
+            let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")
+                .context("bind QUIC obfs client socket")?;
+            let inner = runtime
+                .wrap_udp_socket(std_sock)
+                .context("wrap QUIC obfs client socket")?;
+            let obfs = Arc::new(XorObfsSocket::new(inner, password));
+            Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                None,
+                obfs,
+                runtime,
+            )
+            .context("create QUIC obfs client endpoint")?
+        } else {
+            Endpoint::client("0.0.0.0:0".parse().expect("valid addr"))
+                .context("create QUIC client endpoint")?
+        };
         endpoint.set_default_client_config(self.client_config.clone());
         let endpoint = Arc::new(endpoint);
         *self.client_endpoint.lock().await = Some(endpoint.clone());
@@ -78,6 +105,8 @@ async fn handle_incoming_connection(
     connection: quinn::Connection,
     incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
     masquerade_config: Option<MasqueradeConfig>,
+    event_tx: Option<mpsc::Sender<CoreEvent>>,
+    adaptive: Option<AdaptiveLossConfig>,
 ) {
     let remote = connection.remote_address();
     let alpn = connection_alpn(&connection);
@@ -124,6 +153,8 @@ async fn handle_incoming_connection(
         recv,
         None,
         LinkKind::DirectQuic,
+        event_tx,
+        adaptive,
     ) {
         Ok(session) => {
             if incoming_sessions_tx
@@ -174,11 +205,34 @@ impl Transport for QuicTransport {
         let server_config = build_server_config(&self.options)
             .map_err(|e| anyhow::anyhow!("failed to build QUIC server config: {e}"))?;
 
+        // Store the event channel for use by dial() on outbound sessions.
+        if let Some(ref tx) = ctx.event_tx {
+            *self.event_tx.lock().await = Some(tx.clone());
+        }
+
         let bind_addr = ctx.listen_addr.unwrap_or(self.listen_addr);
-        let endpoint = Arc::new(
+        let endpoint = Arc::new(if self.options.obfs.is_active() {
+            let password = self.options.obfs.password.as_deref().unwrap();
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC obfs listener"))?;
+            let std_sock = std::net::UdpSocket::bind(bind_addr)
+                .map_err(|e| anyhow::anyhow!("Failed to bind QUIC obfs on {bind_addr}: {e}"))?;
+            let inner = runtime
+                .wrap_udp_socket(std_sock)
+                .context("wrap QUIC obfs server socket")?;
+            let obfs = Arc::new(XorObfsSocket::new(inner, password));
+            crate::info!("[QuicTransport] Starting with quic_initial_obfs on {}", bind_addr);
+            Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                obfs,
+                runtime,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create QUIC obfs endpoint: {e}"))?
+        } else {
             Endpoint::server(server_config, bind_addr)
-                .map_err(|e| anyhow::anyhow!("Failed to bind QUIC on {bind_addr}: {e}"))?,
-        );
+                .map_err(|e| anyhow::anyhow!("Failed to bind QUIC on {bind_addr}: {e}"))?
+        });
         let actual_addr = endpoint.local_addr()?;
         {
             let mut endpoint_guard = self.endpoint.lock().await;
@@ -192,6 +246,12 @@ impl Transport for QuicTransport {
         } else {
             None
         };
+        let adaptive = if self.options.adaptive_loss.enabled {
+            Some(self.options.adaptive_loss.clone())
+        } else {
+            None
+        };
+        let event_tx = ctx.event_tx.clone();
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -201,6 +261,8 @@ impl Transport for QuicTransport {
                 let incoming_sessions_tx = incoming_sessions_tx.clone();
                 let endpoint = endpoint_for_accept.clone();
                 let masquerade_cfg = masquerade_cfg.clone();
+                let event_tx = event_tx.clone();
+                let adaptive = adaptive.clone();
                 tokio::spawn(async move {
                     let connection = match incoming.await {
                         Ok(conn) => conn,
@@ -214,6 +276,8 @@ impl Transport for QuicTransport {
                         connection,
                         incoming_sessions_tx,
                         masquerade_cfg,
+                        event_tx,
+                        adaptive,
                     )
                     .await;
                 });
@@ -233,6 +297,7 @@ impl Transport for QuicTransport {
             endpoint.close(0u32.into(), b"transport stopped");
         }
         self.client_endpoint.lock().await.take();
+        self.event_tx.lock().await.take();
 
         let accept_handle = {
             let mut accept_task_guard = self.accept_task.lock().await;
@@ -256,6 +321,12 @@ impl Transport for QuicTransport {
             .open_bi()
             .await
             .context("open QUIC bidi stream")?;
+        let event_tx = self.event_tx.lock().await.clone();
+        let adaptive = if self.options.adaptive_loss.enabled {
+            Some(self.options.adaptive_loss.clone())
+        } else {
+            None
+        };
         let session = QuicSession::new_from_streams(
             endpoint,
             connection,
@@ -263,6 +334,8 @@ impl Transport for QuicTransport {
             recv,
             None,
             LinkKind::DirectQuic,
+            event_tx,
+            adaptive,
         )?;
         crate::info!("[QuicTransport] Session created for {}", addr);
         Ok(session as Arc<dyn Session>)

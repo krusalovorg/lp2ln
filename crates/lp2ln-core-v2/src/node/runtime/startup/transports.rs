@@ -42,10 +42,29 @@ pub(crate) fn spawn_listener_transports(
             continue;
         }
         let listen_addr = listens.get(transport.name()).map(|r| *r);
+
+        // Per-transport event channel: transports emit CoreEvents (e.g. loss degradation) here;
+        // the forwarding task relays them to the CoreBus.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CoreEvent>(256);
+        let core_bus_fwd = core_bus.clone();
+        let fwd_cancel = producer_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = fwd_cancel.cancelled() => break,
+                    evt = event_rx.recv() => match evt {
+                        Some(e) => { let _ = core_bus_fwd.emit(e).await; }
+                        None => break,
+                    }
+                }
+            }
+        });
+
         let ctx_clone = TransportContext {
             incoming_sessions_tx: ctx.incoming_sessions_tx.clone(),
             incoming_packets_tx: ctx.incoming_packets_tx.clone(),
             listen_addr,
+            event_tx: Some(event_tx),
         };
         let transport_clone = transport.clone();
         let transport_name = transport.name().to_string();
@@ -120,6 +139,7 @@ pub(crate) fn spawn_listener_transports(
                                 service: service.clone(),
                                 protocol: protocol.clone(),
                                 reason,
+                                loss_rate: 0.0,
                             },
                         );
                         if let Some(addr) = listen_addr {

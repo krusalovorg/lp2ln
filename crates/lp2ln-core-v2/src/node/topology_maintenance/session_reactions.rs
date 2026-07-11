@@ -4,7 +4,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-use crate::event_core::prelude::{CoreEvent, CoreEventHandler, EventContext, SessionEvent};
+use crate::event_core::prelude::{
+    CoreEvent, CoreEventHandler, EventContext, SessionEvent, TransportEvent, TransportProtocol,
+};
 use crate::sessions::LinkKind;
 use crate::sessions::manager::SessionManager;
 use crate::topology::now_ms;
@@ -88,6 +90,56 @@ impl CoreEventHandler for TopologySessionReactionHandler {
         let now = now_ms();
         self.queue
             .schedule(peer_id, now.saturating_add(self.redial_cooldown_ms));
+        Ok(())
+    }
+}
+
+/// Listens for `TransportEvent::Degraded` on QUIC, closes all QUIC sessions,
+/// and schedules affected peers for redial via the topology loop.
+pub struct TransportDegradedReactionHandler {
+    session_manager: Arc<SessionManager>,
+    queue: Arc<SessionRedialQueue>,
+    redial_cooldown_ms: u64,
+}
+
+impl TransportDegradedReactionHandler {
+    pub fn new(
+        session_manager: Arc<SessionManager>,
+        queue: Arc<SessionRedialQueue>,
+        redial_cooldown_ms: u64,
+    ) -> Self {
+        Self {
+            session_manager,
+            queue,
+            redial_cooldown_ms,
+        }
+    }
+}
+
+#[async_trait]
+impl CoreEventHandler for TransportDegradedReactionHandler {
+    async fn handle_event(&self, event: CoreEvent, _ctx: EventContext) -> Result<()> {
+        let CoreEvent::Transport(TransportEvent::Degraded {
+            protocol: TransportProtocol::Quic,
+            ..
+        }) = event
+        else {
+            return Ok(());
+        };
+        let quic_sessions = self.session_manager.sessions_by_kind(LinkKind::DirectQuic);
+        if quic_sessions.is_empty() {
+            return Ok(());
+        }
+        crate::warn!(
+            "[TopologyDegraded] QUIC transport degraded — closing {} session(s) for redial",
+            quic_sessions.len()
+        );
+        let now = now_ms();
+        let redial_at = now.saturating_add(self.redial_cooldown_ms);
+        for (peer_id, session_id) in quic_sessions {
+            let _ = self.session_manager.close_session(&session_id).await;
+            self.queue.schedule(peer_id, redial_at);
+        }
         Ok(())
     }
 }

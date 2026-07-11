@@ -24,7 +24,7 @@ use crate::node::distribution::{
     regular_auto_dial_target,
 };
 use crate::node::nat_traversal::NatTraversalState;
-use crate::node::options::{BootstrapNode, NodeOptions, NodeRole, TopologyTuning};
+use crate::node::options::{BootstrapNode, DialPolicy, NodeOptions, NodeRole, TopologyTuning};
 use crate::peer_score::{
     PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights, total_score,
 };
@@ -39,7 +39,9 @@ use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
 use dialing::{build_dial_plan, execute_dial_plan};
 use packet_helpers::{control_packet, handshake_packet, observe_failure_and_close};
-pub use session_reactions::{SessionRedialQueue, TopologySessionReactionHandler};
+pub use session_reactions::{
+    SessionRedialQueue, TopologySessionReactionHandler, TransportDegradedReactionHandler,
+};
 
 #[derive(Clone)]
 pub(crate) struct BootstrapDialDedupe {
@@ -211,6 +213,7 @@ struct TopologyMaintenanceCtx<'a> {
     log_peer_scores: bool,
     listens: &'a DashMap<String, SocketAddr>,
     dial_book: &'a Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
+    dial_policy: &'a DialPolicy,
 }
 
 async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &CancellationToken) {
@@ -351,7 +354,7 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
             if our_listen_addrs.contains(&addr) {
                 continue;
             }
-            if proto != "tcp" && proto != "udp" {
+            if proto != "tcp" && proto != "udp" && proto != "quic" {
                 continue;
             }
             let mut entry = ctx
@@ -395,6 +398,7 @@ pub(crate) async fn run_topology_maintenance_loop(
     bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
     session_redial_queue: Option<Arc<SessionRedialQueue>>,
     react_to_session_events: bool,
+    dial_policy: DialPolicy,
 ) -> anyhow::Result<()> {
     let initial_jitter = (our_peer_maint
         .bytes()
@@ -422,6 +426,7 @@ pub(crate) async fn run_topology_maintenance_loop(
         log_peer_scores,
         listens: &listens,
         dial_book: &dial_book,
+        dial_policy: &dial_policy,
     };
 
     loop {
@@ -689,6 +694,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &maintenance_handshake_payload,
                 &mut state.dial_cooldown_until,
                 &topology_tuning,
+                loop_ctx.dial_policy.transport_order.as_slice(),
                 now,
             )
             .await;
