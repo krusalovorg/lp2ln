@@ -65,6 +65,8 @@ pub(crate) fn spawn_listener_transports(
             incoming_packets_tx: ctx.incoming_packets_tx.clone(),
             listen_addr,
             event_tx: Some(event_tx),
+            keypair: ctx.keypair.clone(),
+            catalog: ctx.catalog.clone(),
         };
         let transport_clone = transport.clone();
         let transport_name = transport.name().to_string();

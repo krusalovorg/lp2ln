@@ -1,4 +1,6 @@
+use crate::crypto::NodeKeypair;
 use crate::event_core::prelude::CoreEvent;
+use crate::topology::PeerCatalog;
 use crate::{sessions::Session, sessions::session::IncomingPacket};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -69,6 +71,10 @@ pub struct TransportContext {
     pub listen_addr: Option<SocketAddr>,
     /// Channel for transports to emit `CoreEvent`s (e.g. loss degradation) back to the node.
     pub event_tx: Option<mpsc::Sender<CoreEvent>>,
+    /// Node keypair — provided to QUIC transport for ECDH-derived obfs key derivation.
+    pub keypair: Option<Arc<NodeKeypair>>,
+    /// Peer catalog — used to look up per-peer obfs capability during dial.
+    pub catalog: Option<Arc<PeerCatalog>>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +105,12 @@ pub trait Transport: Send + Sync {
     }
 
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>>;
+
+    /// Dial with optional peer_id hint for per-peer obfs key derivation.
+    /// Default: delegates to `dial`. Override in QUIC transport.
+    async fn dial_with_peer(&self, addr: SocketAddr, _peer_id: Option<&str>) -> Result<Arc<dyn Session>> {
+        self.dial(addr).await
+    }
 
     fn supports_tunneling(&self) -> bool {
         false

@@ -62,7 +62,7 @@ impl DirectDialer for CoreDirectDialer {
         }
         session.spawn_reader(self.router.incoming_sender());
 
-        let handshake_payload = handshake::encode_hello(self.obfuscation_protocols.clone());
+        let handshake_payload = handshake::encode_hello(self.obfuscation_protocols.clone(), None);
         let handshake = Packet {
             signature: None,
             data: handshake_payload,

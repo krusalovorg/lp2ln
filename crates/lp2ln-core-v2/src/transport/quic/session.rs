@@ -83,6 +83,10 @@ impl Session for QuicSession {
         Ok(len)
     }
 
+    fn is_degraded(&self) -> bool {
+        self.in_compensate.load(Ordering::Relaxed)
+    }
+
     async fn close(&self) -> Result<()> {
         self.shutdown.cancel();
         self.connection.close(0u32.into(), b"session closed");
@@ -316,6 +320,14 @@ async fn run_loss_monitor(
                 loss_rate * 100.0,
                 session_id_short
             );
+            let _ = event_tx.try_send(CoreEvent::Transport(TransportEvent::Recovered {
+                service: ServiceDescriptor::new(
+                    format!("quic-session:{}", session_id_short),
+                    ServiceKind::Transport,
+                ),
+                protocol: TransportProtocol::Quic,
+                loss_rate,
+            }));
         }
     }
 }

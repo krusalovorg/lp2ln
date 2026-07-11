@@ -50,6 +50,12 @@ pub trait Session: Send + Sync {
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
     );
 
+    /// Returns true when the session's loss monitor is in compensate mode.
+    /// Default: false (non-QUIC sessions never degrade by loss).
+    fn is_degraded(&self) -> bool {
+        false
+    }
+
     /// Waits for this session's background tasks (reader/writer) to finish.
     ///
     /// Must be called only after `close()` has signalled cancellation, and

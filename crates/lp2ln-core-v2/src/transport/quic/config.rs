@@ -139,7 +139,12 @@ pub fn build_client_config(options: &QuicTransportOptions) -> Result<ClientConfi
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
         .with_no_client_auth();
-    rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn);
+    // Use h3 ALPN when masquerade is enabled so DPI sees HTTP/3 traffic
+    if options.masquerade.enabled {
+        rustls_config.alpn_protocols = vec![H3_ALPN.to_vec()];
+    } else {
+        rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn);
+    }
 
     let mut client_config =
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?));

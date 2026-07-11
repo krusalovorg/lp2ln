@@ -383,6 +383,8 @@ pub struct KnownPeerRecord {
     pub descriptor: Option<NodeDescriptor>,
     pub evidence: Vec<PeerEvidence>,
     pub view: PeerView,
+    #[serde(default)]
+    pub quic_obfs_supported: bool,
 }
 
 impl KnownPeerRecord {
@@ -392,6 +394,7 @@ impl KnownPeerRecord {
             descriptor: None,
             evidence: Vec::new(),
             view: PeerView::default(),
+            quic_obfs_supported: false,
         }
     }
 }
@@ -453,6 +456,19 @@ impl PeerCatalog {
 
     pub fn descriptor_of(&self, peer_id: &PeerId) -> Option<NodeDescriptor> {
         self.peers.get(peer_id).and_then(|r| r.descriptor.clone())
+    }
+
+    pub fn set_quic_obfs_supported(&self, peer_id: &PeerId, supported: bool) {
+        if let Some(mut rec) = self.peers.get_mut(peer_id) {
+            rec.quic_obfs_supported = supported;
+        }
+    }
+
+    pub fn quic_obfs_supported(&self, peer_id: &PeerId) -> bool {
+        self.peers
+            .get(peer_id)
+            .map(|r| r.quic_obfs_supported)
+            .unwrap_or(false)
     }
 
     pub fn upsert_descriptor(&self, descriptor: NodeDescriptor) -> Result<bool, String> {

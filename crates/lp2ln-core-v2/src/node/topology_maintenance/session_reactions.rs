@@ -94,8 +94,9 @@ impl CoreEventHandler for TopologySessionReactionHandler {
     }
 }
 
-/// Listens for `TransportEvent::Degraded` on QUIC, closes all QUIC sessions,
-/// and schedules affected peers for redial via the topology loop.
+/// Listens for `TransportEvent::Degraded` on QUIC, marks affected sessions as degraded,
+/// and schedules affected peers for fallback redial — without closing the QUIC session.
+/// On `TransportEvent::Recovered`, clears the degraded flag so the session regains priority.
 pub struct TransportDegradedReactionHandler {
     session_manager: Arc<SessionManager>,
     queue: Arc<SessionRedialQueue>,
@@ -119,26 +120,39 @@ impl TransportDegradedReactionHandler {
 #[async_trait]
 impl CoreEventHandler for TransportDegradedReactionHandler {
     async fn handle_event(&self, event: CoreEvent, _ctx: EventContext) -> Result<()> {
-        let CoreEvent::Transport(TransportEvent::Degraded {
-            protocol: TransportProtocol::Quic,
-            ..
-        }) = event
-        else {
-            return Ok(());
-        };
-        let quic_sessions = self.session_manager.sessions_by_kind(LinkKind::DirectQuic);
-        if quic_sessions.is_empty() {
-            return Ok(());
-        }
-        crate::warn!(
-            "[TopologyDegraded] QUIC transport degraded — closing {} session(s) for redial",
-            quic_sessions.len()
-        );
-        let now = now_ms();
-        let redial_at = now.saturating_add(self.redial_cooldown_ms);
-        for (peer_id, session_id) in quic_sessions {
-            let _ = self.session_manager.close_session(&session_id).await;
-            self.queue.schedule(peer_id, redial_at);
+        match event {
+            CoreEvent::Transport(TransportEvent::Degraded {
+                protocol: TransportProtocol::Quic,
+                ..
+            }) => {
+                let quic_sessions = self.session_manager.sessions_by_kind(LinkKind::DirectQuic);
+                if quic_sessions.is_empty() {
+                    return Ok(());
+                }
+                crate::warn!(
+                    "[TopologyDegraded] QUIC degraded — marking {} session(s), scheduling fallback redial",
+                    quic_sessions.len()
+                );
+                let now = now_ms();
+                let redial_at = now.saturating_add(self.redial_cooldown_ms);
+                for (peer_id, session_id) in quic_sessions {
+                    // ponytail: keep session alive; just lower its rank and queue fallback dial
+                    self.session_manager
+                        .update_metrics(&session_id, |m| m.is_degraded = true);
+                    self.queue.schedule(peer_id, redial_at);
+                }
+            }
+            CoreEvent::Transport(TransportEvent::Recovered {
+                protocol: TransportProtocol::Quic,
+                ..
+            }) => {
+                let quic_sessions = self.session_manager.sessions_by_kind(LinkKind::DirectQuic);
+                for (_, session_id) in quic_sessions {
+                    self.session_manager
+                        .update_metrics(&session_id, |m| m.is_degraded = false);
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

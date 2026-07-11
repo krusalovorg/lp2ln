@@ -45,6 +45,11 @@ pub async fn handle_local_packet(
         }
         _ if handshake::decode_hello(payload).is_some() => {
             crate::processor!("Handshake hello from {} accepted", from);
+            if let Some(hello) = handshake::decode_hello(payload) {
+                if hello.features.quic_obfs_mode.as_deref() == Some("xor_v1") {
+                    peer_catalog.set_quic_obfs_supported(&PeerId::from(from), true);
+                }
+            }
             let ack = Packet {
                 signature: None,
                 data: b"hs_ack".to_vec(),

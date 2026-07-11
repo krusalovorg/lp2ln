@@ -23,6 +23,8 @@ async fn quic_transport_start_dial_and_exchange_packet() {
             incoming_packets_tx: mpsc::channel(8).0,
             listen_addr: None,
             event_tx: None,
+            keypair: None,
+            catalog: None,
         })
         .await
         .expect("start listener")

@@ -13,6 +13,7 @@ pub struct SessionMetrics {
     pub reconnections: u64,
     pub last_reconnection: Option<std::time::Instant>,
     pub is_active: bool,
+    pub is_degraded: bool,
 }
 
 impl SessionMetrics {
@@ -30,6 +31,7 @@ impl SessionMetrics {
             reconnections: 0,
             last_reconnection: None,
             is_active: true,
+            is_degraded: false,
         }
     }
 

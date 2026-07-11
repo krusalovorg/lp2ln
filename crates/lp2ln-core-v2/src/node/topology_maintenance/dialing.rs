@@ -245,7 +245,7 @@ pub(super) async fn execute_dial_plan(
                 }
                 endpoint_attempts = endpoint_attempts.saturating_add(1);
                 dial_attempts_left = dial_attempts_left.saturating_sub(1);
-                match t.dial(addr).await {
+                match t.dial_with_peer(addr, Some(pid.as_str())).await {
                     Ok(session) => {
                         let session_id = SessionId::from(session.id().to_string());
                         router_maint.register_session(

@@ -50,7 +50,8 @@ impl SessionSelectionStrategy for DefaultSessionStrategy {
             LinkKind::TunnelTcp | LinkKind::TunnelUdp => 0.03 * damp,
             LinkKind::Relay => 0.0,
         };
-        priority + link_bonus
+        let degraded_penalty = if metrics.is_degraded { 0.30 } else { 0.0 };
+        priority + link_bonus - degraded_penalty
     }
 }
 

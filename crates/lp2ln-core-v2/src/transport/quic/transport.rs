@@ -1,18 +1,22 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::crypto::NodeKeypair;
 use crate::event_core::prelude::CoreEvent;
 use crate::sessions::Session;
 use crate::sessions::session::LinkKind;
+use crate::topology::PeerCatalog;
 use crate::transport::quic::adaptive::AdaptiveLossConfig;
 use crate::transport::quic::config::{
     MasqueradeConfig, QuicTransportOptions, build_client_config, build_server_config,
 };
 use crate::transport::quic::masquerade;
-use crate::transport::quic::obfs::XorObfsSocket;
+use crate::transport::quic::obfs::{QuicObfsMode, XorObfsSocket, derive_obfs_key_from_ecdh};
 use crate::transport::quic::session::QuicSession;
 use crate::transport::transport::TransportContext;
 use crate::transport::{ACCEPT_TASK_JOIN_TIMEOUT, Transport, join_accept_task};
+use crate::types::PeerId;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use quinn::Endpoint;
@@ -29,6 +33,9 @@ pub struct QuicTransport {
     client_config: quinn::ClientConfig,
     /// Set during start(); used by dial() to attach loss monitoring on outbound sessions.
     event_tx: Arc<Mutex<Option<mpsc::Sender<CoreEvent>>>>,
+    /// Set during start(); used by dial_with_peer() to derive ECDH obfs key for Auto mode.
+    keypair: Arc<Mutex<Option<Arc<NodeKeypair>>>>,
+    catalog: Arc<Mutex<Option<Arc<PeerCatalog>>>>,
 }
 
 impl QuicTransport {
@@ -43,6 +50,8 @@ impl QuicTransport {
             is_listener: true,
             client_config,
             event_tx: Arc::new(Mutex::new(None)),
+            keypair: Arc::new(Mutex::new(None)),
+            catalog: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -57,6 +66,8 @@ impl QuicTransport {
             is_listener: false,
             client_config,
             event_tx: Arc::new(Mutex::new(None)),
+            keypair: Arc::new(Mutex::new(None)),
+            catalog: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -92,60 +103,16 @@ impl QuicTransport {
     }
 }
 
-fn connection_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
-    use quinn::crypto::rustls::HandshakeData;
-    conn.handshake_data()?
-        .downcast::<HandshakeData>()
-        .ok()
-        .and_then(|d| d.protocol.clone())
-}
-
-async fn handle_incoming_connection(
+async fn register_session(
     endpoint: Arc<Endpoint>,
     connection: quinn::Connection,
+    streams: (quinn::SendStream, quinn::RecvStream),
+    remote: std::net::SocketAddr,
     incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
-    masquerade_config: Option<MasqueradeConfig>,
     event_tx: Option<mpsc::Sender<CoreEvent>>,
     adaptive: Option<AdaptiveLossConfig>,
 ) {
-    let remote = connection.remote_address();
-    let alpn = connection_alpn(&connection);
-
-    // Route h3 active probes to masquerade handler; LP2LN traffic continues below.
-    if alpn.as_deref() == Some(b"h3") {
-        match masquerade_config {
-            Some(cfg) if cfg.enabled => {
-                crate::info!("[QuicTransport] h3 probe from {}, serving masquerade", remote);
-                masquerade::serve(connection, cfg).await;
-            }
-            _ => {
-                crate::warn!(
-                    "[QuicTransport] h3 probe from {} but masquerade disabled, dropping",
-                    remote
-                );
-                connection.close(0u32.into(), b"");
-            }
-        }
-        return;
-    }
-
-    crate::info!("[QuicTransport] New incoming connection from {}", remote);
-
-    let (send, recv) = match connection.accept_bi().await {
-        Ok(streams) => {
-            crate::info!("[QuicTransport] Accepted bidi stream from {}", remote);
-            streams
-        }
-        Err(e) => {
-            crate::error!(
-                "[QuicTransport] Failed to accept bidi stream from {}: {}",
-                remote,
-                e
-            );
-            return;
-        }
-    };
-
+    let (send, recv) = streams;
     match QuicSession::new_from_streams(
         endpoint,
         connection,
@@ -181,6 +148,82 @@ async fn handle_incoming_connection(
     }
 }
 
+fn connection_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    use quinn::crypto::rustls::HandshakeData;
+    conn.handshake_data()?
+        .downcast::<HandshakeData>()
+        .ok()
+        .and_then(|d| d.protocol.clone())
+}
+
+async fn handle_incoming_connection(
+    endpoint: Arc<Endpoint>,
+    connection: quinn::Connection,
+    incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
+    masquerade_config: Option<MasqueradeConfig>,
+    event_tx: Option<mpsc::Sender<CoreEvent>>,
+    adaptive: Option<AdaptiveLossConfig>,
+) {
+    let remote = connection.remote_address();
+    let alpn = connection_alpn(&connection);
+
+    // h3 ALPN: could be a DPI active probe or an LP2LN client using masquerade ALPN.
+    // LP2LN always opens a bidi stream immediately; real h3 probes don't.
+    if alpn.as_deref() == Some(b"h3") {
+        match masquerade_config {
+            Some(cfg) if cfg.enabled => {
+                match tokio::time::timeout(Duration::from_millis(500), connection.accept_bi()).await {
+                    Ok(Ok(streams)) => {
+                        // LP2LN client — fall through to session creation with these streams
+                        crate::info!("[QuicTransport] LP2LN client via h3 ALPN from {}", remote);
+                        return register_session(
+                            endpoint,
+                            connection,
+                            streams,
+                            remote,
+                            incoming_sessions_tx,
+                            event_tx,
+                            adaptive,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        crate::info!("[QuicTransport] h3 probe from {}, serving masquerade", remote);
+                        masquerade::serve(connection, cfg).await;
+                    }
+                }
+            }
+            _ => {
+                crate::warn!(
+                    "[QuicTransport] h3 probe from {} but masquerade disabled, dropping",
+                    remote
+                );
+                connection.close(0u32.into(), b"");
+            }
+        }
+        return;
+    }
+
+    crate::info!("[QuicTransport] New incoming connection from {}", remote);
+
+    let (send, recv) = match connection.accept_bi().await {
+        Ok(streams) => {
+            crate::info!("[QuicTransport] Accepted bidi stream from {}", remote);
+            streams
+        }
+        Err(e) => {
+            crate::error!(
+                "[QuicTransport] Failed to accept bidi stream from {}: {}",
+                remote,
+                e
+            );
+            return;
+        }
+    };
+
+    register_session(endpoint, connection, (send, recv), remote, incoming_sessions_tx, event_tx, adaptive).await;
+}
+
 #[async_trait]
 impl Transport for QuicTransport {
     fn name(&self) -> &'static str {
@@ -205,9 +248,15 @@ impl Transport for QuicTransport {
         let server_config = build_server_config(&self.options)
             .map_err(|e| anyhow::anyhow!("failed to build QUIC server config: {e}"))?;
 
-        // Store the event channel for use by dial() on outbound sessions.
+        // Store context provided at startup for use by dial_with_peer().
         if let Some(ref tx) = ctx.event_tx {
             *self.event_tx.lock().await = Some(tx.clone());
+        }
+        if let Some(kp) = ctx.keypair {
+            *self.keypair.lock().await = Some(kp);
+        }
+        if let Some(cat) = ctx.catalog {
+            *self.catalog.lock().await = Some(cat);
         }
 
         let bind_addr = ctx.listen_addr.unwrap_or(self.listen_addr);
@@ -338,6 +387,65 @@ impl Transport for QuicTransport {
             adaptive,
         )?;
         crate::info!("[QuicTransport] Session created for {}", addr);
+        Ok(session as Arc<dyn Session>)
+    }
+
+    async fn dial_with_peer(&self, addr: SocketAddr, peer_id: Option<&str>) -> Result<Arc<dyn Session>> {
+        // Auto mode: derive per-peer ECDH obfs key if we know the peer and they support it.
+        if let (QuicObfsMode::Auto, Some(pid)) = (&self.options.obfs.mode, peer_id) {
+            let keypair = self.keypair.lock().await.clone();
+            if let Some(kp) = keypair {
+                let catalog = self.catalog.lock().await.clone();
+                let supported = catalog
+                    .as_ref()
+                    .map(|c| c.quic_obfs_supported(&PeerId::from(pid)))
+                    .unwrap_or(false);
+                if supported {
+                    let key = derive_obfs_key_from_ecdh(kp.signing_key(), pid)
+                        .context("derive ECDH obfs key for dial")?;
+                    return self.dial_with_obfs_key(addr, key).await;
+                }
+            }
+        }
+        self.dial(addr).await
+    }
+}
+
+impl QuicTransport {
+    async fn dial_with_obfs_key(&self, addr: SocketAddr, key: [u8; 32]) -> Result<Arc<dyn Session>> {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC obfs dial"))?;
+        let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")
+            .context("bind QUIC obfs dial socket")?;
+        let inner = runtime
+            .wrap_udp_socket(std_sock)
+            .context("wrap QUIC obfs dial socket")?;
+        let obfs = Arc::new(XorObfsSocket::new_with_key(inner, key));
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            obfs,
+            runtime,
+        )
+        .context("create QUIC obfs dial endpoint")?;
+        endpoint.set_default_client_config(self.client_config.clone());
+        let endpoint = Arc::new(endpoint);
+        let connection = endpoint
+            .connect(addr, "lp2ln.local")
+            .context(format!("quic obfs connect {}", addr))?
+            .await
+            .with_context(|| format!("quic obfs handshake {}", addr))?;
+        let (send, recv) = connection.open_bi().await.context("open QUIC obfs bidi stream")?;
+        let event_tx = self.event_tx.lock().await.clone();
+        let adaptive = if self.options.adaptive_loss.enabled {
+            Some(self.options.adaptive_loss.clone())
+        } else {
+            None
+        };
+        let session = QuicSession::new_from_streams(
+            endpoint, connection, send, recv, None, LinkKind::DirectQuic, event_tx, adaptive,
+        )?;
+        crate::info!("[QuicTransport] Obfs session (ECDH) created for {}", addr);
         Ok(session as Arc<dyn Session>)
     }
 }

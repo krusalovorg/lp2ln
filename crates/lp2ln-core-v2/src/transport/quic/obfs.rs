@@ -5,6 +5,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use anyhow::Result;
+use k256::ecdsa::SigningKey;
+use k256::elliptic_curve::ecdh::diffie_hellman;
+use k256::elliptic_curve::sec1::FromEncodedPoint;
+use k256::{EncodedPoint, PublicKey};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,6 +20,8 @@ pub enum QuicObfsMode {
     #[default]
     Plain,
     QuicInitialObfs,
+    /// Derive XOR key from ECDH(our_sk, peer_pk) when peer pubkey is known; plain otherwise.
+    Auto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,7 +43,20 @@ impl Default for QuicObfsConfig {
 
 impl QuicObfsConfig {
     pub fn is_active(&self) -> bool {
-        self.mode == QuicObfsMode::QuicInitialObfs && self.password.is_some()
+        match self.mode {
+            QuicObfsMode::QuicInitialObfs => self.password.is_some(),
+            QuicObfsMode::Auto => true,
+            QuicObfsMode::Plain => false,
+        }
+    }
+
+    /// Returns the obfs mode string to announce in HandshakeFeatures.
+    pub fn hello_obfs_mode(&self) -> Option<String> {
+        match self.mode {
+            QuicObfsMode::QuicInitialObfs if self.password.is_some() => Some("xor_v1".into()),
+            QuicObfsMode::Auto => Some("xor_v1".into()),
+            _ => None,
+        }
     }
 }
 
@@ -55,6 +75,23 @@ fn xor_datagram(buf: &mut [u8], key: &[u8; 32]) {
     }
 }
 
+/// Derives a 32-byte XOR key from ECDH shared secret between our sk and their peer_id (compressed pubkey hex).
+/// Same domain separator as `derive_obfs_key` so the wire format is uniform.
+pub fn derive_obfs_key_from_ecdh(our_sk: &SigningKey, their_peer_id_hex: &str) -> Result<[u8; 32]> {
+    let peer_bytes = hex::decode(their_peer_id_hex)
+        .map_err(|e| anyhow::anyhow!("Invalid peer_id hex for obfs: {}", e))?;
+    let point = EncodedPoint::from_bytes(&peer_bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid encoded point in peer_id"))?;
+    let public = PublicKey::from_encoded_point(&point)
+        .into_option()
+        .ok_or_else(|| anyhow::anyhow!("Invalid public key point in peer_id"))?;
+    let shared = diffie_hellman(our_sk.as_nonzero_scalar(), public.as_affine());
+    let mut h = Sha256::new();
+    h.update(b"lp2ln-quic-obfs-v1:");
+    h.update(shared.raw_secret_bytes().as_slice());
+    Ok(h.finalize().into())
+}
+
 /// Wraps a quinn UDP socket and XOR-obfuscates every datagram.
 /// The same key is applied symmetrically on send and receive.
 /// Both endpoints must share the same password in `quic.obfs.password`.
@@ -71,6 +108,10 @@ impl XorObfsSocket {
             inner,
             key: derive_obfs_key(password),
         }
+    }
+
+    pub fn new_with_key(inner: Arc<dyn AsyncUdpSocket>, key: [u8; 32]) -> Self {
+        Self { inner, key }
     }
 }
 
@@ -136,6 +177,19 @@ impl AsyncUdpSocket for XorObfsSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ecdh_obfs_key_symmetric() {
+        use crate::crypto::NodeKeypair;
+        let a = NodeKeypair::generate();
+        let b = NodeKeypair::generate();
+        let key_ab = derive_obfs_key_from_ecdh(a.signing_key(), b.peer_id()).expect("ab");
+        let key_ba = derive_obfs_key_from_ecdh(b.signing_key(), a.peer_id()).expect("ba");
+        assert_eq!(key_ab, key_ba, "ECDH obfs key must be symmetric");
+        // Must differ from password-derived key with same input to avoid cross-protocol reuse
+        let key_pw = derive_obfs_key(b.peer_id());
+        assert_ne!(key_ab, key_pw);
+    }
 
     #[test]
     fn xor_roundtrip() {

@@ -119,6 +119,11 @@ pub enum TransportEvent {
         /// Measured packet-loss fraction (0.0–1.0); 0.0 for non-loss degradation.
         loss_rate: f64,
     },
+    Recovered {
+        service: ServiceDescriptor,
+        protocol: TransportProtocol,
+        loss_rate: f64,
+    },
     Stopped {
         service: ServiceDescriptor,
         protocol: TransportProtocol,

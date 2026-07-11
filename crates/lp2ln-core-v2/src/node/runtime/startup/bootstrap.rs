@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::node::addressing::ordered_bootstrap_targets;
@@ -29,6 +31,8 @@ impl RuntimeService for TransportListenerService {
             incoming_packets_tx: router.incoming_sender(),
             listen_addr: None,
             event_tx: None,
+            keypair: Some(Arc::new(ctx.keypair.clone())),
+            catalog: Some(ctx.peer_catalog.clone()),
         };
         spawn_listener_transports(
             ctx.supervisor,
@@ -65,7 +69,7 @@ impl RuntimeService for BootstrapService {
         let mut obf_protocols: Vec<String> =
             ctx.options.transport_obfuscation.keys().cloned().collect();
         obf_protocols.sort();
-        let handshake_payload = handshake::encode_hello(obf_protocols);
+        let handshake_payload = handshake::encode_hello(obf_protocols, ctx.options.quic.obfs.hello_obfs_mode());
         let bootstrap_dedupe = ctx.bootstrap_dial_dedupe.clone();
         let bootstrap_ok = ctx.bootstrap_dial_ok_ms.clone();
         let cancel_bootstrap = ctx.producer_cancel.clone();

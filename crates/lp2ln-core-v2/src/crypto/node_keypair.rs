@@ -53,6 +53,14 @@ impl NodeKeypair {
         &self.signing_key
     }
 
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        self.signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec()
+    }
+
     fn public_key_to_peer_id(verifying_key: &k256::ecdsa::VerifyingKey) -> String {
         let point = verifying_key.to_encoded_point(true);
         hex::encode(point.as_bytes())
