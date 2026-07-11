@@ -517,6 +517,10 @@ impl NodeOptions {
             "udp".to_string(),
             "0.0.0.0:8081".parse::<SocketAddr>().unwrap(),
         );
+        self.set_listen(
+            "quic".to_string(),
+            "0.0.0.0:8082".parse::<SocketAddr>().unwrap(),
+        );
         self
     }
 
