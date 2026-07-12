@@ -93,10 +93,7 @@ impl PacketIngressDispatcher {
                     let Some(job) = queue.pop(&cancel).await else {
                         break;
                     };
-                    match processor
-                        .process(job.incoming, job.router.clone())
-                        .await
-                    {
+                    match processor.process(job.incoming, job.router.clone()).await {
                         ProcessAction::CloseSession { session_id, reason } => {
                             crate::warn!(
                                 "[Router] closing session {} after processor action: {}",

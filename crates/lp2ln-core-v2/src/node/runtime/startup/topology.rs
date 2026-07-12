@@ -50,7 +50,8 @@ impl RuntimeService for TopologyService {
         let mut obf_protocols: Vec<String> =
             ctx.options.transport_obfuscation.keys().cloned().collect();
         obf_protocols.sort();
-        let maintenance_handshake = handshake::encode_hello(obf_protocols, ctx.options.quic.obfs.hello_obfs_mode());
+        let maintenance_handshake =
+            handshake::encode_hello(obf_protocols, ctx.options.quic.obfs.hello_obfs_mode());
         let nat_state = ctx.nat_state.clone();
         let bootstrap_dedupe = ctx.bootstrap_dial_dedupe.clone();
         let bootstrap_ok = ctx.bootstrap_dial_ok_ms.clone();

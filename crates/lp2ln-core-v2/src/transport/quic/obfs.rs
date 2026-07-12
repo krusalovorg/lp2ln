@@ -221,16 +221,20 @@ mod tests {
     #[test]
     fn obfs_config_is_active() {
         assert!(!QuicObfsConfig::default().is_active());
-        assert!(!QuicObfsConfig {
-            mode: QuicObfsMode::QuicInitialObfs,
-            password: None,
-        }
-        .is_active());
-        assert!(QuicObfsConfig {
-            mode: QuicObfsMode::QuicInitialObfs,
-            password: Some("secret".into()),
-        }
-        .is_active());
+        assert!(
+            !QuicObfsConfig {
+                mode: QuicObfsMode::QuicInitialObfs,
+                password: None,
+            }
+            .is_active()
+        );
+        assert!(
+            QuicObfsConfig {
+                mode: QuicObfsMode::QuicInitialObfs,
+                password: Some("secret".into()),
+            }
+            .is_active()
+        );
     }
 
     #[tokio::test]
@@ -254,11 +258,9 @@ mod tests {
         let server_config = build_server_config(&options).expect("server config");
         let client_config = build_client_config(&options).expect("client config");
 
-        let runtime =
-            quinn::default_runtime().expect("tokio runtime");
+        let runtime = quinn::default_runtime().expect("tokio runtime");
 
-        let server_std =
-            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind server");
+        let server_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind server");
         let server_addr = server_std.local_addr().unwrap();
         let server_inner = runtime.wrap_udp_socket(server_std).expect("wrap server");
         let server_obfs = Arc::new(XorObfsSocket::new(server_inner, password));
@@ -272,8 +274,7 @@ mod tests {
             .expect("server endpoint"),
         );
 
-        let client_std =
-            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client");
+        let client_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client");
         let client_inner = runtime.wrap_udp_socket(client_std).expect("wrap client");
         let client_obfs = Arc::new(XorObfsSocket::new(client_inner, password));
         let mut client_ep = quinn::Endpoint::new_with_abstract_socket(
@@ -331,8 +332,7 @@ mod tests {
         };
         outbound.send(packet.clone()).await.expect("send");
 
-        let (server_ep, server_conn, server_streams) =
-            server_task.await.expect("server task");
+        let (server_ep, server_conn, server_streams) = server_task.await.expect("server task");
         let inbound = QuicSession::new_from_streams(
             server_ep,
             server_conn,

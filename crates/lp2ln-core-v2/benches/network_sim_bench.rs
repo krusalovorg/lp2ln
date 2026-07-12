@@ -5,26 +5,49 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lp2ln_core_v2::logger::LoggerOptions;
+use lp2ln_core_v2::logger::{LoggerOptions, init};
 use lp2ln_core_v2::node::{NodeBuilder, NodeOptions, NodeRuntime};
+use lp2ln_core_v2::sessions::session::IncomingPacket;
 use lp2ln_core_v2::simulation::network::{
-    SimNetwork, graph_diameter_estimate, make_routing_packet,
+    SimNetwork, graph_diameter_estimate, make_routing_packet_with_id, wait_for_request_id,
 };
 use lp2ln_core_v2::simulation::topology::{
     ScenarioConfig, SimulationMetrics, run_baseline_scenario,
 };
-use lp2ln_core_v2::transport::tcp::TcpTransport;
 use lp2ln_core_v2::transport::Transport;
+use lp2ln_core_v2::transport::tcp::TcpTransport;
 use lp2ln_core_v2::types::PeerId;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 const TICKS_PER_NODE: usize = 150;
 const MAX_HOPS: u8 = 32;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const WAIT_TIMEOUT_LARGE: Duration = Duration::from_secs(120);
 const PAYLOAD_SIZES: &[usize] = &[100, 8 * 1024];
+
+fn init_bench_logger() {
+    init(&LoggerOptions {
+        log_dir: None,
+        file_enabled: false,
+        show_debug: false,
+        show_info: false,
+        show_warning: false,
+        show_error: false,
+    });
+}
+
+fn wait_timeout_for(node_count: usize) -> Duration {
+    if node_count >= 1000 {
+        WAIT_TIMEOUT_LARGE
+    } else {
+        WAIT_TIMEOUT
+    }
+}
 
 struct SimBenchEnv {
     _topo_metrics: SimulationMetrics,
@@ -136,7 +159,7 @@ async fn build_live_chain(node_count: usize) -> LiveChain {
             .expect("cross connect");
     }
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
 
     let last_peer_id = nodes[node_count - 1].peer_id().to_string();
     let first = Arc::new(nodes.remove(0));
@@ -149,20 +172,22 @@ async fn build_live_chain(node_count: usize) -> LiveChain {
 }
 
 async fn wait_live_delivery(
-    target: &NodeRuntime,
+    sub: &mut broadcast::Receiver<Arc<IncomingPacket>>,
     sender: &str,
     receiver: &str,
+    request_id: u64,
     timeout: Duration,
 ) -> Option<usize> {
-    let router = target.router().expect("router");
-    let mut sub = router.subscribe();
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, sub.recv()).await {
             Ok(Ok(incoming)) => {
                 let pkt = &incoming.packet;
-                if pkt.sender == sender && pkt.receiver == receiver {
+                if pkt.sender == sender
+                    && pkt.receiver == receiver
+                    && pkt.request_id == Some(request_id)
+                {
                     return Some(pkt.nodes.len());
                 }
             }
@@ -174,6 +199,7 @@ async fn wait_live_delivery(
 }
 
 fn network_sim_setup(c: &mut Criterion) {
+    init_bench_logger();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -201,6 +227,7 @@ fn network_sim_setup(c: &mut Criterion) {
 }
 
 fn network_sim_single_delivery(c: &mut Criterion) {
+    init_bench_logger();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -213,45 +240,72 @@ fn network_sim_single_delivery(c: &mut Criterion) {
 
     for &node_count in &sizes {
         let env = rt.block_on(build_sim_env(node_count));
-        let sender = env.network.peer_id(env.source).to_string();
-        let receiver = env.network.peer_id(env.target).to_string();
+        let network = Arc::new(env.network);
+        let sender = network.peer_id(env.source).to_string();
+        let receiver = network.peer_id(env.target).to_string();
+        let wait_timeout = wait_timeout_for(node_count);
+        let rx = Arc::new(tokio::sync::Mutex::new(network.subscribe(env.target)));
+        let seq = AtomicU64::new(1);
 
         for &payload in PAYLOAD_SIZES {
             let label = format!("{node_count}nodes/{}", format_size(payload));
             let source = env.source;
-            let target = env.target;
+            let shortest = env.shortest_hops;
+            group.throughput(Throughput::Bytes(payload as u64));
             group.bench_with_input(
                 BenchmarkId::new("farthest_pair", &label),
                 &payload,
                 |b, &payload| {
-                    b.to_async(&rt).iter(|| async {
-                        let mut rx = env.network.subscribe(target);
-                        let packet =
-                            make_routing_packet(&sender, &receiver, payload, MAX_HOPS);
-                        env.network.send_from(source, packet).await.expect("send");
-                        let metrics = lp2ln_core_v2::simulation::network::wait_for_deliveries(
-                            &mut rx,
-                            1,
-                            &sender,
-                            &receiver,
-                            WAIT_TIMEOUT,
-                        )
-                        .await;
-                        assert_eq!(
-                            metrics.delivered, 1,
-                            "single delivery failed (nodes={node_count})"
-                        );
-                        metrics.wall_time
+                    let network = network.clone();
+                    let rx = rx.clone();
+                    let sender = sender.clone();
+                    let receiver = receiver.clone();
+                    b.to_async(&rt).iter(|| {
+                        let request_id = seq.fetch_add(1, Ordering::Relaxed);
+                        let network = network.clone();
+                        let rx = rx.clone();
+                        let sender = sender.clone();
+                        let receiver = receiver.clone();
+                        async move {
+                            let packet = make_routing_packet_with_id(
+                                &sender,
+                                &receiver,
+                                payload,
+                                MAX_HOPS,
+                                Some(request_id),
+                            );
+                            network.send_from(source, packet).await.expect("send");
+                            let mut guard = rx.lock().await;
+                            let hops = wait_for_request_id(
+                                &mut guard,
+                                request_id,
+                                &sender,
+                                &receiver,
+                                wait_timeout,
+                            )
+                            .await
+                            .unwrap_or_else(|| {
+                                panic!("single delivery failed (nodes={node_count})");
+                            });
+                            assert!(
+                                hops <= shortest + 2,
+                                "hop count {hops} exceeds shortest {shortest} + 2"
+                            );
+                        }
                     });
                 },
             );
+            group.throughput(Throughput::Elements(1));
         }
-        rt.block_on(env.network.shutdown());
+        if let Ok(network) = Arc::try_unwrap(network) {
+            rt.block_on(network.shutdown());
+        }
     }
     group.finish();
 }
 
 fn network_sim_flood(c: &mut Criterion) {
+    init_bench_logger();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -266,20 +320,28 @@ fn network_sim_flood(c: &mut Criterion) {
 
     for &node_count in &sizes {
         let env = rt.block_on(build_sim_env(node_count));
-        let sender = env.network.peer_id(env.source).to_string();
-        let receiver = env.network.peer_id(env.target).to_string();
+        let network = Arc::new(env.network);
+        let sender = network.peer_id(env.source).to_string();
+        let receiver = network.peer_id(env.target).to_string();
         let label = format!("{node_count}nodes/8KB");
         let source = env.source;
         let target = env.target;
         let shortest = env.shortest_hops;
+        let wait_timeout = wait_timeout_for(node_count);
 
         group.bench_with_input(
             BenchmarkId::new("farthest_flood", &label),
             &node_count,
             |b, _| {
-                b.to_async(&rt).iter(|| async {
-                    let metrics = env
-                        .network
+                let network = network.clone();
+                let sender = sender.clone();
+                let receiver = receiver.clone();
+                b.to_async(&rt).iter(|| {
+                    let network = network.clone();
+                    let sender = sender.clone();
+                    let receiver = receiver.clone();
+                    async move {
+                    let metrics = network
                         .flood_and_wait_count(
                             source,
                             target,
@@ -288,7 +350,7 @@ fn network_sim_flood(c: &mut Criterion) {
                             BATCH,
                             8 * 1024,
                             MAX_HOPS,
-                            WAIT_TIMEOUT,
+                            wait_timeout,
                         )
                         .await;
                     eprintln!(
@@ -304,15 +366,19 @@ fn network_sim_flood(c: &mut Criterion) {
                         metrics.delivery_rate() * 100.0
                     );
                     metrics.wall_time
+                    }
                 });
             },
         );
-        rt.block_on(env.network.shutdown());
+        if let Ok(network) = Arc::try_unwrap(network) {
+            rt.block_on(network.shutdown());
+        }
     }
     group.finish();
 }
 
 fn network_sim_live(c: &mut Criterion) {
+    init_bench_logger();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -327,36 +393,54 @@ fn network_sim_live(c: &mut Criterion) {
         let chain = rt.block_on(build_live_chain(node_count));
         let sender = chain.first.peer_id().to_string();
         let receiver = chain.last_peer_id.clone();
-        let target = chain
-            ._nodes
-            .last()
-            .expect("last node");
+        let target = chain._nodes.last().expect("last node");
         let route = PeerId::from(receiver.as_str());
+        let sub = Arc::new(tokio::sync::Mutex::new(
+            target.router().expect("router").subscribe(),
+        ));
+        let hop_limit = chain.hop_count + 2;
 
         group.bench_with_input(
             BenchmarkId::new("chain_end_to_end", format!("{node_count}nodes")),
             &node_count,
             |b, _| {
-                b.to_async(&rt).iter(|| async {
-                    chain
-                        .first
-                        .send_with_options(
-                            route.clone(),
-                            vec![0xCD; 256],
-                            Some(receiver.clone()),
-                            Some(MAX_HOPS),
-                            None,
+                let first = chain.first.clone();
+                let route = route.clone();
+                let sub = sub.clone();
+                let sender = sender.clone();
+                let receiver = receiver.clone();
+                b.to_async(&rt).iter(|| {
+                    let first = first.clone();
+                    let route = route.clone();
+                    let sub = sub.clone();
+                    let sender = sender.clone();
+                    let receiver = receiver.clone();
+                    async move {
+                        let request_id = first
+                            .send_with_options(
+                                route,
+                                vec![0xCD; 256],
+                                Some(receiver.clone()),
+                                Some(MAX_HOPS),
+                                None,
+                            )
+                            .await
+                            .expect("live send");
+                        let mut guard = sub.lock().await;
+                        let hops = wait_live_delivery(
+                            &mut guard,
+                            &sender,
+                            &receiver,
+                            request_id,
+                            WAIT_TIMEOUT,
                         )
                         .await
-                        .expect("live send");
-                    let hops = wait_live_delivery(target, &sender, &receiver, WAIT_TIMEOUT)
-                        .await
                         .expect("live delivery");
-                    assert!(
-                        hops <= chain.hop_count + 2,
-                        "hop count {hops} exceeds chain expectation {}",
-                        chain.hop_count + 2
-                    );
+                        assert!(
+                            hops <= hop_limit,
+                            "hop count {hops} exceeds chain expectation {hop_limit}"
+                        );
+                    }
                 });
             },
         );

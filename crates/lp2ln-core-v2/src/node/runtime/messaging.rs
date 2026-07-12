@@ -42,7 +42,8 @@ impl NodeRuntime {
         let mut obf_protocols: Vec<String> =
             self.options.transport_obfuscation.keys().cloned().collect();
         obf_protocols.sort();
-        let handshake_payload = handshake::encode_hello(obf_protocols, self.options.quic.obfs.hello_obfs_mode());
+        let handshake_payload =
+            handshake::encode_hello(obf_protocols, self.options.quic.obfs.hello_obfs_mode());
         let handshake_pkt = Packet {
             signature: None,
             data: handshake_payload,

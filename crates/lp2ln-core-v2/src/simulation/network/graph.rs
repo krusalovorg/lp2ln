@@ -64,7 +64,10 @@ pub fn largest_component(snapshot: &TopologySnapshot) -> Vec<SimNodeId> {
     best
 }
 
-pub fn bfs_distances(start: SimNodeId, adj: &HashMap<SimNodeId, Vec<SimNodeId>>) -> HashMap<SimNodeId, usize> {
+pub fn bfs_distances(
+    start: SimNodeId,
+    adj: &HashMap<SimNodeId, Vec<SimNodeId>>,
+) -> HashMap<SimNodeId, usize> {
     let mut dist = HashMap::new();
     let mut queue = VecDeque::from([(start, 0usize)]);
     dist.insert(start, 0);
@@ -80,7 +83,11 @@ pub fn bfs_distances(start: SimNodeId, adj: &HashMap<SimNodeId, Vec<SimNodeId>>)
     dist
 }
 
-pub fn shortest_path_hops(snapshot: &TopologySnapshot, from: SimNodeId, to: SimNodeId) -> Option<usize> {
+pub fn shortest_path_hops(
+    snapshot: &TopologySnapshot,
+    from: SimNodeId,
+    to: SimNodeId,
+) -> Option<usize> {
     if from == to {
         return Some(0);
     }

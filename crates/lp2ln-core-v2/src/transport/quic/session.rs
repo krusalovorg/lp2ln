@@ -196,8 +196,8 @@ impl QuicSession {
                         None => break,
                     },
                 };
-                let write_result = tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut writer, &data))
-                    .await;
+                let write_result =
+                    tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut writer, &data)).await;
                 match write_result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -303,20 +303,19 @@ async fn run_loss_monitor(
                 config.loss_threshold * 100.0,
                 session_id_short
             );
-            let _ = event_tx
-                .try_send(CoreEvent::Transport(TransportEvent::Degraded {
-                    service: ServiceDescriptor::new(
-                        format!("quic-session:{}", session_id_short),
-                        ServiceKind::Transport,
-                    ),
-                    protocol: TransportProtocol::Quic,
-                    reason: format!(
-                        "packet loss {:.1}% exceeds threshold {:.1}%",
-                        loss_rate * 100.0,
-                        config.loss_threshold * 100.0,
-                    ),
-                    loss_rate,
-                }));
+            let _ = event_tx.try_send(CoreEvent::Transport(TransportEvent::Degraded {
+                service: ServiceDescriptor::new(
+                    format!("quic-session:{}", session_id_short),
+                    ServiceKind::Transport,
+                ),
+                protocol: TransportProtocol::Quic,
+                reason: format!(
+                    "packet loss {:.1}% exceeds threshold {:.1}%",
+                    loss_rate * 100.0,
+                    config.loss_threshold * 100.0,
+                ),
+                loss_rate,
+            }));
         } else if loss_rate <= config.loss_threshold && was_compensating {
             in_compensate.store(false, Ordering::Relaxed);
             crate::info!(

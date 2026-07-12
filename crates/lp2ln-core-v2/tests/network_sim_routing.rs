@@ -9,7 +9,9 @@ use lp2ln_core_v2::simulation::topology::{ScenarioConfig, run_baseline_scenario}
 const MAX_HOPS: u8 = 32;
 const WAIT: Duration = Duration::from_secs(10);
 
-async fn converged_snapshot(node_count: usize) -> lp2ln_core_v2::simulation::topology::TopologySnapshot {
+async fn converged_snapshot(
+    node_count: usize,
+) -> lp2ln_core_v2::simulation::topology::TopologySnapshot {
     let scenario = ScenarioConfig {
         node_count,
         steps: node_count.saturating_mul(150),
@@ -28,10 +30,7 @@ async fn delivers_across_farthest_pair_10_nodes() {
     let receiver = network.peer_id(pair.target).to_string();
     let mut rx = network.subscribe(pair.target);
     let packet = make_routing_packet(&sender, &receiver, 128, MAX_HOPS);
-    network
-        .send_from(pair.source, packet)
-        .await
-        .expect("send");
+    network.send_from(pair.source, packet).await.expect("send");
     let metrics = wait_for_deliveries(&mut rx, 1, &sender, &receiver, WAIT).await;
     network.shutdown().await;
     assert_eq!(metrics.delivered, 1, "packet must reach farthest node");
@@ -50,10 +49,7 @@ async fn hop_count_near_shortest_path() {
     let receiver = network.peer_id(pair.target).to_string();
     let mut rx = network.subscribe(pair.target);
     let packet = make_routing_packet(&sender, &receiver, 64, MAX_HOPS);
-    network
-        .send_from(pair.source, packet)
-        .await
-        .expect("send");
+    network.send_from(pair.source, packet).await.expect("send");
     let metrics = wait_for_deliveries(&mut rx, 1, &sender, &receiver, WAIT).await;
     network.shutdown().await;
     assert_eq!(metrics.delivered, 1);
@@ -95,27 +91,17 @@ async fn flood_delivery_rate_above_threshold() {
     const COUNT: usize = 20;
     let mut rx = network.subscribe(pair.target);
     for i in 0..COUNT {
-        let packet = make_routing_packet_with_id(
-            &sender,
-            &receiver,
-            256,
-            MAX_HOPS,
-            Some(i as u64 + 1),
-        );
+        let packet =
+            make_routing_packet_with_id(&sender, &receiver, 256, MAX_HOPS, Some(i as u64 + 1));
         network
             .send_from(pair.source, packet)
             .await
             .expect("flood send");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let metrics = wait_for_unique_deliveries(
-        &mut rx,
-        COUNT,
-        &sender,
-        &receiver,
-        Duration::from_secs(120),
-    )
-    .await;
+    let metrics =
+        wait_for_unique_deliveries(&mut rx, COUNT, &sender, &receiver, Duration::from_secs(120))
+            .await;
     network.shutdown().await;
     assert!(
         metrics.delivery_rate() >= 0.95,

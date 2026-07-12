@@ -50,10 +50,11 @@ async fn quic_transport_start_dial_and_exchange_packet() {
     // the listener's accept_bi() and makes the inbound session available.
     outbound.send(packet.clone()).await.expect("send packet");
 
-    let inbound: Arc<dyn Session> = tokio::time::timeout(Duration::from_secs(5), incoming_sessions_rx.recv())
-        .await
-        .expect("incoming session timeout")
-        .expect("incoming session channel closed");
+    let inbound: Arc<dyn Session> =
+        tokio::time::timeout(Duration::from_secs(5), incoming_sessions_rx.recv())
+            .await
+            .expect("incoming session timeout")
+            .expect("incoming session channel closed");
 
     let (tx, mut rx) = mpsc::channel(4);
     inbound.clone().spawn_reader(tx);

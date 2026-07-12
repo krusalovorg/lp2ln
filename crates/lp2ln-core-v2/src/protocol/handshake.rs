@@ -22,7 +22,10 @@ pub struct HandshakeHello {
 
 pub const HANDSHAKE_VERSION: u16 = 1;
 
-pub fn encode_hello(enabled_transport_obfuscation: Vec<String>, quic_obfs_mode: Option<String>) -> Vec<u8> {
+pub fn encode_hello(
+    enabled_transport_obfuscation: Vec<String>,
+    quic_obfs_mode: Option<String>,
+) -> Vec<u8> {
     let hello = HandshakeHello {
         version: HANDSHAKE_VERSION,
         features: HandshakeFeatures {

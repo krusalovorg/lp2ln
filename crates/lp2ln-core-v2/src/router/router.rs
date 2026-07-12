@@ -90,8 +90,7 @@ impl Router {
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id = our_peer_id.into();
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
-        let (incoming_broadcast_tx, _rx) =
-            broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
+        let (incoming_broadcast_tx, _rx) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();

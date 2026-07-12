@@ -59,10 +59,8 @@ async fn serve_static_404(conn: Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::quic::config::{build_server_config, QuicTransportOptions};
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
+    use crate::transport::quic::config::{QuicTransportOptions, build_server_config};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
     use std::sync::Arc;
@@ -159,7 +157,9 @@ mod tests {
 
         let h3_conn = h3_quinn::Connection::new(quinn_conn);
         let (mut driver, mut send_req) = h3::client::new(h3_conn).await.expect("h3 client");
-        tokio::spawn(async move { let _ = driver.wait_idle().await; });
+        tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
 
         let req = http::Request::builder()
             .method("GET")

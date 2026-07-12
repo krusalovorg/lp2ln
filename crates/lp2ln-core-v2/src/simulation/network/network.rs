@@ -11,13 +11,14 @@ use crate::simulation::topology::{SimEdge, SimNodeId, TopologySnapshot};
 use crate::types::PeerId;
 use crate::{SessionId, sessions::session::IncomingPacket};
 
-use super::graph::{find_farthest_pair, shortest_path_hops, FarthestPair};
+use super::graph::{FarthestPair, find_farthest_pair, shortest_path_hops};
 use super::linked_session::LinkedSession;
 use super::metrics::{
-    make_routing_packet, make_routing_packet_with_id, wait_for_deliveries, wait_for_request_id,
-    RoutingMetrics,
+    RoutingMetrics, make_routing_packet, make_routing_packet_with_id, wait_for_deliveries,
+    wait_for_request_id,
 };
 use super::node::SimNode;
+use super::routing::SimRoutingTable;
 
 pub struct SimNetwork {
     nodes: BTreeMap<SimNodeId, SimNode>,
@@ -27,14 +28,18 @@ pub struct SimNetwork {
 impl SimNetwork {
     pub async fn from_topology_snapshot(snapshot: &TopologySnapshot) -> Result<Self> {
         let cancel = CancellationToken::new();
+        let routing = Arc::new(SimRoutingTable::new());
         let mut nodes: BTreeMap<SimNodeId, SimNode> = BTreeMap::new();
 
         for (&node_id, state) in &snapshot.nodes {
             if !state.online {
                 continue;
             }
-            nodes.insert(node_id, SimNode::spawn(node_id, cancel.clone()));
+            let node = SimNode::spawn(node_id, cancel.clone(), routing.clone());
+            routing.register_peer(node_id, node.peer_id.clone());
+            nodes.insert(node_id, node);
         }
+        routing.build_from_snapshot(snapshot);
 
         for edge in &snapshot.edges {
             wire_edge(snapshot, edge, &nodes)?;
@@ -58,10 +63,7 @@ impl SimNetwork {
         self.nodes.get(&node).expect("sim node").router.clone()
     }
 
-    pub fn subscribe(
-        &self,
-        node: SimNodeId,
-    ) -> broadcast::Receiver<Arc<IncomingPacket>> {
+    pub fn subscribe(&self, node: SimNodeId) -> broadcast::Receiver<Arc<IncomingPacket>> {
         self.nodes.get(&node).expect("sim node").router.subscribe()
     }
 
@@ -137,11 +139,7 @@ impl SimNetwork {
         }
     }
 
-    pub async fn send_from(
-        &self,
-        from: SimNodeId,
-        packet: Packet,
-    ) -> Result<u64> {
+    pub async fn send_from(&self, from: SimNodeId, packet: Packet) -> Result<u64> {
         let router = self.router(from);
         let target = PeerId::from(packet.receiver.as_str());
         router.send_to_peer(target, packet, None).await

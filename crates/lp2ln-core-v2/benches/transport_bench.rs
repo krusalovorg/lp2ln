@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lp2ln_core_v2::packet::Packet;
-use lp2ln_core_v2::sessions::{IncomingPacket, Session};
 use lp2ln_core_v2::sessions::session::LinkKind;
+use lp2ln_core_v2::sessions::{IncomingPacket, Session};
 use lp2ln_core_v2::transport::obfuscation::Obfuscator;
 use lp2ln_core_v2::transport::quic::{QuicTransport, QuicTransportOptions};
 use lp2ln_core_v2::transport::tcp::TcpSession;
@@ -49,9 +49,8 @@ async fn pair_tcp() -> (Arc<dyn Session>, Arc<dyn Session>) {
     });
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    let client =
-        TcpSession::new_from_stream(stream, None, LinkKind::DirectTcp, obfs).unwrap()
-            as Arc<dyn Session>;
+    let client = TcpSession::new_from_stream(stream, None, LinkKind::DirectTcp, obfs).unwrap()
+        as Arc<dyn Session>;
     let server = rx.await.unwrap();
     (client, server)
 }
@@ -64,12 +63,10 @@ async fn pair_udp() -> (Arc<dyn Session>, Arc<dyn Session>) {
     let addr_a = a.local_addr().unwrap();
     let addr_b = b.local_addr().unwrap();
 
-    let sess_a =
-        UdpSession::new_from_socket(a, addr_b, None, LinkKind::DirectUdp, obfs.clone())
-            .unwrap() as Arc<dyn Session>;
-    let sess_b =
-        UdpSession::new_from_socket(b, addr_a, None, LinkKind::DirectUdp, obfs).unwrap()
-            as Arc<dyn Session>;
+    let sess_a = UdpSession::new_from_socket(a, addr_b, None, LinkKind::DirectUdp, obfs.clone())
+        .unwrap() as Arc<dyn Session>;
+    let sess_b = UdpSession::new_from_socket(b, addr_a, None, LinkKind::DirectUdp, obfs).unwrap()
+        as Arc<dyn Session>;
     (sess_a, sess_b)
 }
 
@@ -121,7 +118,10 @@ fn drain(session: Arc<dyn Session>) {
 async fn setup_echo(
     client: Arc<dyn Session>,
     server: Arc<dyn Session>,
-) -> (Arc<dyn Session>, Arc<tokio::sync::Mutex<mpsc::Receiver<IncomingPacket>>>) {
+) -> (
+    Arc<dyn Session>,
+    Arc<tokio::sync::Mutex<mpsc::Receiver<IncomingPacket>>>,
+) {
     let (echo_tx, mut echo_rx) = mpsc::channel::<IncomingPacket>(256);
     server.clone().spawn_reader(echo_tx);
     let server2 = server.clone();

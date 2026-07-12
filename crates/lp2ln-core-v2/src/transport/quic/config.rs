@@ -146,8 +146,7 @@ pub fn build_client_config(options: &QuicTransportOptions) -> Result<ClientConfi
         rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn);
     }
 
-    let mut client_config =
-        ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?));
+    let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?));
     client_config.transport_config(Arc::new(transport_config(options)));
     Ok(client_config)
 }
@@ -155,7 +154,9 @@ pub fn build_client_config(options: &QuicTransportOptions) -> Result<ClientConfi
 fn transport_config(options: &QuicTransportOptions) -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(options.max_concurrent_bidi_streams));
-    transport.max_idle_timeout(Some(idle_timeout_varint(options.max_idle_timeout_secs).into()));
+    transport.max_idle_timeout(Some(
+        idle_timeout_varint(options.max_idle_timeout_secs).into(),
+    ));
     transport.initial_mtu(options.initial_mtu);
     transport
 }
@@ -185,10 +186,10 @@ fn load_tls_from_files(
     cert_path: &PathBuf,
     key_path: &PathBuf,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_pem = fs::read(cert_path)
-        .with_context(|| format!("read QUIC cert {}", cert_path.display()))?;
-    let key_pem = fs::read(key_path)
-        .with_context(|| format!("read QUIC key {}", key_path.display()))?;
+    let cert_pem =
+        fs::read(cert_path).with_context(|| format!("read QUIC cert {}", cert_path.display()))?;
+    let key_pem =
+        fs::read(key_path).with_context(|| format!("read QUIC key {}", key_path.display()))?;
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
@@ -217,21 +218,18 @@ fn to_owned_private_key(key: PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(k) => {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k.secret_pkcs8_der().to_vec()))
         }
-        PrivateKeyDer::Pkcs1(k) => {
-            PrivateKeyDer::Pkcs1(rustls::pki_types::PrivatePkcs1KeyDer::from(
-                k.secret_pkcs1_der().to_vec(),
-            ))
-        }
-        PrivateKeyDer::Sec1(k) => {
-            PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(
-                k.secret_sec1_der().to_vec(),
-            ))
-        }
+        PrivateKeyDer::Pkcs1(k) => PrivateKeyDer::Pkcs1(
+            rustls::pki_types::PrivatePkcs1KeyDer::from(k.secret_pkcs1_der().to_vec()),
+        ),
+        PrivateKeyDer::Sec1(k) => PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(
+            k.secret_sec1_der().to_vec(),
+        )),
         other => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(other.secret_der().to_vec())),
     }
 }
 
-fn generate_ephemeral_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn generate_ephemeral_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>
+{
     let key_pair = KeyPair::generate().context("generate QUIC TLS key pair")?;
     let mut params = CertificateParams::new(vec!["lp2ln.local".to_string()])
         .context("build QUIC certificate params")?;
@@ -336,8 +334,8 @@ mod tests {
     #[tokio::test]
     async fn quic_session_exchange_packet() {
         use crate::packet::Packet;
-        use crate::sessions::session::LinkKind;
         use crate::sessions::Session;
+        use crate::sessions::session::LinkKind;
         use crate::transport::quic::session::QuicSession;
         use tokio::sync::mpsc;
 

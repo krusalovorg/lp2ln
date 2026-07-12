@@ -108,7 +108,11 @@ pub trait Transport: Send + Sync {
 
     /// Dial with optional peer_id hint for per-peer obfs key derivation.
     /// Default: delegates to `dial`. Override in QUIC transport.
-    async fn dial_with_peer(&self, addr: SocketAddr, _peer_id: Option<&str>) -> Result<Arc<dyn Session>> {
+    async fn dial_with_peer(
+        &self,
+        addr: SocketAddr,
+        _peer_id: Option<&str>,
+    ) -> Result<Arc<dyn Session>> {
         self.dial(addr).await
     }
 

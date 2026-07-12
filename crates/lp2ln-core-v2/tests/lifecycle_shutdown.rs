@@ -27,8 +27,8 @@ async fn start_test_node() -> NodeRuntime {
 #[tokio::test]
 async fn stop_terminates_quic_listener() {
     let options = QuicTransportOptions::default();
-    let mut opts = NodeOptions::empty()
-        .with_listen("quic", "127.0.0.1:0".parse().expect("valid addr"));
+    let mut opts =
+        NodeOptions::empty().with_listen("quic", "127.0.0.1:0".parse().expect("valid addr"));
     opts.quic = options;
     opts.enable_topology_maintenance = false;
 

@@ -69,7 +69,8 @@ impl RuntimeService for BootstrapService {
         let mut obf_protocols: Vec<String> =
             ctx.options.transport_obfuscation.keys().cloned().collect();
         obf_protocols.sort();
-        let handshake_payload = handshake::encode_hello(obf_protocols, ctx.options.quic.obfs.hello_obfs_mode());
+        let handshake_payload =
+            handshake::encode_hello(obf_protocols, ctx.options.quic.obfs.hello_obfs_mode());
         let bootstrap_dedupe = ctx.bootstrap_dial_dedupe.clone();
         let bootstrap_ok = ctx.bootstrap_dial_ok_ms.clone();
         let cancel_bootstrap = ctx.producer_cancel.clone();

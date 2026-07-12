@@ -29,11 +29,11 @@ use lp2ln_core_v2::packet::Packet;
 use lp2ln_core_v2::router::Router;
 use lp2ln_core_v2::sessions::Session;
 use lp2ln_core_v2::sessions::session::{IncomingPacket, LinkKind};
+use lp2ln_core_v2::transport::Transport;
 use lp2ln_core_v2::transport::obfuscation::Obfuscator;
 use lp2ln_core_v2::transport::quic::{QuicTransport, QuicTransportOptions};
 use lp2ln_core_v2::transport::tcp::TcpTransport;
 use lp2ln_core_v2::transport::udp::{UdpSession, UdpTransport};
-use lp2ln_core_v2::transport::Transport;
 use lp2ln_core_v2::types::SessionId;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
@@ -155,7 +155,9 @@ async fn setup(proto: Protocol, security: SecurityProfile) -> BenchSetup {
         Protocol::Udp => setup_udp(security).await,
         Protocol::Quic => setup_quic(security).await,
     };
-    let subscriber = Arc::new(tokio::sync::Mutex::new(node_a.router().unwrap().subscribe()));
+    let subscriber = Arc::new(tokio::sync::Mutex::new(
+        node_a.router().unwrap().subscribe(),
+    ));
     BenchSetup {
         _nodes: (node_a, node_b),
         router_b,
@@ -168,7 +170,14 @@ async fn setup(proto: Protocol, security: SecurityProfile) -> BenchSetup {
 
 async fn setup_tcp(
     security: SecurityProfile,
-) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+) -> (
+    NodeRuntime,
+    NodeRuntime,
+    Arc<Router>,
+    SessionId,
+    String,
+    String,
+) {
     let port = free_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
@@ -199,7 +208,14 @@ async fn setup_tcp(
 // ~50% of bench datagrams to be silently discarded by the accept loop.
 async fn setup_udp(
     security: SecurityProfile,
-) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+) -> (
+    NodeRuntime,
+    NodeRuntime,
+    Arc<Router>,
+    SessionId,
+    String,
+    String,
+) {
     let mut node_a = NodeBuilder::new()
         .add_transport(Arc::new(UdpTransport::new_dial()) as Arc<dyn Transport>)
         .build(node_opts(None, security))
@@ -218,10 +234,11 @@ async fn setup_udp(
     let addr_a = sock_a.local_addr().unwrap();
     let addr_b = sock_b.local_addr().unwrap();
 
-    let sess_a = UdpSession::new_from_socket(sock_a, addr_b, None, LinkKind::DirectUdp, obfs.clone())
-        .unwrap();
-    let sess_b = UdpSession::new_from_socket(sock_b, addr_a, None, LinkKind::DirectUdp, obfs)
-        .unwrap();
+    let sess_a =
+        UdpSession::new_from_socket(sock_a, addr_b, None, LinkKind::DirectUdp, obfs.clone())
+            .unwrap();
+    let sess_b =
+        UdpSession::new_from_socket(sock_b, addr_a, None, LinkKind::DirectUdp, obfs).unwrap();
 
     let router_a = node_a.router().unwrap();
     let router_b = node_b.router().unwrap();
@@ -243,7 +260,14 @@ async fn setup_udp(
 
 async fn setup_quic(
     security: SecurityProfile,
-) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+) -> (
+    NodeRuntime,
+    NodeRuntime,
+    Arc<Router>,
+    SessionId,
+    String,
+    String,
+) {
     let port = free_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let quic_opts = QuicTransportOptions::default();
@@ -392,7 +416,9 @@ async fn cpu_probe() {
     const PAYLOAD: usize = 8 * 1024;
     let batch = batch_for_payload(PAYLOAD);
 
-    eprintln!("\n[LP2LN_BENCH_CPU] {PROBE_SECS}s QUIC 8KB probe (verify_off, full crypto egress/ingress)...");
+    eprintln!(
+        "\n[LP2LN_BENCH_CPU] {PROBE_SECS}s QUIC 8KB probe (verify_off, full crypto egress/ingress)..."
+    );
 
     let setup = setup(Protocol::Quic, VERIFY_OFF).await;
     let router_b = setup.router_b;
@@ -458,16 +484,12 @@ async fn cpu_probe() {
     stop.store(true, Ordering::Relaxed);
     let (core_samples, process_peak) = sampler.join().expect("cpu sampler thread");
 
-    let hottest = core_samples
-        .iter()
-        .max_by(|a, b| {
-            a.max_util_pct
-                .partial_cmp(&b.max_util_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    eprintln!(
-        "[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%"
-    );
+    let hottest = core_samples.iter().max_by(|a, b| {
+        a.max_util_pct
+            .partial_cmp(&b.max_util_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    eprintln!("[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%");
     if let Some(h) = hottest {
         eprintln!(
             "[LP2LN_BENCH_CPU] hottest core: #{} at {:.1}% — {}",

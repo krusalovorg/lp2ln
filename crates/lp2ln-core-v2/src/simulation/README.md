@@ -43,7 +43,9 @@ using existing policy logic from topology maintenance while preserving runtime b
 
 The `simulation::network` module wires converged topology snapshots to real
 `Router` + `DefaultPacketProcessor` instances via in-memory `LinkedSession` links.
-It measures multi-hop delivery between the farthest pair of nodes in the graph.
+Each sim node uses a BFS `SimRoutingTable` (shortest-path next hop) so multi-hop
+delivery is deterministic on random converged graphs. It measures multi-hop
+delivery between the farthest pair of nodes in the graph.
 
 ### Run network sim benchmark
 

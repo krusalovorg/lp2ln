@@ -347,11 +347,7 @@ impl SessionManager {
         let ids: Vec<SessionId> = guard.value().clone();
         drop(guard);
         ids.into_iter()
-            .filter_map(|sid| {
-                self.session_to_peer
-                    .get(&sid)
-                    .map(|pid| (pid.clone(), sid))
-            })
+            .filter_map(|sid| self.session_to_peer.get(&sid).map(|pid| (pid.clone(), sid)))
             .collect()
     }
 

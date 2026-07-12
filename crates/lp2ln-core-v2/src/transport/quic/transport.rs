@@ -79,8 +79,8 @@ impl QuicTransport {
             let password = self.options.obfs.password.as_deref().unwrap();
             let runtime = quinn::default_runtime()
                 .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC obfs client"))?;
-            let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")
-                .context("bind QUIC obfs client socket")?;
+            let std_sock =
+                std::net::UdpSocket::bind("0.0.0.0:0").context("bind QUIC obfs client socket")?;
             let inner = runtime
                 .wrap_udp_socket(std_sock)
                 .context("wrap QUIC obfs client socket")?;
@@ -172,7 +172,8 @@ async fn handle_incoming_connection(
     if alpn.as_deref() == Some(b"h3") {
         match masquerade_config {
             Some(cfg) if cfg.enabled => {
-                match tokio::time::timeout(Duration::from_millis(500), connection.accept_bi()).await {
+                match tokio::time::timeout(Duration::from_millis(500), connection.accept_bi()).await
+                {
                     Ok(Ok(streams)) => {
                         // LP2LN client — fall through to session creation with these streams
                         crate::info!("[QuicTransport] LP2LN client via h3 ALPN from {}", remote);
@@ -188,7 +189,10 @@ async fn handle_incoming_connection(
                         .await;
                     }
                     _ => {
-                        crate::info!("[QuicTransport] h3 probe from {}, serving masquerade", remote);
+                        crate::info!(
+                            "[QuicTransport] h3 probe from {}, serving masquerade",
+                            remote
+                        );
                         masquerade::serve(connection, cfg).await;
                     }
                 }
@@ -221,7 +225,16 @@ async fn handle_incoming_connection(
         }
     };
 
-    register_session(endpoint, connection, (send, recv), remote, incoming_sessions_tx, event_tx, adaptive).await;
+    register_session(
+        endpoint,
+        connection,
+        (send, recv),
+        remote,
+        incoming_sessions_tx,
+        event_tx,
+        adaptive,
+    )
+    .await;
 }
 
 #[async_trait]
@@ -270,7 +283,10 @@ impl Transport for QuicTransport {
                 .wrap_udp_socket(std_sock)
                 .context("wrap QUIC obfs server socket")?;
             let obfs = Arc::new(XorObfsSocket::new(inner, password));
-            crate::info!("[QuicTransport] Starting with quic_initial_obfs on {}", bind_addr);
+            crate::info!(
+                "[QuicTransport] Starting with quic_initial_obfs on {}",
+                bind_addr
+            );
             Endpoint::new_with_abstract_socket(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
@@ -390,7 +406,11 @@ impl Transport for QuicTransport {
         Ok(session as Arc<dyn Session>)
     }
 
-    async fn dial_with_peer(&self, addr: SocketAddr, peer_id: Option<&str>) -> Result<Arc<dyn Session>> {
+    async fn dial_with_peer(
+        &self,
+        addr: SocketAddr,
+        peer_id: Option<&str>,
+    ) -> Result<Arc<dyn Session>> {
         // Auto mode: derive per-peer ECDH obfs key if we know the peer and they support it.
         if let (QuicObfsMode::Auto, Some(pid)) = (&self.options.obfs.mode, peer_id) {
             let keypair = self.keypair.lock().await.clone();
@@ -412,11 +432,15 @@ impl Transport for QuicTransport {
 }
 
 impl QuicTransport {
-    async fn dial_with_obfs_key(&self, addr: SocketAddr, key: [u8; 32]) -> Result<Arc<dyn Session>> {
+    async fn dial_with_obfs_key(
+        &self,
+        addr: SocketAddr,
+        key: [u8; 32],
+    ) -> Result<Arc<dyn Session>> {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC obfs dial"))?;
-        let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("bind QUIC obfs dial socket")?;
+        let std_sock =
+            std::net::UdpSocket::bind("0.0.0.0:0").context("bind QUIC obfs dial socket")?;
         let inner = runtime
             .wrap_udp_socket(std_sock)
             .context("wrap QUIC obfs dial socket")?;
@@ -435,7 +459,10 @@ impl QuicTransport {
             .context(format!("quic obfs connect {}", addr))?
             .await
             .with_context(|| format!("quic obfs handshake {}", addr))?;
-        let (send, recv) = connection.open_bi().await.context("open QUIC obfs bidi stream")?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .context("open QUIC obfs bidi stream")?;
         let event_tx = self.event_tx.lock().await.clone();
         let adaptive = if self.options.adaptive_loss.enabled {
             Some(self.options.adaptive_loss.clone())
@@ -443,7 +470,14 @@ impl QuicTransport {
             None
         };
         let session = QuicSession::new_from_streams(
-            endpoint, connection, send, recv, None, LinkKind::DirectQuic, event_tx, adaptive,
+            endpoint,
+            connection,
+            send,
+            recv,
+            None,
+            LinkKind::DirectQuic,
+            event_tx,
+            adaptive,
         )?;
         crate::info!("[QuicTransport] Obfs session (ECDH) created for {}", addr);
         Ok(session as Arc<dyn Session>)

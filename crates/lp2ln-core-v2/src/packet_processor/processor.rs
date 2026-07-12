@@ -44,6 +44,7 @@ pub struct DefaultPacketProcessor {
     peer_cache: Arc<PeerCryptoCache>,
     replay_windows: Arc<DashMap<String, ReplayWindow>>,
     session_drop_counts: Arc<DashMap<SessionId, u32>>,
+    forward_hop_resolver: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
 }
 
 impl DefaultPacketProcessor {
@@ -66,7 +67,16 @@ impl DefaultPacketProcessor {
             peer_cache,
             replay_windows: Arc::new(DashMap::new()),
             session_drop_counts: Arc::new(DashMap::new()),
+            forward_hop_resolver: None,
         }
+    }
+
+    pub fn with_forward_hop_resolver(
+        mut self,
+        resolver: Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.forward_hop_resolver = Some(resolver);
+        self
     }
 
     pub fn peer_cache(&self) -> &Arc<PeerCryptoCache> {
@@ -202,12 +212,18 @@ impl PacketProcessor for DefaultPacketProcessor {
             )
             .await;
         } else {
+            let forward_target = self
+                .forward_hop_resolver
+                .as_ref()
+                .and_then(|resolve| resolve(&self.our_peer_id, receiver.as_str()))
+                .map(|hop| PeerId::from_str(hop.as_str()))
+                .unwrap_or_else(|| PeerId::from_str(receiver.as_str()));
             super::forwarding::forward_packet(
                 packet,
                 incoming_packet.session_id.as_str(),
                 &self.our_peer_id,
                 &peer_id,
-                PeerId::from_str(receiver.as_str()),
+                forward_target,
                 publisher,
             )
             .await;
