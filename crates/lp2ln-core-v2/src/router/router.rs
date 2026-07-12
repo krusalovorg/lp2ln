@@ -28,8 +28,6 @@ use crate::{
 pub const ROUTER_INCOMING_QUEUE_CAP: usize = 16384;
 const ROUTER_BROADCAST_CAP: usize = 4096;
 pub const ROUTER_PROCESS_SEMAPHORE_PERMITS: usize = 256;
-const ROUTER_FALLBACK_FANOUT: usize = 4;
-
 /// Outcome of [`Router::run`]. Replaces the previous `Result<()>` plus
 /// `is_ingress_closed()` side-channel so the supervised loop decides whether
 /// to restart from a typed value.
@@ -287,7 +285,6 @@ impl Router {
         let hop_nodes = packet.nodes.clone();
         let wire = encode_packet(packet)?;
         let mut any_ok = false;
-        let mut sent_count = 0usize;
         let mut last_err = None;
         for neighbor in peers {
             if exclude_from.as_ref() == Some(&neighbor) {
@@ -308,10 +305,9 @@ impl Router {
                             bytes,
                         );
                         any_ok = true;
-                        sent_count += 1;
-                        if sent_count >= ROUTER_FALLBACK_FANOUT {
-                            break;
-                        }
+                        // One successful neighbor is enough; fanning out the same
+                        // wire frame duplicates secure seqs on alternate paths.
+                        break;
                     }
                     Err(e) => {
                         MetricsProvider::record_send_error(

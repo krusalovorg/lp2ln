@@ -14,8 +14,8 @@ pub struct LinkedSession {
     id: String,
     /// Peer id of the node at the far end of this link (who we are connected to).
     remote_peer_id: String,
-    /// Our peer id (unused on wire; kept for session registration symmetry).
-    _local_peer_id: String,
+    /// Our peer id — ingress `from_node` for packets we deliver to the remote.
+    local_peer_id: String,
     /// Session id registered on the remote router for this link.
     remote_session_id: String,
     remote_incoming: mpsc::Sender<IncomingPacket>,
@@ -34,7 +34,7 @@ impl LinkedSession {
         Arc::new(Self {
             id: id.into(),
             remote_peer_id: remote_peer_id.into(),
-            _local_peer_id: local_peer_id.into(),
+            local_peer_id: local_peer_id.into(),
             remote_session_id: remote_session_id.into(),
             remote_incoming,
             latency_ms,
@@ -68,7 +68,7 @@ impl Session for LinkedSession {
         let bytes = packet.wire_size_estimate() as u64;
         let incoming = IncomingPacket {
             session_id: self.remote_session_id.clone(),
-            from_node: None,
+            from_node: Some(self.local_peer_id.clone()),
             packet,
         };
         // Do not block the sender router on a full remote ingress queue; sim harness

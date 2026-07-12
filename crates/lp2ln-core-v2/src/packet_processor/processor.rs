@@ -106,14 +106,20 @@ impl PacketProcessor for DefaultPacketProcessor {
             }
         }
 
-        if let Some(bound_peer) = incoming_packet.from_node.as_deref() {
-            if bound_peer != packet.sender {
-                crate::processor!(
-                    "Session peer_id mismatch: bound={} packet.sender={}, dropping",
-                    bound_peer,
-                    packet.sender
-                );
-                return self.record_drop(session_id, "session peer mismatch");
+        // `from_node` is the immediate link neighbor. On relay hops it differs from
+        // `packet.sender` (the original author). Enforce equality only on the first
+        // hop where the neighbor must be the logical sender; signature checks still
+        // apply on every hop.
+        if packet.nodes.is_empty() {
+            if let Some(bound_peer) = incoming_packet.from_node.as_deref() {
+                if bound_peer != packet.sender {
+                    crate::processor!(
+                        "Session peer_id mismatch: bound={} packet.sender={}, dropping",
+                        bound_peer,
+                        packet.sender
+                    );
+                    return self.record_drop(session_id, "session peer mismatch");
+                }
             }
         }
 

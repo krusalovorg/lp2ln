@@ -274,13 +274,13 @@ async fn router_fallback_fans_out_to_neighbors_but_skips_excluded_and_path_peers
         .expect("fallback send");
 
     let total_sent: usize = sessions.iter().map(|(_, s)| s.sent_len()).sum();
-    assert_eq!(total_sent, 3);
+    assert_eq!(total_sent, 1, "fallback sends to one eligible neighbor");
     assert_eq!(sessions[1].1.sent_len(), 0, "exclude_from peer was flooded");
     assert_eq!(sessions[2].1.sent_len(), 0, "path peer was flooded");
 }
 
 #[tokio::test]
-async fn router_fallback_is_limited_to_four_neighbors() {
+async fn router_fallback_sends_to_first_eligible_neighbor() {
     let (router, _manager) = test_router();
     let mut sessions = Vec::new();
     for i in 0..6 {
@@ -304,7 +304,7 @@ async fn router_fallback_is_limited_to_four_neighbors() {
         .expect("fallback send");
 
     let total_sent: usize = sessions.iter().map(|s| s.sent_len()).sum();
-    assert_eq!(total_sent, 4);
+    assert_eq!(total_sent, 1, "one wire frame per fallback send");
 }
 
 #[tokio::test]

@@ -159,8 +159,12 @@ impl PacketIngressDispatcher {
             return;
         };
 
-        if incoming.from_node.is_none() && !incoming.packet.sender.is_empty() {
-            incoming.from_node = Some(incoming.packet.sender.clone());
+        // `from_node` is the immediate link neighbor (set by transports). Fallback
+        // to logical sender only when the session has no peer binding (e.g. fakes).
+        if incoming.from_node.is_none() && incoming.packet.nodes.is_empty() {
+            if !incoming.packet.sender.is_empty() {
+                incoming.from_node = Some(incoming.packet.sender.clone());
+            }
         }
 
         let skip_early_ipc =
