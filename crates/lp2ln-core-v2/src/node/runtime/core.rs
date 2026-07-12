@@ -10,6 +10,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::crypto::NodeKeypair;
+use crate::crypto::peer_cache::PeerCryptoCache;
 use crate::db::P2PDatabase;
 use crate::event_core::prelude::{CoreBus, HandlerRegistration};
 use crate::logger;
@@ -41,6 +42,7 @@ pub struct NodeRuntime {
     pub(crate) bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
     pub(crate) bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
     pub(crate) descriptor_version: Arc<AtomicU64>,
+    pub(crate) peer_crypto_cache: Arc<PeerCryptoCache>,
     pub(crate) router: Option<Arc<Router>>,
     pub(crate) incoming_sessions_tx: Mutex<Option<mpsc::Sender<Arc<dyn Session>>>>,
     pub(crate) lifecycle: Mutex<NodeLifecycleState>,
@@ -75,6 +77,7 @@ impl NodeRuntime {
             })
             .unwrap_or_else(NodeKeypair::generate);
         let nat_state = NatTraversalState::new();
+        let peer_crypto_cache = PeerCryptoCache::new();
         let packet_processor = packet_processor.unwrap_or_else(|| {
             Arc::new(DefaultPacketProcessor::new(
                 keypair.peer_id().to_string(),
@@ -83,6 +86,7 @@ impl NodeRuntime {
                 options.peer_discovery_random_fraction,
                 nat_state.clone(),
                 keypair.clone(),
+                peer_crypto_cache.clone(),
             )) as Arc<dyn PacketProcessor>
         });
         let peer_scores = Arc::new(PeerScoreStore::new());
@@ -123,6 +127,8 @@ impl NodeRuntime {
                 supervisor_shutdown_timeout_secs: options.supervisor_shutdown_timeout_secs,
                 router_incoming_queue_cap: options.router_incoming_queue_cap,
                 router_broadcast_cap: options.router_broadcast_cap,
+                router_process_concurrency: options.router_process_concurrency,
+                signature_format: options.signature_format,
                 enable_topology_maintenance: options.enable_topology_maintenance,
                 event_bus_broadcast_cap: options.event_bus_broadcast_cap,
                 stop_on_permanent_degradation: options.stop_on_permanent_degradation,
@@ -140,6 +146,7 @@ impl NodeRuntime {
             bootstrap_dial_dedupe: Arc::new(Mutex::new(HashSet::new())),
             bootstrap_dial_ok_ms: Arc::new(Mutex::new(HashMap::new())),
             descriptor_version: Arc::new(AtomicU64::new(1)),
+            peer_crypto_cache,
             router: None,
             incoming_sessions_tx: Mutex::new(None),
             lifecycle: Mutex::new(NodeLifecycleState::Created),

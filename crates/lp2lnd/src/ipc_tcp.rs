@@ -204,7 +204,7 @@ async fn handle_tcp_client(
                                 ip.packet.request_id,
                                 ip.packet.data.len(),
                             );
-                            let msg = incoming_packet_json(ip);
+                            let msg = incoming_packet_json(&ip);
                             let bytes = msg.to_string().into_bytes();
                             if bytes.len() > max_frame_bytes as usize {
                                 lp2ln_core_v2::warn!(
@@ -346,7 +346,7 @@ fn attach_client_request_id(reply: &mut Value, request: &Value) {
     }
 }
 
-fn incoming_packet_json(ip: IncomingPacket) -> Value {
+fn incoming_packet_json(ip: &IncomingPacket) -> Value {
     let data_b64 = STANDARD.encode(&ip.packet.data);
     let data_utf8 = std::str::from_utf8(&ip.packet.data)
         .ok()

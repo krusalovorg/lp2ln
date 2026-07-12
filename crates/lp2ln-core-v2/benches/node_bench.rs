@@ -145,7 +145,7 @@ struct BenchSetup {
     session_id: SessionId,
     peer_a: String,
     peer_b: String,
-    subscriber: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<IncomingPacket>>>,
+    subscriber: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
 }
 
 // peer_b must be the packet sender — DefaultPacketProcessor enforces sender == session.peer_id.
@@ -364,7 +364,7 @@ fn node_throughput_prod(c: &mut Criterion) {
 /// Lagged errors mean the pipeline processed packets faster than we polled —
 /// count them as received since they went through the full stack.
 async fn drain_batch(
-    sub: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<IncomingPacket>>>,
+    sub: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
     count: usize,
 ) {
     let mut rx = sub.lock().await;

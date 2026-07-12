@@ -4,10 +4,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::crypto::NodeKeypair;
-use crate::crypto::secure_channel::{
-    ReplayWindow, decode_secure_envelope, derive_shared_key, is_secure_envelope,
-};
-use crate::crypto::signature::verify_packet;
+use crate::crypto::peer_cache::PeerCryptoCache;
+use crate::crypto::secure_channel::{ReplayWindow, is_secure_envelope};
+use crate::crypto::signature::verify_packet_with_key;
 use crate::nat::NatTraversalState;
 use crate::router::Router;
 use crate::services::{PacketPublisher, SessionRegistry, SessionSelector};
@@ -42,6 +41,7 @@ pub struct DefaultPacketProcessor {
     peer_discovery_random_fraction: f32,
     nat_state: Arc<NatTraversalState>,
     local_keypair: NodeKeypair,
+    peer_cache: Arc<PeerCryptoCache>,
     replay_windows: Arc<DashMap<String, ReplayWindow>>,
     session_drop_counts: Arc<DashMap<SessionId, u32>>,
 }
@@ -54,6 +54,7 @@ impl DefaultPacketProcessor {
         peer_discovery_random_fraction: f32,
         nat_state: Arc<NatTraversalState>,
         local_keypair: NodeKeypair,
+        peer_cache: Arc<PeerCryptoCache>,
     ) -> Self {
         Self {
             our_peer_id: our_peer_id.into(),
@@ -62,9 +63,14 @@ impl DefaultPacketProcessor {
             peer_discovery_random_fraction: peer_discovery_random_fraction.clamp(0.0, 0.9),
             nat_state,
             local_keypair,
+            peer_cache,
             replay_windows: Arc::new(DashMap::new()),
             session_drop_counts: Arc::new(DashMap::new()),
         }
+    }
+
+    pub fn peer_cache(&self) -> &Arc<PeerCryptoCache> {
+        &self.peer_cache
     }
 
     fn record_drop(&self, session_id: SessionId, reason: &'static str) -> ProcessAction {
@@ -85,11 +91,12 @@ impl DefaultPacketProcessor {
 #[async_trait]
 impl PacketProcessor for DefaultPacketProcessor {
     async fn process(&self, incoming_packet: IncomingPacket, router: Arc<Router>) -> ProcessAction {
-        let mut packet = incoming_packet.packet.clone();
         let session_id = SessionId::from(incoming_packet.session_id.clone());
+        let mut packet = incoming_packet.packet;
 
         if !self.allow_unsigned_packets {
-            if let Err(e) = verify_packet(&packet) {
+            let vk = self.peer_cache.verifying_key(&packet.sender).ok();
+            if let Err(e) = verify_packet_with_key(&packet, vk.as_ref()) {
                 crate::processor!(
                     "Invalid or missing signature, dropping packet from {}: {}",
                     packet.sender,
@@ -113,14 +120,11 @@ impl PacketProcessor for DefaultPacketProcessor {
         if is_secure_envelope(&packet.data)
             && (packet.receiver == self.our_peer_id || packet.receiver.is_empty())
         {
-            let key = match derive_shared_key(self.local_keypair.signing_key(), &packet.sender) {
-                Ok(k) => k,
-                Err(e) => {
-                    crate::processor!("Failed to derive secure key from {}: {}", packet.sender, e);
-                    return self.record_drop(session_id, "secure key derivation failed");
-                }
-            };
-            let (seq, plaintext) = match decode_secure_envelope(&packet.data, key) {
+            let (seq, plaintext) = match self.peer_cache.decode_secure(
+                self.local_keypair.signing_key(),
+                &packet.sender,
+                &packet.data,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     crate::processor!(

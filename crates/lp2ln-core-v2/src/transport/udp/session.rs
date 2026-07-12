@@ -48,9 +48,13 @@ impl Session for UdpSession {
 
     async fn send(&self, packet: Packet) -> Result<u64> {
         let bytes = encode_packet(packet)?;
-        let len = bytes.len() as u64;
+        self.send_wire(bytes).await
+    }
+
+    async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
+        let len = encoded.len() as u64;
         self.tx
-            .send((bytes, self.peer_addr))
+            .send((encoded, self.peer_addr))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
         Ok(len)

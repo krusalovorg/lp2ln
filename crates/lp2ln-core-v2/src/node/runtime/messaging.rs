@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+
 use tokio::sync::broadcast::error::RecvError;
 
 impl NodeRuntime {
@@ -170,7 +171,7 @@ impl NodeRuntime {
 
     async fn recv_reply_matching(
         &self,
-        sub: &mut tokio::sync::broadcast::Receiver<IncomingPacket>,
+        sub: &mut tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>,
         route_peer_id: &PeerId,
         request_id: u64,
         timeout: Duration,
@@ -203,7 +204,7 @@ impl NodeRuntime {
                     ));
                 }
             };
-            let packet = incoming.packet;
+            let packet = &incoming.packet;
             if packet.request_id != Some(request_id) {
                 continue;
             }
@@ -217,7 +218,7 @@ impl NodeRuntime {
             if !packet.receiver.is_empty() && packet.receiver != our_id {
                 continue;
             }
-            return Ok(packet.data);
+            return Ok(packet.data.clone());
         }
     }
 }

@@ -52,9 +52,10 @@ impl FlowTraceService {
                 evt = trace_rx.recv() => {
                     match evt {
                         Ok(incoming) => {
-                            let packet = incoming.packet;
+                            let packet = &incoming.packet;
                             let via = incoming
                                 .from_node
+                                .clone()
                                 .unwrap_or_else(|| packet.sender.clone());
                             let hops_len = packet.nodes.len().min(u8::MAX as usize) as u8;
                             let is_forward =
@@ -90,8 +91,8 @@ impl FlowTraceService {
                                 }
                             }
                             let key = (
-                                packet.sender,
-                                packet.receiver,
+                                packet.sender.clone(),
+                                packet.receiver.clone(),
                                 via,
                                 hops_len,
                                 packet.max_hops,

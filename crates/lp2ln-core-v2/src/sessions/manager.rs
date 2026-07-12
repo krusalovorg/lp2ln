@@ -355,6 +355,12 @@ impl SessionManager {
             .collect()
     }
 
+    pub fn get_peer_for_session(&self, session_id: &SessionId) -> Option<PeerId> {
+        self.session_to_peer
+            .get(session_id)
+            .map(|entry| entry.value().clone())
+    }
+
     pub fn debug_sessions(&self) -> Vec<SessionDebugEntry> {
         self.sessions
             .iter()

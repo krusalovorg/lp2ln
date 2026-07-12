@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::NodeKeypair;
+use crate::crypto::signature::SignatureFormat;
 use crate::logger::LoggerOptions;
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
 use crate::transport::obfuscation::ObfuscationConfig;
@@ -334,6 +335,10 @@ pub struct NodeOptions {
     pub supervisor_shutdown_timeout_secs: u64,
     pub router_incoming_queue_cap: usize,
     pub router_broadcast_cap: usize,
+    /// Concurrent packet processor workers (bounded pool).
+    pub router_process_concurrency: usize,
+    /// Outgoing packet signature format (`v1_json` legacy, `v2_hash` fast).
+    pub signature_format: SignatureFormat,
     /// When false the topology-maintenance task is not started (useful for test nodes).
     pub enable_topology_maintenance: bool,
     /// Broadcast capacity for the internal CoreBus observer channel.
@@ -373,6 +378,8 @@ impl NodeOptions {
             supervisor_shutdown_timeout_secs: 10,
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
+            router_process_concurrency: crate::router::ROUTER_PROCESS_SEMAPHORE_PERMITS,
+            signature_format: SignatureFormat::V2Hash,
             enable_topology_maintenance: true,
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,
@@ -418,6 +425,8 @@ impl NodeOptions {
             supervisor_shutdown_timeout_secs: 10,
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
+            router_process_concurrency: crate::router::ROUTER_PROCESS_SEMAPHORE_PERMITS,
+            signature_format: SignatureFormat::V2Hash,
             enable_topology_maintenance: true,
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,

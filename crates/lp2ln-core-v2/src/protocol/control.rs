@@ -96,6 +96,17 @@ impl NetworkControlPayload {
     pub fn decode(data: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(data).map_err(|e| e.to_string())
     }
+
+    /// Cheap pre-filter before full JSON parse (control payloads are JSON objects).
+    pub fn is_likely_control_packet(data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        if crate::crypto::secure_channel::is_secure_envelope(data) {
+            return false;
+        }
+        matches!(data.first(), Some(b'{'))
+    }
 }
 
 #[cfg(test)]

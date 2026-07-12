@@ -564,6 +564,14 @@ mod tests {
             Ok(bytes)
         }
 
+        async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
+            use crate::transport::tcp::codec::decode_packet;
+            let packet = decode_packet(encoded)?;
+            let bytes = packet.wire_size_estimate() as u64;
+            self.sent.lock().expect("sent lock").push(packet);
+            Ok(bytes)
+        }
+
         async fn close(&self) -> Result<()> {
             self.closed.store(true, Ordering::Relaxed);
             Ok(())

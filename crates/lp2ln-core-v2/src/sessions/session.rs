@@ -43,6 +43,12 @@ pub trait Session: Send + Sync {
 
     async fn send(&self, packet: Packet) -> Result<u64>;
 
+    /// Send pre-encoded wire bytes (postcard frame payload). Default encodes via [`send`].
+    async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
+        let _ = encoded;
+        Err(anyhow::anyhow!("send_wire not implemented for this session"))
+    }
+
     async fn close(&self) -> Result<()>;
 
     fn spawn_reader(
