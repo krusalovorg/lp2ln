@@ -3,8 +3,23 @@
 ///
 /// Unlike transport_bench (raw sessions), this exercises every layer:
 /// SessionManager, DefaultPacketProcessor, Router dispatch, CoreBus events.
+///
+/// ## Crypto stack (`send_to_session` path)
+///
+/// | Layer | Always on | `verify_off` (default bench) | `verify_on` (prod bench) |
+/// |-------|-----------|------------------------------|--------------------------|
+/// | ChaCha20Poly1305 secure envelope (egress) | yes | yes | yes |
+/// | ChaCha20Poly1305 decrypt + replay window (ingress) | yes | yes | yes |
+/// | ECDSA sign on egress | yes | yes | yes |
+/// | ECDSA verify on ingress | — | skipped (`allow_unsigned_packets`) | yes |
+/// | QUIC TLS 1.3 (transport) | quic only | yes | yes |
+///
+/// Set `LP2LN_BENCH_CPU=1` to print per-core CPU utilization after the main sweep.
+/// 1 Gbit/s ceiling ≈ 125 MiB/s — linear scaling toward 80–100 MiB/s on 64–256 KiB
+/// blocks indicates per-packet overhead, not wire bandwidth.
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -23,8 +38,62 @@ use lp2ln_core_v2::types::SessionId;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
 
-// Smaller batch than transport_bench — full pipeline is ~10× slower.
-const BATCH: usize = 200;
+/// Target ~1.6 MiB per criterion iteration (same as the original 200 × 8 KiB).
+const TARGET_ITER_BYTES: usize = 200 * 8 * 1024;
+
+const PAYLOAD_SIZES: &[usize] = &[100, 8 * 1024, 64 * 1024, 256 * 1024];
+
+#[derive(Clone, Copy)]
+enum Protocol {
+    Tcp,
+    Udp,
+    Quic,
+}
+
+impl Protocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Quic => "quic",
+        }
+    }
+
+    /// Plaintext above 8 KiB does not fit in a UDP datagram after secure-envelope + postcard encoding.
+    fn supports_payload(self, bytes: usize) -> bool {
+        !matches!(self, Self::Udp) || bytes <= 8 * 1024
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SecurityProfile {
+    allow_unsigned_packets: bool,
+    label: &'static str,
+}
+
+const VERIFY_OFF: SecurityProfile = SecurityProfile {
+    allow_unsigned_packets: true,
+    label: "verify_off",
+};
+
+const VERIFY_ON: SecurityProfile = SecurityProfile {
+    allow_unsigned_packets: false,
+    label: "verify_on",
+};
+
+fn batch_for_payload(payload_bytes: usize) -> usize {
+    (TARGET_ITER_BYTES / payload_bytes).clamp(1, 200)
+}
+
+fn format_size_label(bytes: usize) -> String {
+    if bytes < 1_024 {
+        format!("{bytes}B")
+    } else if bytes < 1_024 * 1_024 {
+        format!("{}KB", bytes / 1_024)
+    } else {
+        format!("{}MB", bytes / (1_024 * 1_024))
+    }
+}
 
 fn make_packet(size: usize, sender: &str, receiver: &str) -> Packet {
     Packet {
@@ -51,10 +120,9 @@ async fn free_port() -> u16 {
     p
 }
 
-fn node_opts(listen: Option<(&str, SocketAddr)>) -> NodeOptions {
-    let mut opts = NodeOptions::empty().allow_unsigned_packets(true);
+fn node_opts(listen: Option<(&str, SocketAddr)>, security: SecurityProfile) -> NodeOptions {
+    let mut opts = NodeOptions::empty().allow_unsigned_packets(security.allow_unsigned_packets);
     opts.enable_topology_maintenance = false;
-    // Suppress all log output during benchmark runs.
     opts = opts.with_logger_options(LoggerOptions {
         log_dir: None,
         file_enabled: false,
@@ -71,21 +139,48 @@ fn node_opts(listen: Option<(&str, SocketAddr)>) -> NodeOptions {
 
 // ── per-protocol setup ────────────────────────────────────────────────────────
 
-// Returns: (node_a, node_b, router_b, session_id, peer_a_id, peer_b_id)
-// peer_b_id must be the packet sender — DefaultPacketProcessor enforces sender == session.peer_id.
-async fn setup_tcp() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+struct BenchSetup {
+    _nodes: (NodeRuntime, NodeRuntime),
+    router_b: Arc<Router>,
+    session_id: SessionId,
+    peer_a: String,
+    peer_b: String,
+    subscriber: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<IncomingPacket>>>,
+}
+
+// peer_b must be the packet sender — DefaultPacketProcessor enforces sender == session.peer_id.
+async fn setup(proto: Protocol, security: SecurityProfile) -> BenchSetup {
+    let (node_a, node_b, router_b, session_id, peer_a, peer_b) = match proto {
+        Protocol::Tcp => setup_tcp(security).await,
+        Protocol::Udp => setup_udp(security).await,
+        Protocol::Quic => setup_quic(security).await,
+    };
+    let subscriber = Arc::new(tokio::sync::Mutex::new(node_a.router().unwrap().subscribe()));
+    BenchSetup {
+        _nodes: (node_a, node_b),
+        router_b,
+        session_id,
+        peer_a,
+        peer_b,
+        subscriber,
+    }
+}
+
+async fn setup_tcp(
+    security: SecurityProfile,
+) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
     let port = free_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let mut node_a = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new()) as Arc<dyn Transport>)
-        .build(node_opts(Some(("tcp", addr))))
+        .build(node_opts(Some(("tcp", addr)), security))
         .unwrap();
     node_a.start().await.unwrap();
 
     let mut node_b = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new_dial()) as Arc<dyn Transport>)
-        .build(node_opts(None))
+        .build(node_opts(None, security))
         .unwrap();
     node_b.start().await.unwrap();
 
@@ -102,16 +197,18 @@ async fn setup_tcp() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, Strin
 // socket. The shared-socket design would create a race between the accept loop's
 // recv_from and the inbound session reader's recv_from on the same fd, causing
 // ~50% of bench datagrams to be silently discarded by the accept loop.
-async fn setup_udp() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+async fn setup_udp(
+    security: SecurityProfile,
+) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
     let mut node_a = NodeBuilder::new()
         .add_transport(Arc::new(UdpTransport::new_dial()) as Arc<dyn Transport>)
-        .build(node_opts(None))
+        .build(node_opts(None, security))
         .unwrap();
     node_a.start().await.unwrap();
 
     let mut node_b = NodeBuilder::new()
         .add_transport(Arc::new(UdpTransport::new_dial()) as Arc<dyn Transport>)
-        .build(node_opts(None))
+        .build(node_opts(None, security))
         .unwrap();
     node_b.start().await.unwrap();
 
@@ -121,8 +218,6 @@ async fn setup_udp() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, Strin
     let addr_a = sock_a.local_addr().unwrap();
     let addr_b = sock_b.local_addr().unwrap();
 
-    // sess_a lives on node_a and receives from sock_b's address.
-    // sess_b lives on node_b and sends to sock_a's address.
     let sess_a = UdpSession::new_from_socket(sock_a, addr_b, None, LinkKind::DirectUdp, obfs.clone())
         .unwrap();
     let sess_b = UdpSession::new_from_socket(sock_b, addr_a, None, LinkKind::DirectUdp, obfs)
@@ -146,7 +241,9 @@ async fn setup_udp() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, Strin
     (node_a, node_b, router_b, sid_b, peer_a, peer_b)
 }
 
-async fn setup_quic() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
+async fn setup_quic(
+    security: SecurityProfile,
+) -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, String, String) {
     let port = free_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let quic_opts = QuicTransportOptions::default();
@@ -156,13 +253,13 @@ async fn setup_quic() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, Stri
             Arc::new(QuicTransport::new_listener(Some(addr), quic_opts.clone()))
                 as Arc<dyn Transport>,
         )
-        .build(node_opts(Some(("quic", addr))))
+        .build(node_opts(Some(("quic", addr)), security))
         .unwrap();
     node_a.start().await.unwrap();
 
     let mut node_b = NodeBuilder::new()
         .add_transport(Arc::new(QuicTransport::new_dial(quic_opts)) as Arc<dyn Transport>)
-        .build(node_opts(None))
+        .build(node_opts(None, security))
         .unwrap();
     node_b.start().await.unwrap();
 
@@ -177,6 +274,45 @@ async fn setup_quic() -> (NodeRuntime, NodeRuntime, Arc<Router>, SessionId, Stri
 
 // ── benchmark ─────────────────────────────────────────────────────────────────
 
+fn register_protocol_benches(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    rt: &tokio::runtime::Runtime,
+    proto: Protocol,
+    security: SecurityProfile,
+    sizes: &[usize],
+) {
+    for &size in sizes {
+        if !proto.supports_payload(size) {
+            continue;
+        }
+        let batch = batch_for_payload(size);
+        let label = format_size_label(size);
+        let bench_id = BenchmarkId::new(proto.as_str(), format!("{label}/{}", security.label));
+        group.throughput(Throughput::Bytes(batch as u64 * size as u64));
+
+        let setup = rt.block_on(setup(proto, security));
+        let _keepalive = setup._nodes;
+        let router_b = setup.router_b;
+        let session_id = setup.session_id;
+        let peer_a = setup.peer_a;
+        let peer_b = setup.peer_b;
+        let subscriber = setup.subscriber;
+
+        group.bench_function(bench_id, |b| {
+            let r = router_b.clone();
+            let sid = session_id.clone();
+            let pkt = make_packet(size, &peer_b, &peer_a);
+            let sub = subscriber.clone();
+            b.to_async(rt).iter(|| async {
+                for _ in 0..batch {
+                    r.send_to_session(sid.clone(), pkt.clone()).await.unwrap();
+                }
+                drain_batch(sub.clone(), batch).await;
+            });
+        });
+    }
+}
+
 fn node_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -186,73 +322,39 @@ fn node_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("node_throughput");
     group.measurement_time(Duration::from_secs(15));
 
-    for &size in &[100_usize, 8_192] {
-        let label = if size < 1_024 {
-            format!("{size}B")
-        } else {
-            format!("{}KB", size / 1_024)
-        };
-        group.throughput(Throughput::Bytes(BATCH as u64 * size as u64));
+    for proto in [Protocol::Tcp, Protocol::Udp, Protocol::Quic] {
+        register_protocol_benches(&mut group, &rt, proto, VERIFY_OFF, PAYLOAD_SIZES);
+    }
 
-        // ── TCP ──────────────────────────────────────────────────────────────
-        let (node_a_tcp, _node_b_tcp, router_b_tcp, sid_tcp, peer_a_tcp, peer_b_tcp) =
-            rt.block_on(setup_tcp());
-        let sub_tcp = Arc::new(tokio::sync::Mutex::new(
-            node_a_tcp.router().unwrap().subscribe(),
-        ));
+    group.finish();
 
-        group.bench_function(BenchmarkId::new("tcp", &label), |b| {
-            let r = router_b_tcp.clone();
-            let sid = sid_tcp.clone();
-            let pkt = make_packet(size, &peer_b_tcp, &peer_a_tcp);
-            let sub = sub_tcp.clone();
-            b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    r.send_to_session(sid.clone(), pkt.clone()).await.unwrap();
-                }
-                drain_batch(sub.clone(), BATCH).await;
-            });
-        });
+    if std::env::var_os("LP2LN_BENCH_CPU").is_some() {
+        run_cpu_probe();
+    }
+}
 
-        // ── UDP ──────────────────────────────────────────────────────────────
-        let (node_a_udp, _node_b_udp, router_b_udp, sid_udp, peer_a_udp, peer_b_udp) =
-            rt.block_on(setup_udp());
-        let sub_udp = Arc::new(tokio::sync::Mutex::new(
-            node_a_udp.router().unwrap().subscribe(),
-        ));
+fn run_cpu_probe() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(cpu_probe());
+}
 
-        group.bench_function(BenchmarkId::new("udp", &label), |b| {
-            let r = router_b_udp.clone();
-            let sid = sid_udp.clone();
-            let pkt = make_packet(size, &peer_b_udp, &peer_a_udp);
-            let sub = sub_udp.clone();
-            b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    r.send_to_session(sid.clone(), pkt.clone()).await.unwrap();
-                }
-                drain_batch(sub.clone(), BATCH).await;
-            });
-        });
+/// Production crypto: full ECDSA verify on ingress. Only mid/large payloads — signing
+/// cost is mostly fixed per packet, so small-packet prod numbers are dominated by overhead.
+fn node_throughput_prod(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-        // ── QUIC ─────────────────────────────────────────────────────────────
-        let (node_a_quic, _node_b_quic, router_b_quic, sid_quic, peer_a_quic, peer_b_quic) =
-            rt.block_on(setup_quic());
-        let sub_quic = Arc::new(tokio::sync::Mutex::new(
-            node_a_quic.router().unwrap().subscribe(),
-        ));
+    let mut group = c.benchmark_group("node_throughput_prod");
+    group.measurement_time(Duration::from_secs(12));
+    let prod_sizes = &[8 * 1024, 64 * 1024];
 
-        group.bench_function(BenchmarkId::new("quic", &label), |b| {
-            let r = router_b_quic.clone();
-            let sid = sid_quic.clone();
-            let pkt = make_packet(size, &peer_b_quic, &peer_a_quic);
-            let sub = sub_quic.clone();
-            b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    r.send_to_session(sid.clone(), pkt.clone()).await.unwrap();
-                }
-                drain_batch(sub.clone(), BATCH).await;
-            });
-        });
+    for proto in [Protocol::Tcp, Protocol::Udp, Protocol::Quic] {
+        register_protocol_benches(&mut group, &rt, proto, VERIFY_ON, prod_sizes);
     }
 
     group.finish();
@@ -276,5 +378,120 @@ async fn drain_batch(
     }
 }
 
-criterion_group!(benches, node_throughput);
+// ── optional CPU probe ────────────────────────────────────────────────────────
+
+struct CpuSample {
+    core_index: usize,
+    max_util_pct: f32,
+}
+
+async fn cpu_probe() {
+    use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    const PROBE_SECS: u64 = 8;
+    const PAYLOAD: usize = 8 * 1024;
+    let batch = batch_for_payload(PAYLOAD);
+
+    eprintln!("\n[LP2LN_BENCH_CPU] {PROBE_SECS}s QUIC 8KB probe (verify_off, full crypto egress/ingress)...");
+
+    let setup = setup(Protocol::Quic, VERIFY_OFF).await;
+    let router_b = setup.router_b;
+    let sid = setup.session_id;
+    let pkt = make_packet(PAYLOAD, &setup.peer_b, &setup.peer_a);
+    let sub = setup.subscriber;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_sampler = stop.clone();
+    let sampler = std::thread::spawn(move || {
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_processes(ProcessRefreshKind::everything()),
+        );
+        let pid = sysinfo::get_current_pid().ok();
+        let mut core_peak: Vec<f32> = Vec::new();
+        let mut process_peak = 0.0f32;
+
+        while !stop_sampler.load(Ordering::Relaxed) {
+            system.refresh_cpu_usage();
+            if let Some(pid) = pid {
+                system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                if let Some(proc_) = system.process(pid) {
+                    process_peak = process_peak.max(proc_.cpu_usage());
+                }
+            }
+            for (i, cpu) in system.cpus().iter().enumerate() {
+                let util = cpu.cpu_usage();
+                if i >= core_peak.len() {
+                    core_peak.push(util);
+                } else {
+                    core_peak[i] = core_peak[i].max(util);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let samples: Vec<CpuSample> = core_peak
+            .into_iter()
+            .enumerate()
+            .map(|(core_index, max_util_pct)| CpuSample {
+                core_index,
+                max_util_pct,
+            })
+            .collect();
+        (samples, process_peak)
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(PROBE_SECS);
+    let mut iterations = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        for _ in 0..batch {
+            router_b
+                .send_to_session(sid.clone(), pkt.clone())
+                .await
+                .unwrap();
+        }
+        drain_batch(sub.clone(), batch).await;
+        iterations += 1;
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let (core_samples, process_peak) = sampler.join().expect("cpu sampler thread");
+
+    let hottest = core_samples
+        .iter()
+        .max_by(|a, b| {
+            a.max_util_pct
+                .partial_cmp(&b.max_util_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    eprintln!(
+        "[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%"
+    );
+    if let Some(h) = hottest {
+        eprintln!(
+            "[LP2LN_BENCH_CPU] hottest core: #{} at {:.1}% — {}",
+            h.core_index,
+            h.max_util_pct,
+            if h.max_util_pct >= 95.0 {
+                "likely single-thread bottleneck (serialization / queue drain)"
+            } else if h.max_util_pct >= 70.0 {
+                "moderate single-core pressure; check criterion element/s vs throughput"
+            } else {
+                "multi-core headroom; throughput may be allocation/copy bound"
+            }
+        );
+    }
+    let loaded: Vec<_> = core_samples
+        .iter()
+        .filter(|s| s.max_util_pct >= 50.0)
+        .collect();
+    eprintln!(
+        "[LP2LN_BENCH_CPU] cores >=50%: {}/{}",
+        loaded.len(),
+        core_samples.len()
+    );
+}
+
+criterion_group!(benches, node_throughput, node_throughput_prod);
 criterion_main!(benches);

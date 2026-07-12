@@ -10,16 +10,16 @@ pub struct Packet {
     pub max_hops: u8,
     /// Корреляция запрос/ответ: роутер назначает уникальный id;
     /// ответы должны повторять id входящего запроса.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub request_id: Option<u64>,
     /// Идентификатор потока чанков (один на всё сообщение).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub chunk_stream_id: Option<u64>,
     /// Порядковый номер чанка (0-based).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub chunk_index: Option<u32>,
     /// Общее количество чанков в потоке.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub total_chunks: Option<u32>,
 }
 
