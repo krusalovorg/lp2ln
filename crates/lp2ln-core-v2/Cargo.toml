@@ -42,6 +42,15 @@ http = "1"
 
 [dev-dependencies]
 rcgen = "0.13"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "transport_bench"
+harness = false
+
+[[bench]]
+name = "node_bench"
+harness = false
 
 [lib]
 name = "lp2ln_core_v2"
