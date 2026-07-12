@@ -54,6 +54,10 @@ harness = false
 name = "node_bench"
 harness = false
 
+[[bench]]
+name = "network_sim_bench"
+harness = false
+
 [lib]
 name = "lp2ln_core_v2"
 path = "src/lib.rs"

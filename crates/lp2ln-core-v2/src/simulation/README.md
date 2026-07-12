@@ -39,7 +39,32 @@ Planned integration references are defined in `simulation::topology::RUNTIME_INT
 Implement a concrete adapter that translates `SimNodeObservation` into `NodeActionPlan`
 using existing policy logic from topology maintenance while preserving runtime behavior.
 
-## How to run simulation regressions
+## Network routing simulation (packet bench)
+
+The `simulation::network` module wires converged topology snapshots to real
+`Router` + `DefaultPacketProcessor` instances via in-memory `LinkedSession` links.
+It measures multi-hop delivery between the farthest pair of nodes in the graph.
+
+### Run network sim benchmark
+
+```bash
+cargo bench -p lp2ln-core-v2 --bench network_sim_bench
+cargo bench -p lp2ln-core-v2 --bench network_sim_bench -- network_sim_single_delivery
+```
+
+Groups:
+
+- `network_sim_setup` — topology converge + SimNetwork build (10/100/1000 nodes)
+- `network_sim_single_delivery` — one packet farthest-pair latency (100/1000 nodes)
+- `network_sim_flood` — sequential farthest-pair flood throughput (100/1000 nodes)
+- `network_sim_live` — full NodeRuntime chain validation (10/20 nodes)
+
+### Run routing regression tests
+
+```bash
+cargo test -p lp2ln-core-v2 --test network_sim_routing
+```
+
 
 - Fast local run:
   - `cargo test -p lp2ln-core-v2 --test topology_sim_regression -- --nocapture`
