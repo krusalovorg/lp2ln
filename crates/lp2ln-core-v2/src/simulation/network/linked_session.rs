@@ -61,9 +61,6 @@ impl Session for LinkedSession {
     }
 
     async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
-        if self.latency_ms > 0 {
-            sleep(Duration::from_millis(u64::from(self.latency_ms))).await;
-        }
         let packet = decode_packet(encoded)?;
         let bytes = packet.wire_size_estimate() as u64;
         let incoming = IncomingPacket {
@@ -71,10 +68,13 @@ impl Session for LinkedSession {
             from_node: Some(self.local_peer_id.clone()),
             packet,
         };
-        // Do not block the sender router on a full remote ingress queue; sim harness
-        // prioritizes liveness over backpressure fidelity.
         let tx = self.remote_incoming.clone();
+        let latency_ms = self.latency_ms;
+        // ponytail: latency applied in spawn so batch sends don't serialize
         tokio::spawn(async move {
+            if latency_ms > 0 {
+                sleep(Duration::from_millis(u64::from(latency_ms))).await;
+            }
             let _ = tx.send(incoming).await;
         });
         Ok(bytes)

@@ -84,7 +84,7 @@ pub async fn wait_for_deliveries(
                     let pkt = &incoming.packet;
                     if pkt.sender == sender && pkt.receiver == receiver {
                         delivered += 1;
-                        total_hops += pkt.nodes.len();
+                        total_hops += pkt.nodes.len() + 1; // edge count
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -127,7 +127,7 @@ pub async fn wait_for_request_id(
                         && pkt.receiver == receiver
                         && pkt.request_id == Some(request_id)
                     {
-                        return Some(pkt.nodes.len());
+                        return Some(pkt.nodes.len() + 1); // edge count
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -162,7 +162,7 @@ pub async fn wait_for_unique_deliveries(
                         && let Some(rid) = pkt.request_id
                         && seen.insert(rid)
                     {
-                        total_hops += pkt.nodes.len();
+                        total_hops += pkt.nodes.len() + 1; // edge count
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,

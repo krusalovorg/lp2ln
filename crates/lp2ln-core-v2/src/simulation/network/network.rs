@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
@@ -15,7 +15,7 @@ use super::graph::{FarthestPair, find_farthest_pair, shortest_path_hops};
 use super::linked_session::LinkedSession;
 use super::metrics::{
     RoutingMetrics, make_routing_packet, make_routing_packet_with_id, wait_for_deliveries,
-    wait_for_request_id,
+    wait_for_request_id, wait_for_unique_deliveries,
 };
 use super::node::SimNode;
 use super::routing::SimRoutingTable;
@@ -187,6 +187,33 @@ impl SimNetwork {
         metrics.shortest_path_hops = shortest_path_hops(snapshot, from, to).unwrap_or(0);
         metrics.sent = count;
         Ok(metrics)
+    }
+
+    /// Send `batch` packets concurrently, then wait for all unique deliveries under one deadline.
+    /// Unlike `flood_and_wait_count`, no per-packet waiting — all sends complete before any recv.
+    pub async fn batch_flood_and_wait(
+        &self,
+        from: SimNodeId,
+        to: SimNodeId,
+        sender: &str,
+        receiver: &str,
+        batch: usize,
+        payload_size: usize,
+        max_hops: u8,
+        deadline: Duration,
+        base_request_id: u64,
+    ) -> RoutingMetrics {
+        let mut rx = self.subscribe(to);
+        let started = Instant::now();
+        for i in 0..batch {
+            let rid = base_request_id + i as u64;
+            let pkt = make_routing_packet_with_id(sender, receiver, payload_size, max_hops, Some(rid));
+            let _ = self.send_from(from, pkt).await;
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        let mut m = wait_for_unique_deliveries(&mut rx, batch, sender, receiver, remaining).await;
+        m.wall_time = started.elapsed();
+        m
     }
 
     pub async fn shutdown(self) {

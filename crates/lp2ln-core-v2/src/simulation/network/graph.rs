@@ -104,19 +104,21 @@ pub fn find_farthest_pair(snapshot: &TopologySnapshot) -> Option<FarthestPair> {
     let adj = adjacency(snapshot);
     let start = component[0];
     let dist_a = bfs_distances(start, &adj);
-    let (&far_a, dist_a_max) = dist_a
+    // tie-break by node id so two calls on the same graph always pick the same pair
+    let (&far_a, _dist_a_max) = dist_a
         .iter()
         .filter(|(id, _)| component.contains(id))
-        .max_by_key(|(_, d)| *d)?;
+        .max_by(|(id_a, d_a), (id_b, d_b)| d_a.cmp(d_b).then(id_a.cmp(id_b)))?;
     let dist_b = bfs_distances(far_a, &adj);
     let (&far_b, dist_b_max) = dist_b
         .iter()
         .filter(|(id, _)| component.contains(id))
-        .max_by_key(|(_, d)| *d)?;
+        .max_by(|(id_a, d_a), (id_b, d_b)| d_a.cmp(d_b).then(id_a.cmp(id_b)))?;
     Some(FarthestPair {
         source: far_a,
         target: far_b,
-        distance: (*dist_b_max).max(*dist_a_max),
+        // ponytail: second sweep distance IS the diameter estimate; .max() was wrong
+        distance: *dist_b_max,
     })
 }
 
