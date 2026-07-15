@@ -12,6 +12,9 @@ pub struct Packet {
     /// ответы должны повторять id входящего запроса.
     #[serde(default)]
     pub request_id: Option<u64>,
+    /// App Plane protocol identifier; None = legacy/control traffic.
+    #[serde(default)]
+    pub protocol_id: Option<u16>,
     /// Идентификатор потока чанков (один на всё сообщение).
     #[serde(default)]
     pub chunk_stream_id: Option<u64>,
@@ -89,6 +92,7 @@ impl Packet {
                     chunk_stream_id: Some(chunk_stream_id),
                     chunk_index: Some(i as u32),
                     total_chunks: Some(total_chunks),
+                    protocol_id: None,
                 }
             })
             .collect()

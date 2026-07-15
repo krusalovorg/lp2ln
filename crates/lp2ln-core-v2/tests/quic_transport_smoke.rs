@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::time::Duration;
 
 use lp2ln_core_v2::packet::Packet;
@@ -45,6 +45,7 @@ async fn quic_transport_start_dial_and_exchange_packet() {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     };
     // Send first: the write triggers the QUIC STREAM frame, which unblocks
     // the listener's accept_bi() and makes the inbound session available.

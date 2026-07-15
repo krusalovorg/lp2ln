@@ -1,5 +1,5 @@
-/// End-to-end throughput through full NodeRuntime pipeline:
-/// Router ingress → PacketProcessor (semaphore, 256 permits) → broadcast delivery.
+﻿/// End-to-end throughput through full NodeRuntime pipeline:
+/// Router ingress в†’ PacketProcessor (semaphore, 256 permits) в†’ broadcast delivery.
 ///
 /// Unlike transport_bench (raw sessions), this exercises every layer:
 /// SessionManager, DefaultPacketProcessor, Router dispatch, CoreBus events.
@@ -11,11 +11,11 @@
 /// | ChaCha20Poly1305 secure envelope (egress) | yes | yes | yes |
 /// | ChaCha20Poly1305 decrypt + replay window (ingress) | yes | yes | yes |
 /// | ECDSA sign on egress | yes | yes | yes |
-/// | ECDSA verify on ingress | — | skipped (`allow_unsigned_packets`) | yes |
+/// | ECDSA verify on ingress | – | skipped (`allow_unsigned_packets`) | yes |
 /// | QUIC TLS 1.3 (transport) | quic only | yes | yes |
 ///
 /// Set `LP2LN_BENCH_CPU=1` to print per-core CPU utilization after the main sweep.
-/// 1 Gbit/s ceiling ≈ 125 MiB/s — linear scaling toward 80–100 MiB/s on 64–256 KiB
+/// 1 Gbit/s ceiling ≈ 125 MiB/s – linear scaling toward 80–100 MiB/s on 64–256 KiB
 /// blocks indicates per-packet overhead, not wire bandwidth.
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use lp2ln_core_v2::types::SessionId;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
 
-/// Target ~1.6 MiB per criterion iteration (same as the original 200 × 8 KiB).
+/// Target ~1.6 MiB per criterion iteration (same as the original 200 Г— 8 KiB).
 const TARGET_ITER_BYTES: usize = 200 * 8 * 1024;
 
 const PAYLOAD_SIZES: &[usize] = &[100, 8 * 1024, 64 * 1024, 256 * 1024];
@@ -107,11 +107,12 @@ fn make_packet(size: usize, sender: &str, receiver: &str) -> Packet {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 
 /// Grab a free OS-assigned port, release it, return the number.
-/// Tiny race window — acceptable for benchmark setup only.
+/// Tiny race window – acceptable for benchmark setup only.
 async fn free_port() -> u16 {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let p = l.local_addr().unwrap().port();
@@ -137,7 +138,7 @@ fn node_opts(listen: Option<(&str, SocketAddr)>, security: SecurityProfile) -> N
     opts
 }
 
-// ── per-protocol setup ────────────────────────────────────────────────────────
+// в”Ђв”Ђ per-protocol setup в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 struct BenchSetup {
     _nodes: (NodeRuntime, NodeRuntime),
@@ -148,7 +149,7 @@ struct BenchSetup {
     subscriber: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
 }
 
-// peer_b must be the packet sender — DefaultPacketProcessor enforces sender == session.peer_id.
+// peer_b must be the packet sender – DefaultPacketProcessor enforces sender == session.peer_id.
 async fn setup(proto: Protocol, security: SecurityProfile) -> BenchSetup {
     let (node_a, node_b, router_b, session_id, peer_a, peer_b) = match proto {
         Protocol::Tcp => setup_tcp(security).await,
@@ -296,7 +297,7 @@ async fn setup_quic(
     (node_a, node_b, router_b, session_id, peer_a, peer_b)
 }
 
-// ── benchmark ─────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ benchmark в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 fn register_protocol_benches(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
@@ -365,7 +366,7 @@ fn run_cpu_probe() {
     rt.block_on(cpu_probe());
 }
 
-/// Production crypto: full ECDSA verify on ingress. Only mid/large payloads — signing
+/// Production crypto: full ECDSA verify on ingress. Only mid/large payloads – signing
 /// cost is mostly fixed per packet, so small-packet prod numbers are dominated by overhead.
 fn node_throughput_prod(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -385,7 +386,7 @@ fn node_throughput_prod(c: &mut Criterion) {
 }
 
 /// Wait until `count` packets arrive on the broadcast receiver.
-/// Lagged errors mean the pipeline processed packets faster than we polled —
+/// Lagged errors mean the pipeline processed packets faster than we polled –
 /// count them as received since they went through the full stack.
 async fn drain_batch(
     sub: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
@@ -402,7 +403,7 @@ async fn drain_batch(
     }
 }
 
-// ── optional CPU probe ────────────────────────────────────────────────────────
+// в”Ђв”Ђ optional CPU probe в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 struct CpuSample {
     core_index: usize,
@@ -492,7 +493,7 @@ async fn cpu_probe() {
     eprintln!("[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%");
     if let Some(h) = hottest {
         eprintln!(
-            "[LP2LN_BENCH_CPU] hottest core: #{} at {:.1}% — {}",
+            "[LP2LN_BENCH_CPU] hottest core: #{} at {:.1}% – {}",
             h.core_index,
             h.max_util_pct,
             if h.max_util_pct >= 95.0 {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -62,6 +62,7 @@ pub fn make_routing_packet_with_id(
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 

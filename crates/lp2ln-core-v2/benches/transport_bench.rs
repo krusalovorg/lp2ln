@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -13,7 +13,7 @@ use lp2ln_core_v2::transport::{Transport, TransportContext};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
-// Packets sent per criterion iteration — large enough to amortise async overhead.
+// Packets sent per criterion iteration – large enough to amortise async overhead.
 const BATCH: usize = 1_000;
 
 fn make_packet(size: usize) -> Packet {
@@ -28,10 +28,11 @@ fn make_packet(size: usize) -> Packet {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 
-// ── session pair helpers ──────────────────────────────────────────────────────
+// в”Ђв”Ђ session pair helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 /// Raw TCP pair: bypasses the transport handshake so we measure pure wire throughput.
 async fn pair_tcp() -> (Arc<dyn Session>, Arc<dyn Session>) {
@@ -55,7 +56,7 @@ async fn pair_tcp() -> (Arc<dyn Session>, Arc<dyn Session>) {
     (client, server)
 }
 
-/// Two independent UDP sockets pointing at each other — no shared-socket races.
+/// Two independent UDP sockets pointing at each other – no shared-socket races.
 async fn pair_udp() -> (Arc<dyn Session>, Arc<dyn Session>) {
     let obfs = Arc::new(Obfuscator::plain());
     let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -70,7 +71,7 @@ async fn pair_udp() -> (Arc<dyn Session>, Arc<dyn Session>) {
     (sess_a, sess_b)
 }
 
-/// QUIC pair — mirrors the quic_transport_smoke test.
+/// QUIC pair – mirrors the quic_transport_smoke test.
 async fn pair_quic() -> (Arc<dyn Session>, Arc<dyn Session>) {
     let opts = QuicTransportOptions::default();
     let listener = Arc::new(QuicTransport::new_listener(
@@ -105,7 +106,7 @@ async fn pair_quic() -> (Arc<dyn Session>, Arc<dyn Session>) {
     (outbound, inbound)
 }
 
-// ── bench helpers ─────────────────────────────────────────────────────────────
+// в”Ђв”Ђ bench helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 /// Spawns a background task that drains a session's reader so send channels never fill.
 fn drain(session: Arc<dyn Session>) {
@@ -135,7 +136,7 @@ async fn setup_echo(
     (client, Arc::new(tokio::sync::Mutex::new(pong_rx)))
 }
 
-// ── benchmarks ────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ benchmarks в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 fn throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -146,7 +147,7 @@ fn throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
     group.measurement_time(Duration::from_secs(10));
 
-    // 100 B → max packet rate; 8 KB → data throughput (fits in a UDP datagram after encoding).
+    // 100 B в†’ max packet rate; 8 KB в†’ data throughput (fits in a UDP datagram after encoding).
     for &size in &[100_usize, 8_192] {
         let label = if size < 1_024 {
             format!("{size}B")

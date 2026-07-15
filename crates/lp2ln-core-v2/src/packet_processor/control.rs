@@ -1,4 +1,4 @@
-use crate::packet::Packet;
+﻿use crate::packet::Packet;
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::services::{NatTraversalPort, PacketPublisher, SessionSelector};
 use crate::topology::{
@@ -23,6 +23,7 @@ fn make_control_packet(
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 
@@ -314,6 +315,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         let publisher = RecordingPublisher::new();
         let selector = StaticSelector {

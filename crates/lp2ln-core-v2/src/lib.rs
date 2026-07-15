@@ -1,5 +1,7 @@
+pub mod app_plane;
 pub mod crypto;
 pub mod db;
+pub mod dht;
 pub mod event_core;
 pub mod logger;
 pub mod metrics;
@@ -13,6 +15,7 @@ pub mod router;
 pub mod services;
 pub mod sessions;
 pub mod simulation;
+pub mod storage;
 pub mod stun;
 pub mod topology;
 pub mod transport;

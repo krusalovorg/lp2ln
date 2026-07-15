@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -74,6 +74,7 @@ impl DirectDialer for CoreDirectDialer {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         self.router
             .send_to_session(session_id.clone(), handshake)
@@ -156,6 +157,7 @@ impl NatTraversalTrigger for CoreNatTraversalTrigger {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         let _ = self
             .router

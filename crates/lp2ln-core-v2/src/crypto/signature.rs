@@ -1,4 +1,4 @@
-use crate::packet::Packet;
+﻿use crate::packet::Packet;
 use hex;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -183,6 +183,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         sign_packet_with_format(&mut packet, kp.signing_key(), SignatureFormat::V2Hash).unwrap();
         verify_packet(&packet).unwrap();
@@ -202,6 +203,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         sign_packet(&mut packet, kp.signing_key()).unwrap();
         verify_packet(&packet).unwrap();

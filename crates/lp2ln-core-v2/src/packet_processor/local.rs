@@ -1,4 +1,4 @@
-use crate::packet::Packet;
+﻿use crate::packet::Packet;
 use crate::protocol::handshake;
 use crate::services::PacketPublisher;
 use crate::topology::PeerCatalog;
@@ -27,6 +27,7 @@ pub async fn handle_local_packet(
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             };
             if let Err(e) = publisher.send_to_session(session_id.clone(), ack).await {
                 let msg = e.to_string();
@@ -61,6 +62,7 @@ pub async fn handle_local_packet(
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             };
             if let Err(e) = publisher.send_to_session(session_id.clone(), ack).await {
                 let msg = e.to_string();
@@ -87,6 +89,7 @@ pub async fn handle_local_packet(
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             };
             if let Err(e) = publisher.send_to_peer(peer_id.clone(), pong, None).await {
                 crate::error!("[PacketProcessor] Failed to send pong: {}", e);

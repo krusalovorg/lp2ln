@@ -1,4 +1,4 @@
-use rand::Rng;
+﻿use rand::Rng;
 
 use crate::node::runtime::NodeRuntime;
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
@@ -68,6 +68,7 @@ impl NodeRuntime {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         let _ = router.send_to_peer(route_peer_id, packet, None).await?;
         Ok(session_id)

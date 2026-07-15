@@ -17,6 +17,9 @@ base64 = "0.22"
 futures-util = "0.3"
 tokio-tungstenite = "0.23"
 console-subscriber = { version = "0.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [[bin]]
 name = "lp2lnd"

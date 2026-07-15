@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ pub const H3_ALPN: &[u8] = b"h3";
 pub enum MasqueradeMode {
     #[default]
     Static404,
-    // ponytail: reverse_proxy not implemented — add when proxy_url is needed in production
+    // ponytail: reverse_proxy not implemented – add when proxy_url is needed in production
     ReverseProxy,
 }
 
@@ -400,6 +400,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         outbound.send(packet.clone()).await.expect("send");
 

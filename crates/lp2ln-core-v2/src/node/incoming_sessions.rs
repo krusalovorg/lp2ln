@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+﻿use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::node::distribution::{
@@ -152,6 +152,7 @@ pub async fn send_discovery_redirect_and_close_with_preamble(
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             };
             let _ = router.send_to_session(session_id.clone(), packet).await;
         }
@@ -447,6 +448,7 @@ pub(crate) async fn run_incoming_session_handler(
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             };
             if let Err(e) = router_for_incoming
                 .send_to_session(ack_session_id, ack)
@@ -496,6 +498,7 @@ pub(crate) async fn run_incoming_session_handler(
                             chunk_stream_id: None,
                             chunk_index: None,
                             total_chunks: None,
+                            protocol_id: None,
                         };
                         let _ = router_for_incoming.send_to_peer(pid, packet, None).await;
                     }

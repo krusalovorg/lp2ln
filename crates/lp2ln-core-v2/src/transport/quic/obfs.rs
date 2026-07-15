@@ -1,4 +1,4 @@
-use std::fmt;
+﻿use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -96,7 +96,7 @@ pub fn derive_obfs_key_from_ecdh(our_sk: &SigningKey, their_peer_id_hex: &str) -
 /// The same key is applied symmetrically on send and receive.
 /// Both endpoints must share the same password in `quic.obfs.password`.
 ///
-/// ponytail: GSO/GRO disabled (max_segments=1) — each datagram must be keyed from offset 0
+/// ponytail: GSO/GRO disabled (max_segments=1) – each datagram must be keyed from offset 0
 pub struct XorObfsSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     key: [u8; 32],
@@ -329,6 +329,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         outbound.send(packet.clone()).await.expect("send");
 

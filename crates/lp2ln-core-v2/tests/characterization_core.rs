@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+﻿use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -148,6 +148,7 @@ fn packet(data: Vec<u8>) -> Packet {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 

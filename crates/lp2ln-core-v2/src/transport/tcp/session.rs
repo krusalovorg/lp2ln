@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+﻿use std::io::ErrorKind;
 use std::sync::Arc;
 
 use crate::crypto::signature::verify_packet;
@@ -299,6 +299,7 @@ impl TcpSession {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         let bytes = encode_packet(handshake_packet)?;
         Obfuscator::plain().write_frame(stream, &bytes).await

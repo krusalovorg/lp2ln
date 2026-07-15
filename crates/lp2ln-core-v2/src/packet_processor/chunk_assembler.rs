@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 
 use dashmap::DashMap;
 
@@ -118,6 +118,7 @@ impl ChunkAssembler {
                 chunk_stream_id: None,
                 chunk_index: None,
                 total_chunks: None,
+                protocol_id: None,
             })
         };
 

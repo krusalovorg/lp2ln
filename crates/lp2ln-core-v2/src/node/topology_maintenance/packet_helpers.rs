@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::packet::Packet;
@@ -23,6 +23,7 @@ pub(super) fn control_packet(
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
+        protocol_id: None,
     }
 }
 

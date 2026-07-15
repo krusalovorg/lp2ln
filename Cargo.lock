@@ -2031,9 +2031,12 @@ dependencies = [
  "console-subscriber",
  "futures-util",
  "lp2ln-core-v2",
+ "postcard",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-use crate::node::runtime::NodeRuntime;
+﻿use crate::node::runtime::NodeRuntime;
 use crate::packet::Packet;
 use crate::protocol::handshake;
 use crate::sessions::session::IncomingPacket;
@@ -55,6 +55,7 @@ impl NodeRuntime {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         router
             .send_to_session(session_id.clone(), handshake_pkt)
@@ -89,6 +90,7 @@ impl NodeRuntime {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         router.send_to_peer(route_peer_id, packet, None).await
     }
@@ -156,6 +158,7 @@ impl NodeRuntime {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         router.send_to_session(session_id, packet).await
     }

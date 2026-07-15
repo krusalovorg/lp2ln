@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+﻿use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -298,7 +298,7 @@ async fn run_loss_monitor(
         if loss_rate > config.loss_threshold && !was_compensating {
             in_compensate.store(true, Ordering::Relaxed);
             crate::warn!(
-                "[QuicSession] Loss {:.1}% > threshold {:.1}% — compensate mode (session={})",
+                "[QuicSession] Loss {:.1}% > threshold {:.1}% – compensate mode (session={})",
                 loss_rate * 100.0,
                 config.loss_threshold * 100.0,
                 session_id_short
@@ -319,7 +319,7 @@ async fn run_loss_monitor(
         } else if loss_rate <= config.loss_threshold && was_compensating {
             in_compensate.store(false, Ordering::Relaxed);
             crate::info!(
-                "[QuicSession] Loss recovered to {:.1}% — normal mode (session={})",
+                "[QuicSession] Loss recovered to {:.1}% – normal mode (session={})",
                 loss_rate * 100.0,
                 session_id_short
             );
@@ -353,6 +353,7 @@ mod tests {
             chunk_stream_id: None,
             chunk_index: None,
             total_chunks: None,
+            protocol_id: None,
         };
         let bytes = encode(packet.clone()).expect("encode");
         let decoded = decode(bytes).expect("decode");
