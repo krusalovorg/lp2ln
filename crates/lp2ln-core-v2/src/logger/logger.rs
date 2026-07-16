@@ -252,7 +252,7 @@ pub fn net_disconnect(message: &str) {
 pub fn net_dial(message: &str) {
     let timestamp = get_timestamp();
     let log_message = format!("[{}] [DIAL] {}", timestamp, message);
-    if SHOW_INFO.load(Ordering::SeqCst) {
+    if SHOW_DEBUG.load(Ordering::SeqCst) {
         println!("{}", log_message.yellow().bold());
     }
     tokio::spawn(write_to_file(log_message));

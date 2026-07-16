@@ -31,10 +31,9 @@ impl StunClient {
         let mut client = match bind_res {
             Ok(c) => c,
             Err(e) if stun_bind_addr_in_use(&e) => {
-                crate::warn!(
-                    "[STUN] cannot bind 0.0.0.0:{} ({}); using ephemeral local port (XOR mapped port may differ from UDP listener)",
-                    port,
-                    e
+                crate::debug!(
+                    "[STUN] cannot bind 0.0.0.0:{} (port in use); using ephemeral local port",
+                    port
                 );
                 Client::new("0.0.0.0:0", None).await.map_err(|e2| {
                     anyhow::anyhow!("Failed to create STUN client (fallback): {:?}", e2)
