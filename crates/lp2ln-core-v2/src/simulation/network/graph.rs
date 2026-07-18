@@ -112,7 +112,7 @@ pub fn find_farthest_pair(snapshot: &TopologySnapshot) -> Option<FarthestPair> {
     let dist_b = bfs_distances(far_a, &adj);
     let (&far_b, dist_b_max) = dist_b
         .iter()
-        .filter(|(id, _)| component.contains(id))
+        .filter(|(id, _)| component.contains(id) && **id != far_a)
         .max_by(|(id_a, d_a), (id_b, d_b)| d_a.cmp(d_b).then(id_a.cmp(id_b)))?;
     Some(FarthestPair {
         source: far_a,
