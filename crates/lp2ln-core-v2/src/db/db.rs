@@ -24,6 +24,8 @@ impl P2PDatabase {
                 write_txn.open_table(tables::PEER_SCORE_TABLE)?;
                 write_txn.open_table(tables::BLOCK_TABLE)?;
                 write_txn.open_table(tables::DHT_TABLE)?;
+                write_txn.open_table(tables::LEASE_TABLE)?;
+                write_txn.open_table(tables::JOB_TABLE)?;
             }
             write_txn.commit()?;
         }

@@ -108,6 +108,8 @@ async fn handle_ws_client(
             "disconnect_peer_batch",
             "refresh_snapshot",
             "stop_node",
+            "block_put",
+            "block_get",
         ],
     });
     ws_tx.send(Message::Text(hello.to_string())).await?;
@@ -621,6 +623,8 @@ pub(crate) async fn handle_client_command(
                 "error": e.to_string(),
             })),
         },
+        "block_put" => Some(block_put(db, &value).await),
+        "block_get" => Some(block_get(db, &value).await),
         _ => Some(json!({
             "event": "error",
             "ts_ms": now_ms(),
@@ -1211,6 +1215,83 @@ async fn collect_db_tables(db: Option<Arc<P2PDatabase>>) -> Value {
             "peer_scores": scores_json,
         },
     })
+}
+
+async fn block_put(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
+    let Some(db) = db else {
+        return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_put", "error": "database is disabled",
+        });
+    };
+    let b64 = match value.get("data_base64").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_string(),
+        None => return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_put", "error": "data_base64 is required",
+        }),
+    };
+    let data = match STANDARD.decode(&b64) {
+        Ok(d) => d,
+        Err(e) => return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_put", "error": format!("base64 decode: {e}"),
+        }),
+    };
+    let store = lp2ln_core_v2::storage::BlockStore::new(db);
+    match store.put(&data) {
+        Ok(id) => json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": true, "cmd": "block_put",
+            "content_id": lp2ln_core_v2::storage::content_id_hex(&id),
+        }),
+        Err(e) => json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_put", "error": e.to_string(),
+        }),
+    }
+}
+
+async fn block_get(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
+    let Some(db) = db else {
+        return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_get", "error": "database is disabled",
+        });
+    };
+    let cid_hex = match value.get("content_id").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_string(),
+        None => return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_get", "error": "content_id is required",
+        }),
+    };
+    let cid = match lp2ln_core_v2::storage::content_id_from_hex(&cid_hex) {
+        Some(id) => id,
+        None => return json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_get", "error": "invalid content_id hex",
+        }),
+    };
+    let store = lp2ln_core_v2::storage::BlockStore::new(db);
+    match store.get(&cid) {
+        Ok(Some(data)) => json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": true, "cmd": "block_get",
+            "content_id": cid_hex,
+            "data_base64": STANDARD.encode(&data),
+        }),
+        Ok(None) => json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": true, "cmd": "block_get",
+            "content_id": cid_hex,
+            "data_base64": null,
+        }),
+        Err(e) => json!({
+            "event": "command_result", "ts_ms": now_ms(),
+            "ok": false, "cmd": "block_get", "error": e.to_string(),
+        }),
+    }
 }
 
 fn now_ms() -> u64 {

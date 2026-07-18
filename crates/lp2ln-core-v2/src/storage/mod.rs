@@ -1,7 +1,14 @@
 // M3 — local content-addressed block store (slice 10)
+// M5 — encryption, manifests, leases, block transfer, repair, magic folder
 //
-// ContentId = SHA-256 of raw bytes (32 bytes, hex-encoded for storage keys).
+// ContentId = SHA-256 of ciphertext bytes (encrypt-then-hash per roadmap 04).
 // BlockStore wraps the existing redb P2PDatabase via the BLOCK_TABLE.
+
+pub mod block_transfer;
+pub mod encrypt;
+pub mod lease;
+pub mod manifest;
+pub mod repair;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
