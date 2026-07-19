@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, HashSet};
+﻿use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,14 +13,12 @@ use lp2ln_core_v2::{
     node::{
         NodeRole,
         direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
-        distribution::{
-            rank_dial_candidates, should_skip_for_bootstrap_quota, structured_slot_count,
-        },
+        distribution::should_skip_for_bootstrap_quota,
         nat_traversal::{NatSessionStage, NatTraversalState},
     },
     packet::Packet,
     packet_processor::{PacketProcessor, ProcessAction},
-    peer_score::{PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights},
+    peer_score::{PeerConnectionPolicy, PeerScoreStore, PeerScoreWeights},
     protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload},
     router::{Router, RouterRunOutcome},
     sessions::{IncomingPacket, LinkKind, Session, manager::SessionManager},
@@ -425,115 +423,7 @@ fn descriptor(peer_id: &str, bootstrap_entry: bool, active_connections: u16) -> 
     )
 }
 
-fn peer_score(latency_ms: u32, success_rate: f32) -> PeerScore {
-    PeerScore {
-        latency_ms,
-        success_rate,
-        uptime_score: success_rate,
-        bandwidth_score: 0.7,
-        relay_score: 0.6,
-        trust_score: 0.5,
-        geo_score: 0.5,
-        nat_compat_score: 0.6,
-        load_penalty: 0.0,
-    }
-}
 
-#[test]
-fn distribution_ranking_promotes_xor_closest_peers_into_structured_slots() {
-    let local = "0000000000000000000000000000000000000000000000000000000000000000";
-    let far = PeerId::from("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    let near_1 = PeerId::from("0000000000000000000000000000000000000000000000000000000000000001");
-    let near_2 = PeerId::from("0000000000000000000000000000000000000000000000000000000000000002");
-    let near_3 = PeerId::from("0000000000000000000000000000000000000000000000000000000000000010");
-    let mut candidates = vec![far.clone(), near_3.clone(), near_2.clone(), near_1.clone()];
-    let store = PeerScoreStore::new();
-    let weights = PeerScoreWeights::default();
-    let desc_by_peer = HashMap::new();
-
-    rank_dial_candidates(
-        &mut candidates,
-        &store,
-        &weights,
-        &desc_by_peer,
-        local,
-        NodeRole::Regular,
-        4,
-        0,
-        2,
-        false,
-        0,
-        1,
-        &HashSet::new(),
-        7,
-        0,
-    );
-
-    let k = structured_slot_count(7);
-    assert_eq!(k, 3);
-    assert_eq!(&candidates[..k], &[near_1, near_2, near_3]);
-    assert_eq!(candidates[k], far);
-}
-
-#[test]
-fn distribution_mesh_first_places_regular_candidates_before_bootstrap_candidates() {
-    let regular_low = PeerId::from("regular-low");
-    let regular_high = PeerId::from("regular-high");
-    let bootstrap_high = PeerId::from("bootstrap-high");
-    let mut candidates = vec![
-        bootstrap_high.clone(),
-        regular_low.clone(),
-        regular_high.clone(),
-    ];
-    let store = PeerScoreStore::new();
-    store.insert(bootstrap_high.clone(), peer_score(20, 1.0));
-    store.insert(regular_low.clone(), peer_score(300, 0.3));
-    store.insert(regular_high.clone(), peer_score(50, 0.9));
-    let weights = PeerScoreWeights::default();
-    let desc_by_peer = HashMap::from([
-        (
-            bootstrap_high.clone(),
-            descriptor(bootstrap_high.as_str(), true, 1),
-        ),
-        (
-            regular_low.clone(),
-            descriptor(regular_low.as_str(), false, 1),
-        ),
-        (
-            regular_high.clone(),
-            descriptor(regular_high.as_str(), false, 1),
-        ),
-    ]);
-
-    rank_dial_candidates(
-        &mut candidates,
-        &store,
-        &weights,
-        &desc_by_peer,
-        "local",
-        NodeRole::Regular,
-        3,
-        1,
-        2,
-        true,
-        2,
-        2,
-        &HashSet::new(),
-        3,
-        0,
-    );
-
-    let bootstrap_index = candidates
-        .iter()
-        .position(|p| p == &bootstrap_high)
-        .expect("bootstrap candidate");
-    let regular_indexes: Vec<_> = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, p)| (p != &bootstrap_high).then_some(idx))
-        .collect();
-    assert!(regular_indexes.into_iter().all(|idx| idx < bootstrap_index));
-}
 
 #[tokio::test]
 async fn router_drains_buffered_packets_on_cancel() {

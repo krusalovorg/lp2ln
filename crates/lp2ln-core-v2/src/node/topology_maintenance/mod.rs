@@ -32,14 +32,15 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, PeerDirectory, SmartMeshPlanner,
-    TopologyPlanner, TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
+    CapacityBudget, LegacyTopologyPlanner, NodeDescriptor, PeerCatalog, PeerDirectory,
+    SmartMeshPlanner, TopologyPlanner, TopologyReconciler, TopologySnapshot, now_ms,
+    parse_observed_addr_line,
 };
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
 use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
-use dialing::{build_dial_plan, execute_dial_plan};
+use dialing::{DialPlan, execute_dial_plan};
 use packet_helpers::{control_packet, handshake_packet};
 pub use session_reactions::{
     SessionRedialQueue, TopologySessionReactionHandler, TransportDegradedReactionHandler,
@@ -668,34 +669,35 @@ pub(crate) async fn run_topology_maintenance_loop(
             );
             state.last_policy_log_ms = now;
         }
-        if n < dial_target_low || should_explore {
+        // Discovery: planner already identified which connected peers to ask for more peers.
+        for need in &topology_plan.discovery {
             let req = NetworkControlPayload::RequestPeers { limit: 48 };
             if let Ok(data) = req.encode() {
-                for p in router_maint.connected_peers() {
+                for p in &need.request_from {
                     let packet =
                         control_packet(&our_peer_maint, p.as_str().to_string(), data.clone(), 2);
-                    let _ = router_maint.send_to_peer(p, packet, None).await;
+                    let _ = router_maint.send_to_peer(p.clone(), packet, None).await;
                 }
             }
-            let mut plan = build_dial_plan(
-                &dial_book,
-                &router_maint,
-                &catalog,
-                &peer_store,
-                &weights,
-                &our_peer_maint,
-                node_role,
-                known_peers,
-                n,
-                desired,
-                dial_target,
-                dial_target_high,
-                adaptive.min_active_peers,
-                adaptive_tick.exploratory_slots,
-                &topology_tuning,
-                should_explore,
-                now,
-            );
+        }
+
+        // Dial: execute the planner's candidate list through the transport layer.
+        // SmartMesh already selected and ordered candidates; execute_dial_plan handles
+        // transport selection, backoff guards, and session registration.
+        if !topology_plan.dial.is_empty() {
+            let desc_by_peer: HashMap<PeerId, NodeDescriptor> = catalog
+                .descriptors()
+                .into_iter()
+                .map(|d| (PeerId::from(d.peer_id.as_str()), d))
+                .collect();
+            let dial_limit = if should_explore { dial_target_high } else { dial_target };
+            let mut plan = DialPlan {
+                candidates: topology_plan.dial.iter().map(|i| i.peer_id.clone()).collect(),
+                desc_by_peer,
+                connected_bootstrap: connected_bootstrap_now,
+                dial_limit,
+                force_non_bootstrap: false,
+            };
             let exec = execute_dial_plan(
                 &mut plan,
                 n,

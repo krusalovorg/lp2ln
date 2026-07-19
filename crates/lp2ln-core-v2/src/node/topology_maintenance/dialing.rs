@@ -6,11 +6,9 @@ use dashmap::DashMap;
 
 use crate::node::distribution::{
     DIAL_HUB_SOFT_CAP_EXTRA, REGULAR_SELF_HEAL_FLOOR, bootstrap_dial_quota, connectivity_selective,
-    descriptor_prefix24, dial_endpoint_attempt_budget, rank_dial_candidates,
-    should_skip_for_bootstrap_quota,
+    dial_endpoint_attempt_budget, should_skip_for_bootstrap_quota,
 };
 use crate::node::options::{NodeRole, TopologyTuning};
-use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
 use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
@@ -33,90 +31,6 @@ pub(super) struct DialPlan {
 
 pub(super) struct DialExecutionResult {
     pub(super) dialed_any: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_dial_plan(
-    dial_book: &Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
-    router_maint: &Arc<Router>,
-    catalog: &Arc<PeerCatalog>,
-    peer_store: &Arc<PeerScoreStore>,
-    weights: &PeerScoreWeights,
-    our_peer: &str,
-    node_role: NodeRole,
-    known_peers: usize,
-    n: usize,
-    desired: usize,
-    dial_target: usize,
-    dial_target_high: usize,
-    adaptive_min_active_peers: usize,
-    exploratory_slots: usize,
-    topology_tuning: &TopologyTuning,
-    should_explore: bool,
-    now: u64,
-) -> DialPlan {
-    let mut candidates: Vec<PeerId> = dial_book.iter().map(|r| r.key().clone()).collect();
-    let desc_by_peer: HashMap<PeerId, NodeDescriptor> = catalog
-        .descriptors()
-        .into_iter()
-        .map(|d| (PeerId::from(d.peer_id.as_str()), d))
-        .collect();
-    let stale_descriptor_cutoff_ms = now.saturating_sub(90_000);
-    candidates.retain(|pid| {
-        desc_by_peer
-            .get(pid)
-            .map(|d| d.timestamp_ms >= stale_descriptor_cutoff_ms)
-            .unwrap_or(true)
-    });
-    let connected_snapshot = router_maint.connected_peers();
-    let connected_bootstrap = connected_snapshot
-        .iter()
-        .filter(|p| catalog.peer_is_bootstrap_entry(p))
-        .count();
-    let connected_non_bootstrap = connected_snapshot.len().saturating_sub(connected_bootstrap);
-    let target_non_bootstrap = if matches!(node_role, NodeRole::Regular) {
-        desired.saturating_sub(topology_tuning.regular_bootstrap_min_keep)
-    } else {
-        0
-    };
-    let force_non_bootstrap = matches!(node_role, NodeRole::Regular)
-        && connected_bootstrap > 0
-        && connected_non_bootstrap < target_non_bootstrap;
-    let bootstrap_quota = bootstrap_dial_quota(node_role);
-    let connected_prefix24: HashSet<[u8; 3]> = connected_snapshot
-        .iter()
-        .filter_map(|pid| catalog.descriptor_of(pid))
-        .filter_map(|d| descriptor_prefix24(&d))
-        .collect();
-    rank_dial_candidates(
-        &mut candidates,
-        peer_store.as_ref(),
-        weights,
-        &desc_by_peer,
-        our_peer,
-        node_role,
-        dial_target,
-        connected_bootstrap,
-        bootstrap_quota,
-        true,
-        n,
-        adaptive_min_active_peers,
-        &connected_prefix24,
-        known_peers,
-        exploratory_slots,
-    );
-    let dial_limit = if should_explore || force_non_bootstrap {
-        dial_target_high
-    } else {
-        dial_target
-    };
-    DialPlan {
-        candidates,
-        desc_by_peer,
-        connected_bootstrap,
-        dial_limit,
-        force_non_bootstrap,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
