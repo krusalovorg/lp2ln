@@ -360,7 +360,7 @@ pub struct NodeOptions {
     pub router_broadcast_cap: usize,
     /// Concurrent packet processor workers (bounded pool).
     pub router_process_concurrency: usize,
-    /// Outgoing packet signature format (`v1_json` / `v2_hash` legacy, `v3_hash` binds `protocol_id`).
+    /// Outgoing packet signature format (only `v3_hash` is supported).
     pub signature_format: SignatureFormat,
     /// Experimental DHT/content/repair/App Plane opt-ins (default all off ).
     pub experimental: ExperimentalOptions,

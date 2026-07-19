@@ -1,50 +1,23 @@
-﻿use crate::packet::Packet;
+use crate::packet::Packet;
 use hex;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Wire signature format for new packets.
+/// Wire signature format for outgoing packets.
+///
+/// Only V3 is supported. Older V1/V2 formats were removed before any public
+/// network deployment (no compatibility burden).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureFormat {
-    V1Json,
-    V2Hash,
     #[default]
     V3Hash,
 }
 
-const V2_SIGNATURE_PREFIX: &str = "v2:";
 const V3_SIGNATURE_PREFIX: &str = "v3:";
 
-#[derive(Serialize)]
-struct SigningPayloadV1 {
-    data: Option<Vec<u8>>,
-    nodes: Vec<String>,
-    sender: String,
-    receiver: String,
-    max_hops: u8,
-    request_id: Option<u64>,
-    chunk_stream_id: Option<u64>,
-    chunk_index: Option<u32>,
-    total_chunks: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct SigningPayloadV2 {
-    data_hash: [u8; 32],
-    nodes: Vec<String>,
-    sender: String,
-    receiver: String,
-    max_hops: u8,
-    request_id: Option<u64>,
-    chunk_stream_id: Option<u64>,
-    chunk_index: Option<u32>,
-    total_chunks: Option<u32>,
-}
-
-/// V3 = V2 fields + `protocol_id` so App Plane tags cannot be rewritten in transit.
 #[derive(Serialize)]
 struct SigningPayloadV3 {
     data_hash: [u8; 32],
@@ -57,37 +30,6 @@ struct SigningPayloadV3 {
     chunk_index: Option<u32>,
     total_chunks: Option<u32>,
     protocol_id: Option<u16>,
-}
-
-fn packet_to_signing_payload_v1(packet: &Packet) -> SigningPayloadV1 {
-    SigningPayloadV1 {
-        data: Some(packet.data.clone()),
-        nodes: packet.nodes.clone(),
-        sender: packet.sender.clone(),
-        receiver: packet.receiver.clone(),
-        max_hops: packet.max_hops,
-        request_id: packet.request_id,
-        chunk_stream_id: packet.chunk_stream_id,
-        chunk_index: packet.chunk_index,
-        total_chunks: packet.total_chunks,
-    }
-}
-
-fn packet_to_signing_payload_v2(packet: &Packet) -> SigningPayloadV2 {
-    let data_hash = Sha256::digest(&packet.data);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&data_hash);
-    SigningPayloadV2 {
-        data_hash: hash,
-        nodes: packet.nodes.clone(),
-        sender: packet.sender.clone(),
-        receiver: packet.receiver.clone(),
-        max_hops: packet.max_hops,
-        request_id: packet.request_id,
-        chunk_stream_id: packet.chunk_stream_id,
-        chunk_index: packet.chunk_index,
-        total_chunks: packet.total_chunks,
-    }
 }
 
 fn packet_to_signing_payload_v3(packet: &Packet) -> SigningPayloadV3 {
@@ -109,7 +51,7 @@ fn packet_to_signing_payload_v3(packet: &Packet) -> SigningPayloadV3 {
 }
 
 pub fn sign_packet(packet: &mut Packet, signing_key: &SigningKey) -> Result<(), String> {
-    sign_packet_with_format(packet, signing_key, SignatureFormat::V1Json)
+    sign_packet_with_format(packet, signing_key, SignatureFormat::V3Hash)
 }
 
 pub fn sign_packet_with_format(
@@ -118,21 +60,6 @@ pub fn sign_packet_with_format(
     format: SignatureFormat,
 ) -> Result<(), String> {
     match format {
-        SignatureFormat::V1Json => {
-            let payload = packet_to_signing_payload_v1(packet);
-            let data = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
-            let signature: Signature = signing_key.sign(&data);
-            packet.signature = Some(hex::encode(signature.to_bytes()));
-        }
-        SignatureFormat::V2Hash => {
-            let payload = packet_to_signing_payload_v2(packet);
-            let data = postcard::to_allocvec(&payload).map_err(|e| e.to_string())?;
-            let signature: Signature = signing_key.sign(&data);
-            packet.signature = Some(format!(
-                "{V2_SIGNATURE_PREFIX}{}",
-                hex::encode(signature.to_bytes())
-            ));
-        }
         SignatureFormat::V3Hash => {
             let payload = packet_to_signing_payload_v3(packet);
             let data = postcard::to_allocvec(&payload).map_err(|e| e.to_string())?;
@@ -159,14 +86,11 @@ pub fn verify_packet_with_key(
         .as_ref()
         .ok_or_else(|| "Missing signature".to_string())?;
 
-    if let Some(rest) = sig_hex.strip_prefix(V3_SIGNATURE_PREFIX) {
-        return verify_packet_v3(packet, rest, verifying_key);
-    }
-    if let Some(rest) = sig_hex.strip_prefix(V2_SIGNATURE_PREFIX) {
-        return verify_packet_v2(packet, rest, verifying_key);
-    }
+    let rest = sig_hex
+        .strip_prefix(V3_SIGNATURE_PREFIX)
+        .ok_or_else(|| "Unsupported signature format (only v3: is accepted)".to_string())?;
 
-    verify_packet_v1(packet, sig_hex, verifying_key)
+    verify_packet_v3(packet, rest, verifying_key)
 }
 
 fn resolve_verifying_key(
@@ -180,36 +104,6 @@ fn resolve_verifying_key(
             VerifyingKey::from_sec1_bytes(&pub_bytes).map_err(|e| e.to_string())
         }
     }
-}
-
-fn verify_packet_v1(
-    packet: &Packet,
-    sig_hex: &str,
-    verifying_key: Option<&VerifyingKey>,
-) -> Result<(), String> {
-    let payload = packet_to_signing_payload_v1(packet);
-    let data = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
-    let sig_bytes = hex::decode(sig_hex).map_err(|e| e.to_string())?;
-    let signature = Signature::from_slice(&sig_bytes).map_err(|e| e.to_string())?;
-    let verifying_key = resolve_verifying_key(packet, verifying_key)?;
-    verifying_key
-        .verify(&data, &signature)
-        .map_err(|e| format!("Signature verification failed: {}", e))
-}
-
-fn verify_packet_v2(
-    packet: &Packet,
-    sig_hex: &str,
-    verifying_key: Option<&VerifyingKey>,
-) -> Result<(), String> {
-    let payload = packet_to_signing_payload_v2(packet);
-    let data = postcard::to_allocvec(&payload).map_err(|e| e.to_string())?;
-    let sig_bytes = hex::decode(sig_hex).map_err(|e| e.to_string())?;
-    let signature = Signature::from_slice(&sig_bytes).map_err(|e| e.to_string())?;
-    let verifying_key = resolve_verifying_key(packet, verifying_key)?;
-    verifying_key
-        .verify(&data, &signature)
-        .map_err(|e| format!("Signature verification failed: {}", e))
 }
 
 fn verify_packet_v3(
@@ -267,7 +161,7 @@ mod tests {
     fn v3_sign_verify_none_protocol_id() {
         let kp = NodeKeypair::generate();
         let mut packet = sample_packet(&kp, None);
-        sign_packet_with_format(&mut packet, kp.signing_key(), SignatureFormat::V3Hash).unwrap();
+        sign_packet(&mut packet, kp.signing_key()).unwrap();
         verify_packet(&packet).unwrap();
     }
 
@@ -290,41 +184,32 @@ mod tests {
     }
 
     #[test]
-    fn v2_still_verifies_and_ignores_protocol_id() {
-        let kp = NodeKeypair::generate();
-        let mut packet = sample_packet(&kp, Some(0x4448));
-        sign_packet_with_format(&mut packet, kp.signing_key(), SignatureFormat::V2Hash).unwrap();
-        verify_packet(&packet).unwrap();
-        // V2 does not bind protocol_id — characterizing legacy gap closed by V3.
-        packet.protocol_id = Some(0x9999);
-        verify_packet(&packet).unwrap();
-    }
-
-    #[test]
-    fn v2_sign_verify_roundtrip() {
+    fn rejects_legacy_v2_prefix() {
         let kp = NodeKeypair::generate();
         let mut packet = sample_packet(&kp, None);
-        sign_packet_with_format(&mut packet, kp.signing_key(), SignatureFormat::V2Hash).unwrap();
-        verify_packet(&packet).unwrap();
+        sign_packet(&mut packet, kp.signing_key()).unwrap();
+        let hex = packet
+            .signature
+            .as_ref()
+            .unwrap()
+            .strip_prefix(V3_SIGNATURE_PREFIX)
+            .unwrap();
+        packet.signature = Some(format!("v2:{hex}"));
+        assert!(verify_packet(&packet).is_err());
     }
 
     #[test]
-    fn v1_still_verifies() {
+    fn rejects_bare_hex_legacy_v1() {
         let kp = NodeKeypair::generate();
-        let mut packet = Packet {
-            signature: None,
-            data: b"hello".to_vec(),
-            nodes: vec![],
-            sender: kp.peer_id().to_string(),
-            receiver: String::new(),
-            max_hops: 8,
-            request_id: None,
-            chunk_stream_id: None,
-            chunk_index: None,
-            total_chunks: None,
-            protocol_id: None,
-        };
+        let mut packet = sample_packet(&kp, None);
         sign_packet(&mut packet, kp.signing_key()).unwrap();
-        verify_packet(&packet).unwrap();
+        let hex = packet
+            .signature
+            .as_ref()
+            .unwrap()
+            .strip_prefix(V3_SIGNATURE_PREFIX)
+            .unwrap();
+        packet.signature = Some(hex.to_string());
+        assert!(verify_packet(&packet).is_err());
     }
 }

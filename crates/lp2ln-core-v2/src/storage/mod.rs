@@ -1,4 +1,4 @@
-//! # EXPERIMENTAL 
+//! # EXPERIMENTAL
 //!
 //! Local content-addressed block store, encryption, manifests, leases, transfer, repair.
 //!

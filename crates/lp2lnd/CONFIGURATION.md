@@ -106,18 +106,15 @@ Allow packets without signatures.
   - dev/test: `true`
   - production/untrusted networks: prefer `false` if your full stack supports strict signing
 
-#### `signature_format: "v1_json" | "v2_hash" | "v3_hash"`
+#### `signature_format: "v3_hash"`
 
-Outgoing packet signature wire format. Ingress always accepts V1/V2/V3 by prefix.
+Outgoing packet signature wire format. Ingress accepts **only** V3 (`v3:` prefix).
 
 | Value | Payload | Wire prefix |
 |---|---|---|
-| `v1_json` | JSON of packet fields (full `data`) | bare hex |
-| `v2_hash` | postcard of fields + SHA-256(`data`) | `v2:` |
-| `v3_hash` (default) | V2 fields + `protocol_id` | `v3:` |
+| `v3_hash` (default, only) | postcard: SHA-256(`data`) + routing fields + `protocol_id` | `v3:` |
 
-- Why V3: `protocol_id` is an App Plane multiplex tag; without it in the signed payload a relay can rewrite the tag without invalidating the signature.
-- Recommended: `v3_hash` for all new deployments. Keep `v2_hash` only while mixed peers cannot verify V3.
+Legacy V1 (JSON) and V2 (`v2:`) were removed before any public deployment — there is no mixed-version compatibility path.
 
 #### `experimental` (P0-04)
 
