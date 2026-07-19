@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 
@@ -195,4 +195,77 @@ pub(super) async fn execute_dial_plan(
         }
     }
     DialExecutionResult { dialed_any }
+}
+
+pub(crate) async fn dial_bootstrap_address(
+    transports: &[Arc<dyn Transport>],
+    router: &Arc<Router>,
+    incoming: &tokio::sync::mpsc::Sender<IncomingPacket>,
+    our_peer_id: &str,
+    target: &crate::node::options::BootstrapNode,
+    handshake_payload: &[u8],
+    dedupe: Option<&super::BootstrapDialDedupe>,
+    record_dial_ok: Option<(&Arc<Mutex<HashMap<SocketAddr, u64>>>, u64)>,
+) -> bool {
+    for transport in transports {
+        if !transport.is_listener() {
+            continue;
+        }
+        if !target.protocols.is_empty()
+            && !target
+                .protocols
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(transport.name()))
+        {
+            continue;
+        }
+        let transport_name = transport.name().to_string();
+        let key = (transport_name.clone(), target.addr);
+        if let Some(d) = dedupe {
+            if d.active_peers > 0 && d.set.lock().unwrap().contains(&key) {
+                if let Some((m, ts)) = record_dial_ok {
+                    m.lock().unwrap().insert(target.addr, ts);
+                }
+                return true;
+            }
+        }
+        match transport.dial(target.addr).await {
+            Ok(session) => {
+                crate::info!(
+                    "[NodeRuntime] Connected to default node {} via {}",
+                    target.addr,
+                    transport.name()
+                );
+                let session_id = crate::types::SessionId::from(session.id().to_string());
+                router.register_session_only(session_id.clone(), session.clone());
+                session.spawn_reader(incoming.clone());
+                let handshake = handshake_packet(our_peer_id, handshake_payload);
+                if let Err(e) = router.send_to_session(session_id, handshake).await {
+                    crate::error!(
+                        "[NodeRuntime] Failed to send handshake to {}: {}",
+                        target.addr,
+                        e
+                    );
+                    return false;
+                }
+                if let Some(d) = dedupe {
+                    d.set.lock().unwrap().insert(key);
+                }
+                if let Some((m, ts)) = record_dial_ok {
+                    m.lock().unwrap().insert(target.addr, ts);
+                }
+                return true;
+            }
+            Err(e) => {
+                let detail = crate::logger::describe_anyhow_io_error(&e);
+                crate::net_dial!(
+                    "[NodeRuntime] Dial to {} via {} failed: {}",
+                    target.addr,
+                    transport.name(),
+                    detail
+                );
+            }
+        }
+    }
+    false
 }

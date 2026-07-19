@@ -40,8 +40,8 @@ pub struct NodeHealthSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub total_errors: u64,
-    pub cpu_load_estimate: f32,
-    pub memory_pressure_estimate: f32,
+    pub conn_load_estimate: f32,
+    pub local_capacity_pressure: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

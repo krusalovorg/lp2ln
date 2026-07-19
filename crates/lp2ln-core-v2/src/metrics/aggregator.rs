@@ -53,8 +53,8 @@ impl MetricsAggregator {
         } else {
             0.0
         };
-        node.cpu_load_estimate = (conn_pressure * 0.7 + err_pressure * 0.3).min(1.0);
-        node.memory_pressure_estimate = (conn_pressure * 0.8 + err_pressure * 0.2).min(1.0);
+        node.conn_load_estimate = (conn_pressure * 0.7 + err_pressure * 0.3).min(1.0);
+        node.local_capacity_pressure = (conn_pressure * 0.8 + err_pressure * 0.2).min(1.0);
 
         AggregatedMetricsSnapshot {
             collected_at_ms: crate::topology::now_ms(),

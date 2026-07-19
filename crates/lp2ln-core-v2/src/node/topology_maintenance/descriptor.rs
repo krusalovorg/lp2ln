@@ -103,8 +103,8 @@ pub(super) async fn publish_descriptor_if_due(
         .min(u16::MAX as usize) as u16;
     let load = metrics
         .node
-        .cpu_load_estimate
-        .max(metrics.node.memory_pressure_estimate)
+        .conn_load_estimate
+        .max(metrics.node.local_capacity_pressure)
         .clamp(0.0, 1.0);
     let pressure_factor = (1.0 - ((load - 0.5).max(0.0) * 2.0)).clamp(0.3, 1.0);
     let effective_cap = (((base_cap as f32) * pressure_factor).round() as u16).max(4);

@@ -7,7 +7,7 @@ use futures::FutureExt;
 
 use crate::node::addressing::detect_lan_advertise_ip;
 use crate::node::runtime::startup::context::{RuntimeService, StartupContext};
-use crate::node::topology_maintenance::run_topology_maintenance_loop;
+use crate::node::topology_maintenance::{TopologyMaintenanceArgs, run_topology_maintenance_loop};
 use crate::protocol::handshake;
 
 pub struct TopologyService;
@@ -71,34 +71,36 @@ impl RuntimeService for TopologyService {
                     _ = cancel_topology.cancelled() => break,
                     result = AssertUnwindSafe(run_topology_maintenance_loop(
                         cancel_topology.clone(),
-                        policy_live.clone(),
-                        node_role,
-                        weights.clone(),
-                        sm.clone(),
-                        peer_dir.clone(),
-                        dial_book.clone(),
-                        peer_store.clone(),
-                        catalog.clone(),
-                        db.clone(),
-                        listens.clone(),
-                        advertise_addrs.clone(),
-                        advertise_fallback_ip,
-                        transports.clone(),
-                        router.clone(),
-                        incoming.clone(),
-                        our_peer.clone(),
-                        descriptor_ver.clone(),
-                        signing_key.clone(),
-                        log_peer_scores,
-                        topology_tuning.clone(),
-                        maintenance_handshake.clone(),
-                        bootstrap_targets_maint.clone(),
-                        nat_state.clone(),
-                        bootstrap_dedupe.clone(),
-                        bootstrap_ok.clone(),
-                        Some(session_redial_queue.clone()),
-                        react_to_session_events,
-                        dial_policy.clone(),
+                        TopologyMaintenanceArgs {
+                            policy_live: policy_live.clone(),
+                            node_role,
+                            weights: weights.clone(),
+                            sm: sm.clone(),
+                            peer_dir: peer_dir.clone(),
+                            dial_book: dial_book.clone(),
+                            peer_store: peer_store.clone(),
+                            catalog: catalog.clone(),
+                            db: db.clone(),
+                            listens: listens.clone(),
+                            advertise_addrs: advertise_addrs.clone(),
+                            advertise_fallback_ip,
+                            transports: transports.clone(),
+                            router: router.clone(),
+                            incoming: incoming.clone(),
+                            our_peer_id: our_peer.clone(),
+                            descriptor_ver: descriptor_ver.clone(),
+                            signing_key: signing_key.clone(),
+                            log_peer_scores,
+                            topology_tuning: topology_tuning.clone(),
+                            handshake_payload: maintenance_handshake.clone(),
+                            bootstrap_targets: bootstrap_targets_maint.clone(),
+                            nat_state: nat_state.clone(),
+                            bootstrap_dial_dedupe: bootstrap_dedupe.clone(),
+                            bootstrap_dial_ok_ms: bootstrap_ok.clone(),
+                            session_redial_queue: Some(session_redial_queue.clone()),
+                            react_to_session_events,
+                            dial_policy: dial_policy.clone(),
+                        },
                     ))
                     .catch_unwind() => result,
                 };

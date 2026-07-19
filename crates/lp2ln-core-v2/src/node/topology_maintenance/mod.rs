@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, RwLock};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
+mod args;
 mod bootstrap;
 mod descriptor;
 mod dialing;
@@ -14,22 +14,20 @@ mod packet_helpers;
 mod policy;
 mod session_reactions;
 mod state;
+mod tick;
 
-pub(crate) use self::policy::compute_policy_snapshot;
+pub(crate) use args::TopologyMaintenanceArgs;
+pub(crate) use dialing::dial_bootstrap_address;
 use self::state::MaintenanceState;
+use self::tick::{TickState, prepare_tick};
 use crate::db::P2PDatabase;
-use crate::metrics::MetricsAggregator;
-use crate::node::distribution::{
-    capacity_target_factor, dial_reserve_slots, regular_auto_dial_target,
-};
 use crate::node::nat_traversal::NatTraversalState;
-use crate::node::options::{BootstrapNode, DialPolicy, NodeOptions, NodeRole, TopologyTuning};
+use crate::node::options::{DialPolicy, NodeOptions, NodeRole, TopologyTuning};
 use crate::peer_score::{
     PeerConnectionPolicy, PeerScore, PeerScoreStore, PeerScoreWeights, total_score,
 };
 use crate::protocol::control::NetworkControlPayload;
 use crate::router::Router;
-use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
     CapacityBudget, NodeDescriptor, PeerCatalog, PeerDirectory,
@@ -41,7 +39,7 @@ use crate::types::{PeerId, SessionId};
 use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
 use dialing::{DialPlan, execute_dial_plan};
-use packet_helpers::{control_packet, handshake_packet};
+use packet_helpers::control_packet;
 pub use session_reactions::{
     SessionRedialQueue, TopologySessionReactionHandler, TransportDegradedReactionHandler,
 };
@@ -50,71 +48,6 @@ pub use session_reactions::{
 pub(crate) struct BootstrapDialDedupe {
     pub active_peers: usize,
     pub set: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
-}
-
-fn effective_bootstrap_connected_count(
-    connected: &[PeerId],
-    catalog: &PeerCatalog,
-    bootstrap_targets: &[BootstrapNode],
-    dial_book: &DashMap<PeerId, Vec<(String, SocketAddr)>>,
-    bootstrap_dial_ok_ms: &HashMap<SocketAddr, u64>,
-    now: u64,
-) -> usize {
-    let mut seen: HashSet<PeerId> = HashSet::new();
-    for p in connected {
-        if catalog.peer_is_bootstrap_entry(p) {
-            seen.insert(p.clone());
-            continue;
-        }
-        if let Some(desc) = catalog.descriptor_of(p) {
-            if bootstrap_targets
-                .iter()
-                .any(|t| descriptor_announces_bootstrap_target(&desc, t))
-            {
-                seen.insert(p.clone());
-                continue;
-            }
-        }
-        if let Some(entry) = dial_book.get(p) {
-            let hinted = bootstrap_targets
-                .iter()
-                .any(|t| t.peer_id_hint.as_ref() == Some(p));
-            let addr_match = bootstrap_targets.iter().any(|t| {
-                entry.value().iter().any(|(proto, addr)| {
-                    *addr == t.addr
-                        && (t.protocols.is_empty()
-                            || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(proto)))
-                })
-            });
-            if hinted || addr_match {
-                seen.insert(p.clone());
-            }
-        }
-    }
-    if !seen.is_empty() {
-        return seen.len();
-    }
-    let any_recent_dial = bootstrap_targets.iter().any(|t| {
-        bootstrap_dial_ok_ms
-            .get(&t.addr)
-            .copied()
-            .map(|ts| now.saturating_sub(ts) < BOOTSTRAP_DIAL_OK_TTL_MS)
-            .unwrap_or(false)
-    });
-    if any_recent_dial { 1 } else { 0 }
-}
-
-fn descriptor_announces_bootstrap_target(
-    desc: &crate::topology::NodeDescriptor,
-    t: &BootstrapNode,
-) -> bool {
-    desc.observed_addrs.iter().any(|line| {
-        parse_observed_addr_line(line).is_some_and(|(proto, addr)| {
-            addr == t.addr
-                && (t.protocols.is_empty()
-                    || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(&proto)))
-        })
-    })
 }
 
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
@@ -128,79 +61,6 @@ pub(super) const SHEPHERD_FINAL_PEERS_LIMIT: usize = 24;
 pub(super) const SHEPHERD_SKIP_IF_CONNECTED_AT_MOST: usize = 6;
 
 pub(super) const BOOTSTRAP_DIAL_OK_TTL_MS: u64 = 120_000;
-
-pub(crate) async fn dial_bootstrap_address(
-    transports: &[Arc<dyn Transport>],
-    router: &Arc<Router>,
-    incoming_packets_tx: &tokio::sync::mpsc::Sender<IncomingPacket>,
-    our_peer_id: &str,
-    target: &BootstrapNode,
-    handshake_payload: &[u8],
-    dedupe: Option<&BootstrapDialDedupe>,
-    record_dial_ok: Option<(&Arc<Mutex<HashMap<SocketAddr, u64>>>, u64)>,
-) -> bool {
-    for transport in transports {
-        if !transport.is_listener() {
-            continue;
-        }
-        if !target.protocols.is_empty()
-            && !target
-                .protocols
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(transport.name()))
-        {
-            continue;
-        }
-        let transport_name = transport.name().to_string();
-        let key = (transport_name.clone(), target.addr);
-        if let Some(d) = dedupe {
-            if d.active_peers > 0 && d.set.lock().unwrap().contains(&key) {
-                if let Some((m, ts)) = record_dial_ok {
-                    m.lock().unwrap().insert(target.addr, ts);
-                }
-                return true;
-            }
-        }
-        match transport.dial(target.addr).await {
-            Ok(session) => {
-                crate::info!(
-                    "[NodeRuntime] Connected to default node {} via {}",
-                    target.addr,
-                    transport.name()
-                );
-                let session_id = SessionId::from(session.id().to_string());
-                router.register_session_only(session_id.clone(), session.clone());
-                session.spawn_reader(incoming_packets_tx.clone());
-                let handshake = handshake_packet(our_peer_id, handshake_payload);
-                if let Err(e) = router.send_to_session(session_id, handshake).await {
-                    crate::error!(
-                        "[NodeRuntime] Failed to send handshake to {}: {}",
-                        target.addr,
-                        e
-                    );
-                    return false;
-                }
-                if let Some(d) = dedupe {
-                    d.set.lock().unwrap().insert(key);
-                }
-                if let Some((m, ts)) = record_dial_ok {
-                    m.lock().unwrap().insert(target.addr, ts);
-                }
-                return true;
-            }
-            Err(e) => {
-                let detail = crate::logger::describe_anyhow_io_error(&e);
-                crate::net_dial!(
-                    "[NodeRuntime] Dial to {} via {} failed: {}",
-                    target.addr,
-                    transport.name(),
-                    detail
-                );
-            }
-        }
-    }
-    false
-}
 
 #[allow(clippy::too_many_arguments)]
 fn build_topology_snapshot(
@@ -234,10 +94,10 @@ fn build_topology_snapshot(
         .collect();
     let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> =
         ctx.dial_book.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
-    let peer_age_ms = ctx.router_maint.peer_connection_ages();
+    let peer_age_ms = ctx.router.peer_connection_ages();
 
     TopologySnapshot {
-        our_peer_id: PeerId::from(ctx.our_peer_maint),
+        our_peer_id: PeerId::from(ctx.our_peer_id),
         node_role,
         policy: policy.clone(),
         weights: ctx.weights.clone(),
@@ -260,10 +120,10 @@ fn build_topology_snapshot(
 }
 
 struct TopologyMaintenanceCtx<'a> {
-    transports_maint: &'a [Arc<dyn Transport>],
-    router_maint: &'a Arc<Router>,
-    incoming_maint: &'a tokio::sync::mpsc::Sender<IncomingPacket>,
-    our_peer_maint: &'a str,
+    transports: &'a [Arc<dyn Transport>],
+    router: &'a Arc<Router>,
+    incoming: &'a tokio::sync::mpsc::Sender<IncomingPacket>,
+    our_peer_id: &'a str,
     nat_state: &'a Arc<NatTraversalState>,
     catalog: &'a Arc<PeerCatalog>,
     peer_store: &'a Arc<PeerScoreStore>,
@@ -285,7 +145,7 @@ async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &Cancellatio
         let mut selected_addr: Option<String> = None;
         let mut failure_reason: Option<String> = None;
         if let Some(udp_transport) = ctx
-            .transports_maint
+            .transports
             .iter()
             .find(|t| t.name().eq_ignore_ascii_case("udp") && t.supports_tunneling())
         {
@@ -313,12 +173,12 @@ async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &Cancellatio
                     Ok(session) => {
                         let session_id = SessionId::from(session.id().to_string());
                         let peer_id = PeerId::from(nat_job.peer_id.as_str());
-                        ctx.router_maint.register_session(
+                        ctx.router.register_session(
                             peer_id.clone(),
                             session_id.clone(),
                             session.clone(),
                         );
-                        session.spawn_reader(ctx.incoming_maint.clone());
+                        session.spawn_reader(ctx.incoming.clone());
                         crate::info!(
                             "[NodeRuntime] NAT tunnel established: peer={} session={} target={}",
                             peer_id,
@@ -350,9 +210,9 @@ async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &Cancellatio
             reason: failure_reason,
         };
         if let Ok(data) = result.encode() {
-            let packet = control_packet(ctx.our_peer_maint, nat_job.peer_id.clone(), data, 2);
+            let packet = control_packet(ctx.our_peer_id, nat_job.peer_id.clone(), data, 2);
             let _ = ctx
-                .router_maint
+                .router
                 .send_to_peer(PeerId::from(nat_job.peer_id.as_str()), packet, None)
                 .await;
         }
@@ -401,12 +261,10 @@ fn refresh_scores(ctx: &TopologyMaintenanceCtx<'_>) {
 fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
     let our_listen_addrs: HashSet<SocketAddr> = ctx.listens.iter().map(|r| *r.value()).collect();
     for desc in ctx.catalog.descriptors() {
-        if desc.peer_id == ctx.our_peer_maint {
+        if desc.peer_id == ctx.our_peer_id {
             continue;
         }
-        // PeerDirectory is the authoritative freshness-aware store.
         ctx.peer_dir.upsert_from_descriptor(&desc, &our_listen_addrs);
-        // DashMap stays for build_dial_plan and direct_upgrade until Step 7.
         for addr_s in &desc.observed_addrs {
             let Some((proto, addr)) = parse_observed_addr_line(addr_s) else {
                 continue;
@@ -432,39 +290,41 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_topology_maintenance_loop(
     cancel: CancellationToken,
-    policy_live_maint: Arc<RwLock<PeerConnectionPolicy>>,
-    node_role: NodeRole,
-    weights: PeerScoreWeights,
-    sm: Arc<SessionManager>,
-    peer_dir: Arc<PeerDirectory>,
-    dial_book: Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
-    peer_store: Arc<PeerScoreStore>,
-    catalog: Arc<PeerCatalog>,
-    db: Option<Arc<P2PDatabase>>,
-    listens: DashMap<String, SocketAddr>,
-    advertise_addrs: std::collections::HashMap<String, SocketAddr>,
-    advertise_fallback_ip: Option<IpAddr>,
-    transports_maint: Vec<Arc<dyn Transport>>,
-    router_maint: Arc<Router>,
-    incoming_maint: tokio::sync::mpsc::Sender<IncomingPacket>,
-    our_peer_maint: String,
-    descriptor_ver: Arc<AtomicU64>,
-    signing_key: k256::ecdsa::SigningKey,
-    log_peer_scores: bool,
-    topology_tuning: TopologyTuning,
-    maintenance_handshake_payload: Vec<u8>,
-    bootstrap_targets_maint: Vec<BootstrapNode>,
-    nat_state: Arc<NatTraversalState>,
-    bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
-    bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
-    session_redial_queue: Option<Arc<SessionRedialQueue>>,
-    react_to_session_events: bool,
-    dial_policy: DialPolicy,
+    args: TopologyMaintenanceArgs,
 ) -> anyhow::Result<()> {
-    let initial_jitter = (our_peer_maint
+    let TopologyMaintenanceArgs {
+        policy_live: policy_live_maint,
+        node_role,
+        weights,
+        sm,
+        peer_dir,
+        dial_book,
+        peer_store,
+        catalog,
+        db,
+        listens,
+        advertise_addrs,
+        advertise_fallback_ip,
+        transports,
+        router,
+        incoming,
+        our_peer_id,
+        descriptor_ver,
+        signing_key,
+        log_peer_scores,
+        topology_tuning,
+        handshake_payload: maintenance_handshake_payload,
+        bootstrap_targets: bootstrap_targets_maint,
+        nat_state,
+        bootstrap_dial_dedupe,
+        bootstrap_dial_ok_ms,
+        session_redial_queue,
+        react_to_session_events,
+        dial_policy,
+    } = args;
+    let initial_jitter = (our_peer_id
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
         % MAINTENANCE_START_JITTER_MS)
@@ -480,10 +340,10 @@ pub(crate) async fn run_topology_maintenance_loop(
     let reconciler = TopologyReconciler::new();
     let planner: std::sync::Arc<dyn TopologyPlanner> = std::sync::Arc::new(SmartMeshPlanner);
     let loop_ctx = TopologyMaintenanceCtx {
-        transports_maint: &transports_maint,
-        router_maint: &router_maint,
-        incoming_maint: &incoming_maint,
-        our_peer_maint: &our_peer_maint,
+        transports: &transports,
+        router: &router,
+        incoming: &incoming,
+        our_peer_id: &our_peer_id,
         nat_state: &nat_state,
         catalog: &catalog,
         peer_store: &peer_store,
@@ -519,85 +379,42 @@ pub(crate) async fn run_topology_maintenance_loop(
         .normalized();
         refresh_scores(&loop_ctx);
         sync_dial_book(&loop_ctx);
-        let metrics = MetricsAggregator::aggregate(sm.as_ref(), policy.max_active_peers.max(8));
-        let mut n = metrics.node.active_peers as usize;
-        let budget = CapacityBudget {
-            active_sessions: metrics.node.active_connections as usize,
-            max_sessions: policy.max_active_peers.max(8),
-            hard_ceiling_connections: policy.max_active_peers.max(16) * 4,
-            cpu_load: metrics.node.cpu_load_estimate,
-            memory_pressure: metrics.node.memory_pressure_estimate,
-            ..CapacityBudget::default()
-        };
-        let adaptive = budget.recommend_policy(&policy);
-        let now = now_ms();
-        let known_peers = catalog.known_peer_ids().len().max(1);
-        let self_capacity_factor = capacity_target_factor(
-            metrics.node.cpu_load_estimate,
-            metrics.node.memory_pressure_estimate,
-            policy.max_active_peers.min(u16::MAX as usize) as u16,
-        );
-        let auto_target_regular =
-            regular_auto_dial_target(known_peers, &topology_tuning, self_capacity_factor);
-        let mut desired = adaptive
-            .target_active_peers
-            .max(adaptive.min_active_peers)
-            .min(adaptive.max_active_peers);
-        if matches!(node_role, NodeRole::Regular) {
-            desired = desired.min(auto_target_regular);
-        }
-        let reserve_slots = dial_reserve_slots(node_role);
-        let dial_target_base = desired
-            .saturating_sub(reserve_slots)
-            .max(adaptive.min_active_peers);
-        let connected_snapshot_for_policy = router_maint.connected_peers();
-        {
-            let mut g = bootstrap_dial_ok_ms.lock().unwrap();
-            g.retain(|_, ts| now.saturating_sub(*ts) < BOOTSTRAP_DIAL_OK_TTL_MS);
-        }
-        let dial_ok_snap = bootstrap_dial_ok_ms.lock().unwrap().clone();
-        let connected_bootstrap_now = effective_bootstrap_connected_count(
-            &connected_snapshot_for_policy,
-            catalog.as_ref(),
-            &bootstrap_targets_maint,
-            dial_book.as_ref(),
-            &dial_ok_snap,
-            now,
-        );
-        let connected_non_bootstrap_now = connected_snapshot_for_policy
-            .len()
-            .saturating_sub(connected_bootstrap_now);
-        let policy_snapshot = compute_policy_snapshot(
-            &topology_tuning,
-            node_role,
+
+        let TickState {
+            metrics,
+            budget,
+            adaptive,
             known_peers,
-            n,
+            connected_snapshot,
             connected_bootstrap_now,
             connected_non_bootstrap_now,
-            dial_target_base,
-            desired,
-            adaptive.min_active_peers,
-            bootstrap_targets_maint.len(),
-            state.last_bootstrap_reseed_ms,
+            phase,
+            adaptive_tick,
+            dial_target,
+            dial_target_low,
+            dial_target_high,
+            reseed_for_low,
+            reseed_for_bridge,
             now,
+        } = prepare_tick(
+            &loop_ctx,
+            &policy,
+            node_role,
+            &sm,
+            &topology_tuning,
+            &bootstrap_targets_maint,
+            &bootstrap_dial_ok_ms,
+            state.last_bootstrap_reseed_ms,
         );
-        let phase = policy_snapshot.phase;
-        let adaptive_tick = policy_snapshot.adaptive_tick;
-        let dial_target = policy_snapshot.dial_target;
-        let dial_target_low = policy_snapshot.dial_target_low;
-        let dial_target_high = policy_snapshot.dial_target_high;
-        let reseed_for_low = policy_snapshot.reseed_for_low;
-        let reseed_for_bridge = policy_snapshot.reseed_for_bridge;
 
         // Planner decides all keep/drop/dial/discovery from a pure snapshot.
-        // Replaces the four inline drop passes that used to live below.
         let topology_snapshot = build_topology_snapshot(
             &loop_ctx,
             &topology_tuning,
             &policy,
             budget.clone(),
             node_role,
-            connected_snapshot_for_policy.clone(),
+            connected_snapshot.clone(),
             connected_bootstrap_now,
             known_peers,
             bootstrap_targets_maint.len(),
@@ -615,7 +432,7 @@ pub(crate) async fn run_topology_maintenance_loop(
             );
         }
         reconciler.execute_drops(&topology_plan.drop, &catalog, &sm, &peer_dir).await;
-        n = sm.distinct_peer_count();
+        let mut n = sm.distinct_peer_count();
 
         if handle_bootstrap_reseed(
             reseed_for_low,
@@ -624,14 +441,14 @@ pub(crate) async fn run_topology_maintenance_loop(
             adaptive.min_active_peers,
             connected_bootstrap_now,
             &bootstrap_targets_maint,
-            &our_peer_maint,
+            &our_peer_id,
             &topology_tuning,
             &mut state.bootstrap_deny_until,
             now,
             &adaptive_tick,
-            &transports_maint,
-            &router_maint,
-            &incoming_maint,
+            &transports,
+            &router,
+            &incoming,
             &maintenance_handshake_payload,
             &bootstrap_dial_dedupe,
             &bootstrap_dial_ok_ms,
@@ -671,14 +488,13 @@ pub(crate) async fn run_topology_maintenance_loop(
             if let Ok(data) = req.encode() {
                 for p in &need.request_from {
                     let packet =
-                        control_packet(&our_peer_maint, p.as_str().to_string(), data.clone(), 2);
-                    let _ = router_maint.send_to_peer(p.clone(), packet, None).await;
+                        control_packet(&our_peer_id, p.as_str().to_string(), data.clone(), 2);
+                    let _ = router.send_to_peer(p.clone(), packet, None).await;
                 }
             }
         }
 
-        // Dial: execute the planner's candidate list through the transport layer.
-        // SmartMesh already selected and ordered candidates; execute_dial_plan handles
+        // Dial: SmartMesh already selected and ordered candidates; execute_dial_plan handles
         // transport selection, backoff guards, and session registration.
         if !topology_plan.dial.is_empty() {
             let desc_by_peer: HashMap<PeerId, NodeDescriptor> = catalog
@@ -703,10 +519,10 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &dial_book,
                 &catalog,
                 &sm,
-                &transports_maint,
-                &router_maint,
-                &incoming_maint,
-                &our_peer_maint,
+                &transports,
+                &router,
+                &incoming,
+                &our_peer_id,
                 &maintenance_handshake_payload,
                 &peer_dir,
                 &topology_tuning,
@@ -718,7 +534,6 @@ pub(crate) async fn run_topology_maintenance_loop(
                 state.last_exploration_ms = now;
             }
         }
-        // Bootstrap shedding is handled by the planner's capacity ceiling pass above.
         n = sm.distinct_peer_count();
         let now = now_ms();
 
@@ -726,11 +541,11 @@ pub(crate) async fn run_topology_maintenance_loop(
             node_role,
             now,
             state.last_shepherd_sweep_ms,
-            &router_maint,
+            &router,
             &sm,
             &catalog,
             &mut state.peer_admission_ms,
-            &our_peer_maint,
+            &our_peer_id,
         )
         .await;
         if shepherd_ran {
@@ -746,7 +561,7 @@ pub(crate) async fn run_topology_maintenance_loop(
             descriptor_interval,
             descriptor_ttl_secs,
             &descriptor_ver,
-            &transports_maint,
+            &transports,
             &listens,
             &advertise_addrs,
             advertise_fallback_ip,
@@ -754,11 +569,11 @@ pub(crate) async fn run_topology_maintenance_loop(
             &adaptive,
             &metrics,
             n,
-            &our_peer_maint,
+            &our_peer_id,
             &signing_key,
             &catalog,
             &db,
-            &router_maint,
+            &router,
         )
         .await;
     }
@@ -766,7 +581,7 @@ pub(crate) async fn run_topology_maintenance_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::policy::TopologyPhase;
+    use super::policy::{TopologyPhase, compute_policy_snapshot};
     use super::*;
 
     #[test]
