@@ -6,7 +6,7 @@ pub mod snapshot;
 
 pub use peer_directory::{AddressRecord, AddressSource, DialRecord, PeerDirectory};
 pub use planner::{
-    AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent, DropReason, LegacyTopologyPlanner,
+    AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent, DropReason,
     PeerCandidate, TopologyPlan, TopologyPlanner,
 };
 pub use reconciler::TopologyReconciler;

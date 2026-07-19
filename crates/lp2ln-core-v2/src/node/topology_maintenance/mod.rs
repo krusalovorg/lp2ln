@@ -32,7 +32,7 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, LegacyTopologyPlanner, NodeDescriptor, PeerCatalog, PeerDirectory,
+    CapacityBudget, NodeDescriptor, PeerCatalog, PeerDirectory,
     SmartMeshPlanner, TopologyPlanner, TopologyReconciler, TopologySnapshot, now_ms,
     parse_observed_addr_line,
 };
@@ -478,11 +478,7 @@ pub(crate) async fn run_topology_maintenance_loop(
     let descriptor_interval = Duration::from_secs(30);
     let mut state = MaintenanceState::new(descriptor_interval, now_ms());
     let reconciler = TopologyReconciler::new();
-    let planner: std::sync::Arc<dyn TopologyPlanner> = if topology_tuning.use_legacy_planner {
-        std::sync::Arc::new(LegacyTopologyPlanner)
-    } else {
-        std::sync::Arc::new(SmartMeshPlanner)
-    };
+    let planner: std::sync::Arc<dyn TopologyPlanner> = std::sync::Arc::new(SmartMeshPlanner);
     let loop_ctx = TopologyMaintenanceCtx {
         transports_maint: &transports_maint,
         router_maint: &router_maint,

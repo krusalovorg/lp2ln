@@ -115,7 +115,7 @@ impl TopologyDecisionAdapter for BasicHeuristicAdapter {
     }
 }
 
-/// Wraps `LegacyTopologyPlanner` so the simulator exercises the same planner as the runtime.
+/// Adapter that feeds the simulator through the same `SmartMeshPlanner` as the runtime.
 /// Converts SimNodeId ↔ PeerId via `u64.to_string()`, uses fake loopback addresses for
 /// the dial book (simulator never connects to them; it only uses the PeerId round-trip).
 #[derive(Debug, Clone, PartialEq)]

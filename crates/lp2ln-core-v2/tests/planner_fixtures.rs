@@ -1,11 +1,11 @@
-/// fixture tests: verify LegacyTopologyPlanner produces correct decisions
+/// fixture tests: verify SmartMeshPlanner produces correct decisions
 /// for canned TopologySnapshot inputs. Network I/O is not involved.
 use std::collections::{HashMap, HashSet};
 
 use lp2ln_core_v2::node::options::{NodeRole, TopologyTuning};
 use lp2ln_core_v2::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
 use lp2ln_core_v2::topology::{
-    CapacityBudget, LegacyTopologyPlanner, PeerCandidate, TopologyPlanner, TopologySnapshot,
+    CapacityBudget, PeerCandidate, SmartMeshPlanner, TopologyPlanner, TopologySnapshot,
 };
 use lp2ln_core_v2::types::PeerId;
 
@@ -43,7 +43,7 @@ fn base_snapshot() -> TopologySnapshot {
 
 #[test]
 fn dial_when_under_target() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     // 2 connected, target 8 → should want to dial
@@ -59,7 +59,7 @@ fn dial_when_under_target() {
 
 #[test]
 fn no_dial_when_at_target() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     // Exactly at target
@@ -78,7 +78,7 @@ fn no_dial_when_at_target() {
 
 #[test]
 fn drop_when_over_max() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     // 20 connected, max 16 → should drop
@@ -96,7 +96,7 @@ fn drop_when_over_max() {
 
 #[test]
 fn discovery_when_under_target() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     // 2 connected, target 8 → should request peers
@@ -111,7 +111,7 @@ fn discovery_when_under_target() {
 
 #[test]
 fn no_self_dial() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     // dial_book contains our own peer_id
@@ -130,7 +130,7 @@ fn no_self_dial() {
 
 #[test]
 fn cooldown_peers_not_dialed() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
 
     let p = peer("coolpeer");
@@ -149,7 +149,7 @@ fn cooldown_peers_not_dialed() {
 
 #[test]
 fn admission_accept_when_under_hard_limit() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
     snap.connected_peers = (0..4).map(|i| peer(&format!("c{i}"))).collect(); // target=8, hard limit > 4
 
@@ -164,7 +164,7 @@ fn admission_accept_when_under_hard_limit() {
 
 #[test]
 fn admission_redirect_when_over_hard_limit() {
-    let planner = LegacyTopologyPlanner;
+    let planner = SmartMeshPlanner;
     let mut snap = base_snapshot();
     // target=8, headroom=2 → hard limit=10 for Regular; connect 12
     snap.connected_peers = (0..12).map(|i| peer(&format!("c{i:02}"))).collect();

@@ -98,9 +98,6 @@ pub struct TopologyTuning {
     pub adaptive_rejoin_cooldown_max_ms: u64,
     #[serde(default = "default_adaptive_redirect_memory_ms")]
     pub adaptive_redirect_memory_ms: u64,
-    /// Use LegacyTopologyPlanner instead of SmartMeshPlanner (rollback gate).
-    #[serde(default)]
-    pub use_legacy_planner: bool,
     /// Minimum time a peer must be connected (ms) before it can be rotated out.
     #[serde(default = "default_min_peer_residency_ms")]
     pub min_peer_residency_ms: u64,
@@ -135,7 +132,6 @@ impl Default for TopologyTuning {
             adaptive_rejoin_cooldown_min_ms: default_adaptive_rejoin_cooldown_min_ms(),
             adaptive_rejoin_cooldown_max_ms: default_adaptive_rejoin_cooldown_max_ms(),
             adaptive_redirect_memory_ms: default_adaptive_redirect_memory_ms(),
-            use_legacy_planner: false,
             min_peer_residency_ms: default_min_peer_residency_ms(),
             rotation_budget_frac: default_rotation_budget_frac(),
             replacement_epsilon: default_replacement_epsilon(),
