@@ -239,6 +239,24 @@ impl SessionManager {
         self.by_peer.iter().map(|r| r.key().clone()).collect()
     }
 
+    /// Returns the age (ms elapsed since first session) per connected peer.
+    pub fn peer_connection_ages(&self) -> std::collections::HashMap<PeerId, u64> {
+        self.by_peer
+            .iter()
+            .filter_map(|r| {
+                // max elapsed = oldest session for this peer
+                let age = r
+                    .value()
+                    .iter()
+                    .filter_map(|sid| {
+                        self.metrics.get(sid).map(|m| m.created_at.elapsed().as_millis() as u64)
+                    })
+                    .max();
+                age.map(|a| (r.key().clone(), a))
+            })
+            .collect()
+    }
+
     pub fn get_all_peers_sorted_by_score(&self) -> Vec<PeerId> {
         let peers = self.get_all_peers();
         crate::peer_score::rank_peers(&peers, |p| self.peer_scores.get(p), &self.peer_weights)

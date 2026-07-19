@@ -87,12 +87,14 @@ impl SmartMeshPlanner {
     }
 
     /// Greedy marginal-gain peer set selection across the four slot types.
+    /// Returns `(all_desired, structured_peers)` — the structured subset is
+    /// protected from rotation to preserve DHT bucket coverage.
     fn select_peer_set(
         &self,
         snapshot: &TopologySnapshot,
         our_node_id: &NodeId,
         subnets: &HashMap<PeerId, HashSet<[u8; 2]>>,
-    ) -> HashSet<PeerId> {
+    ) -> (HashSet<PeerId>, HashSet<PeerId>) {
         let policy = snapshot.policy.normalized();
         let target = policy.target_active_peers.max(1);
 
@@ -120,6 +122,7 @@ impl SmartMeshPlanner {
         };
 
         let mut selected: HashSet<PeerId> = HashSet::new();
+        let mut structured_peers: HashSet<PeerId> = HashSet::new();
 
         // ── Phase 1: structured — one peer per XOR bucket ────────────────────
         // Covers distinct regions of the keyspace; ensures routing progress.
@@ -140,6 +143,7 @@ impl SmartMeshPlanner {
             best_per_bucket
                 .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
             for (_, peer, _) in best_per_bucket.into_iter().take(structured_n) {
+                structured_peers.insert(peer.clone());
                 selected.insert(peer);
             }
         }
@@ -218,7 +222,7 @@ impl SmartMeshPlanner {
             }
         }
 
-        selected
+        (selected, structured_peers)
     }
 }
 
@@ -226,44 +230,58 @@ impl TopologyPlanner for SmartMeshPlanner {
     fn plan(&self, snapshot: &TopologySnapshot) -> TopologyPlan {
         let subnets = Self::peer_subnets(snapshot);
         let our_node_id = node_id_of(snapshot.our_peer_id.as_str());
-        let desired = self.select_peer_set(snapshot, &our_node_id, &subnets);
+        let (desired, structured_peers) = self.select_peer_set(snapshot, &our_node_id, &subnets);
 
         let policy = snapshot.policy.normalized();
+        let tuning = &snapshot.topology_tuning;
         let n = snapshot.connected_peers.len();
-        let cooldown_ms = snapshot.topology_tuning.prune_redial_cooldown_ms;
+        let cooldown_ms = tuning.prune_redial_cooldown_ms;
+        let residency_ms = tuning.min_peer_residency_ms;
+        let epsilon = tuning.replacement_epsilon;
+        let rotation_budget_frac = tuning.rotation_budget_frac.clamp(0.0, 1.0);
+        // Emergency: high resource pressure — bypass residency and budget guards.
+        let is_emergency = snapshot.capacity.overloaded();
+
         let mut drop_intents: Vec<DropIntent> = Vec::new();
         let mut dropped: HashSet<PeerId> = HashSet::new();
         let mut effective_n = n;
 
-        // Pass 1: hard capacity ceiling — prefer non-desired peers.
+        // Pass 1: hard capacity ceiling — prefer non-desired, then non-structured.
+        // No residency or epsilon guard: must shed regardless.
         if effective_n > policy.max_active_peers {
             let drop_n = effective_n.saturating_sub(policy.max_active_peers);
-            let mut candidates: Vec<PeerId> = snapshot
-                .connected_peers
-                .iter()
-                .filter(|p| !desired.contains(*p))
-                .cloned()
-                .collect();
-            candidates.sort_by(|a, b| {
+            let score_asc = |a: &PeerId, b: &PeerId| {
                 snapshot
                     .total_score_of(a)
                     .partial_cmp(&snapshot.total_score_of(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            };
+            // Order: non-desired non-structured → non-desired structured → desired
+            let mut candidates: Vec<PeerId> = snapshot
+                .connected_peers
+                .iter()
+                .filter(|p| !desired.contains(*p) && !structured_peers.contains(*p))
+                .cloned()
+                .collect();
+            candidates.sort_by(score_asc);
             if candidates.len() < drop_n {
-                // Exhausted non-desired; dip into desired (lowest score first).
+                let mut extra: Vec<PeerId> = snapshot
+                    .connected_peers
+                    .iter()
+                    .filter(|p| !desired.contains(*p) && structured_peers.contains(*p))
+                    .cloned()
+                    .collect();
+                extra.sort_by(score_asc);
+                candidates.extend(extra);
+            }
+            if candidates.len() < drop_n {
                 let mut extra: Vec<PeerId> = snapshot
                     .connected_peers
                     .iter()
                     .filter(|p| desired.contains(*p))
                     .cloned()
                     .collect();
-                extra.sort_by(|a, b| {
-                    snapshot
-                        .total_score_of(a)
-                        .partial_cmp(&snapshot.total_score_of(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                extra.sort_by(score_asc);
                 candidates.extend(extra);
             }
             for p in candidates.into_iter().take(drop_n) {
@@ -278,15 +296,51 @@ impl TopologyPlanner for SmartMeshPlanner {
         }
 
         // Pass 2: rotation — shed connected peers outside the desired set.
-        // ponytail: step 8 adds minimum residency + per-tick rotation budget cap.
+        // Guards: structured bucket protection, minimum residency, replacement epsilon.
+        // All guards are bypassed in emergency (resource pressure).
         if effective_n > policy.min_active_peers {
-            let rotation_budget = (policy.target_active_peers / 4)
-                .max(1)
-                .min(effective_n.saturating_sub(policy.min_active_peers));
+            let rotation_budget =
+                ((policy.target_active_peers as f32 * rotation_budget_frac).ceil() as usize)
+                    .max(1)
+                    .min(effective_n.saturating_sub(policy.min_active_peers));
+
+            // Best unconnected candidate score — needed for epsilon guard.
+            let connected_set: HashSet<&PeerId> = snapshot.connected_peers.iter().collect();
+            let best_candidate_score = desired
+                .iter()
+                .filter(|p| {
+                    !connected_set.contains(*p)
+                        && snapshot.dial_book.contains_key(*p)
+                        && !snapshot.in_cooldown(*p)
+                })
+                .map(|p| snapshot.total_score_of(p))
+                .fold(f32::NEG_INFINITY, f32::max);
+
             let mut rotation_candidates: Vec<PeerId> = snapshot
                 .connected_peers
                 .iter()
-                .filter(|p| !dropped.contains(*p) && !desired.contains(*p))
+                .filter(|p| {
+                    if dropped.contains(*p) || desired.contains(*p) {
+                        return false;
+                    }
+                    if !is_emergency {
+                        // Structured bucket protection: keep DHT coverage stable.
+                        if structured_peers.contains(*p) {
+                            return false;
+                        }
+                        // Minimum residency: don't evict freshly-connected peers.
+                        let age = snapshot.peer_age_ms.get(*p).copied().unwrap_or(0);
+                        if age < residency_ms {
+                            return false;
+                        }
+                        // Replacement epsilon: only rotate if the gain justifies it.
+                        let peer_score = snapshot.total_score_of(*p);
+                        if best_candidate_score <= peer_score + epsilon {
+                            return false;
+                        }
+                    }
+                    true
+                })
                 .cloned()
                 .collect();
             rotation_candidates.sort_by(|a, b| {
@@ -409,7 +463,7 @@ impl TopologyPlanner for SmartMeshPlanner {
         // Known peer: accept only if the candidate would occupy a desired slot.
         let our_node_id = node_id_of(snapshot.our_peer_id.as_str());
         let subnets = Self::peer_subnets(snapshot);
-        let desired = self.select_peer_set(snapshot, &our_node_id, &subnets);
+        let (desired, _) = self.select_peer_set(snapshot, &our_node_id, &subnets);
 
         if desired.contains(&candidate.peer_id) {
             AdmissionDecision::Accept

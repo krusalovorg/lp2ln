@@ -34,6 +34,7 @@ fn base_snapshot() -> TopologySnapshot {
         capacity: CapacityBudget::default(),
         dial_book: HashMap::new(),
         dial_cooldowns: HashMap::new(),
+        peer_age_ms: HashMap::new(),
         bootstrap_targets_count: 3,
         last_bootstrap_reseed_ms: 0,
         now_ms: 60_000,

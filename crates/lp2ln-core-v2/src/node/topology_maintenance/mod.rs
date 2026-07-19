@@ -32,8 +32,8 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, PeerCatalog, PeerDirectory, SmartMeshPlanner, TopologyPlanner,
-    TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
+    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, PeerDirectory, SmartMeshPlanner,
+    TopologyPlanner, TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
 };
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
@@ -233,6 +233,7 @@ fn build_topology_snapshot(
         .collect();
     let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> =
         ctx.dial_book.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+    let peer_age_ms = ctx.router_maint.peer_connection_ages();
 
     TopologySnapshot {
         our_peer_id: PeerId::from(ctx.our_peer_maint),
@@ -250,6 +251,7 @@ fn build_topology_snapshot(
         capacity,
         dial_book,
         dial_cooldowns: ctx.peer_dir.cooldowns(),
+        peer_age_ms,
         bootstrap_targets_count,
         last_bootstrap_reseed_ms,
         now_ms: now,
@@ -475,8 +477,11 @@ pub(crate) async fn run_topology_maintenance_loop(
     let descriptor_interval = Duration::from_secs(30);
     let mut state = MaintenanceState::new(descriptor_interval, now_ms());
     let reconciler = TopologyReconciler::new();
-    // ponytail: feature-gate LegacyTopologyPlanner fallback in step 8 for safe migration rollout
-    let planner = SmartMeshPlanner;
+    let planner: std::sync::Arc<dyn TopologyPlanner> = if topology_tuning.use_legacy_planner {
+        std::sync::Arc::new(LegacyTopologyPlanner)
+    } else {
+        std::sync::Arc::new(SmartMeshPlanner)
+    };
     let loop_ctx = TopologyMaintenanceCtx {
         transports_maint: &transports_maint,
         router_maint: &router_maint,

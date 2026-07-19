@@ -258,6 +258,7 @@ pub(crate) async fn run_incoming_session_handler(
                 capacity: CapacityBudget::default(),
                 dial_book: std::collections::HashMap::new(),
                 dial_cooldowns: std::collections::HashMap::new(),
+                peer_age_ms: std::collections::HashMap::new(),
                 bootstrap_targets_count: 0,
                 last_bootstrap_reseed_ms: 0,
                 now_ms: now,

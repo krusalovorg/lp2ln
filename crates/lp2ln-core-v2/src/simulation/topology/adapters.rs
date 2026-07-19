@@ -181,6 +181,7 @@ impl TopologyDecisionAdapter for PlannerAdapter {
             capacity: CapacityBudget::default(),
             dial_book,
             dial_cooldowns: HashMap::new(),
+            peer_age_ms: HashMap::new(),
             bootstrap_targets_count: 0,
             last_bootstrap_reseed_ms: 0,
             now_ms: observation.now_ms,

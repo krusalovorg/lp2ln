@@ -369,6 +369,10 @@ impl Router {
         self.session_manager.get_all_peers()
     }
 
+    pub fn peer_connection_ages(&self) -> std::collections::HashMap<PeerId, u64> {
+        self.session_manager.peer_connection_ages()
+    }
+
     pub async fn run(
         self: Arc<Self>,
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,

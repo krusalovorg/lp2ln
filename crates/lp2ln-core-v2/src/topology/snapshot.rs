@@ -41,6 +41,8 @@ pub struct TopologySnapshot {
     pub dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>>,
     /// Peers that are in a dial cooldown period: peer_id → ready_at_ms.
     pub dial_cooldowns: HashMap<PeerId, u64>,
+    /// How long each currently-connected peer has been connected (ms). Used for residency guards.
+    pub peer_age_ms: HashMap<PeerId, u64>,
 
     /// Number of configured bootstrap target nodes (for reseed guard heuristics).
     pub bootstrap_targets_count: usize,
