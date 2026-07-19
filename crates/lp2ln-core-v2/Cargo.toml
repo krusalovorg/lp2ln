@@ -40,6 +40,7 @@ rcgen = "0.13"
 h3 = "0.0.5"
 h3-quinn = "0.0.6"
 http = "1"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 rcgen = "0.13"

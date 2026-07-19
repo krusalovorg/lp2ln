@@ -15,7 +15,8 @@ use crate::types::PeerId;
 
 use super::options::{
     BootstrapNode, DebugServerOptions, DialPolicy, DirectUpgradeConfig, FlowTraceOptions,
-    IpcTcpOptions, NodeOptions, NodeRole, TopologyTuning, default_transport_obfuscation,
+    IpcTcpOptions, LanDiscoveryOptions, NodeOptions, NodeRole, TopologyTuning,
+    default_transport_obfuscation,
 };
 
 pub(super) fn from_file(path: impl AsRef<Path>) -> Result<NodeOptions, String> {
@@ -119,6 +120,8 @@ struct NodeOptionsFile {
     topology_react_to_session_events: bool,
     #[serde(default)]
     dial_policy: DialPolicy,
+    #[serde(default)]
+    lan_discovery: LanDiscoveryOptions,
 }
 
 fn default_event_bus_broadcast_cap() -> usize {
@@ -242,6 +245,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             stop_on_permanent_degradation: file.stop_on_permanent_degradation,
             topology_react_to_session_events: file.topology_react_to_session_events,
             dial_policy: file.dial_policy,
+            lan_discovery: file.lan_discovery,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -396,6 +400,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             stop_on_permanent_degradation: opts.stop_on_permanent_degradation,
             topology_react_to_session_events: opts.topology_react_to_session_events,
             dial_policy: opts.dial_policy.clone(),
+            lan_discovery: opts.lan_discovery.clone(),
         }
     }
 }

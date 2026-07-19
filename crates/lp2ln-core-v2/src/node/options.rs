@@ -385,6 +385,7 @@ pub struct NodeOptions {
     /// When true, topology reacts to session-close events via CoreBus handlers.
     pub topology_react_to_session_events: bool,
     pub dial_policy: DialPolicy,
+    pub lan_discovery: LanDiscoveryOptions,
 }
 
 impl Default for NodeOptions {
@@ -429,6 +430,7 @@ impl NodeOptions {
             stop_on_permanent_degradation: false,
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
+            lan_discovery: LanDiscoveryOptions::default(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -477,6 +479,7 @@ impl NodeOptions {
             stop_on_permanent_degradation: false,
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
+            lan_discovery: LanDiscoveryOptions::default(),
             logger_options: Some(LoggerOptions::default()),
         }
     }
@@ -656,6 +659,48 @@ impl NodeOptions {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
         super::options_file::save(self, path)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanDiscoveryOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_lan_port")]
+    pub port: u16,
+    /// How often to multicast a LanHello (ms).
+    #[serde(default = "default_lan_announce_interval_ms")]
+    pub announce_interval_ms: u64,
+    /// Lifetime of a LanHello's endpoints in PeerDirectory (ms).
+    #[serde(default = "default_lan_hello_ttl_ms")]
+    pub hello_ttl_ms: u64,
+    /// Per-peer rate limit: drop hellos beyond this many per second.
+    #[serde(default = "default_lan_max_hellos_per_peer_per_sec")]
+    pub max_hellos_per_peer_per_sec: u32,
+}
+
+impl Default for LanDiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: default_lan_port(),
+            announce_interval_ms: default_lan_announce_interval_ms(),
+            hello_ttl_ms: default_lan_hello_ttl_ms(),
+            max_hellos_per_peer_per_sec: default_lan_max_hellos_per_peer_per_sec(),
+        }
+    }
+}
+
+fn default_lan_port() -> u16 {
+    42500
+}
+fn default_lan_announce_interval_ms() -> u64 {
+    15_000
+}
+fn default_lan_hello_ttl_ms() -> u64 {
+    60_000
+}
+fn default_lan_max_hellos_per_peer_per_sec() -> u32 {
+    5
 }
 
 pub(super) fn default_true() -> bool {

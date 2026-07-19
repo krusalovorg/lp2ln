@@ -136,6 +136,7 @@ impl NodeRuntime {
                 stop_on_permanent_degradation: options.stop_on_permanent_degradation,
                 topology_react_to_session_events: options.topology_react_to_session_events,
                 dial_policy: options.dial_policy,
+                lan_discovery: options.lan_discovery,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,

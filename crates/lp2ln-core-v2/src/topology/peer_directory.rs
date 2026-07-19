@@ -13,6 +13,8 @@ pub enum AddressSource {
     SelfReported,
     /// Received via gossip (PeersResponse from a third party).
     Gossip,
+    /// Discovered via LAN multicast (signed LanHello).
+    Lan,
 }
 
 /// A known dial endpoint for a peer with freshness metadata.
@@ -171,6 +173,28 @@ impl PeerDirectory {
             .collect()
     }
 
+    /// Replace all Lan-sourced addresses for a peer with a new set.
+    /// Called when a new LanHello arrives (new boot_id or higher seq).
+    pub fn replace_lan_addresses(
+        &self,
+        peer_id: &PeerId,
+        endpoints: &[(String, SocketAddr)],
+        expires_at_ms: u64,
+        last_seen_ms: u64,
+    ) {
+        let mut entry = self.peers.entry(peer_id.clone()).or_default();
+        entry.addresses.retain(|r| r.source != AddressSource::Lan);
+        for (proto, addr) in endpoints {
+            entry.addresses.push(AddressRecord {
+                proto: proto.clone(),
+                addr: *addr,
+                source: AddressSource::Lan,
+                last_seen_ms,
+                expires_at_ms,
+            });
+        }
+    }
+
     /// Remove peers whose addresses have all expired and whose backoff has ended.
     pub fn cleanup_expired(&self, now: u64) {
         let to_remove: Vec<PeerId> = self
@@ -251,6 +275,67 @@ mod tests {
         let addrs = book.get(&pid).unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].1.port(), 1234);
+    }
+
+    #[test]
+    fn replace_lan_addresses_clears_stale_lan_and_inserts_new() {
+        let dir = PeerDirectory::new();
+        let pid = PeerId::from("peer1");
+        let now = 100_000u64;
+
+        // Первый набор LAN-адресов.
+        dir.replace_lan_addresses(
+            &pid,
+            &[("tcp".into(), make_addr(1111))],
+            now + 60_000,
+            now,
+        );
+        let book = dir.dial_book(now);
+        assert_eq!(book[&pid].len(), 1);
+        assert_eq!(book[&pid][0].1.port(), 1111);
+
+        // Замена (новый boot_id).
+        dir.replace_lan_addresses(
+            &pid,
+            &[("tcp".into(), make_addr(2222))],
+            now + 60_000,
+            now,
+        );
+        let book = dir.dial_book(now);
+        assert_eq!(book[&pid].len(), 1);
+        assert_eq!(book[&pid][0].1.port(), 2222, "старый LAN-адрес должен быть заменён");
+    }
+
+    #[test]
+    fn replace_lan_does_not_remove_self_reported_addresses() {
+        let dir = PeerDirectory::new();
+        let pid = PeerId::from("peer1");
+        let now = 100_000u64;
+
+        // SelfReported-адрес через дескриптор.
+        {
+            let mut entry = dir.peers.entry(pid.clone()).or_default();
+            entry.addresses.push(AddressRecord {
+                proto: "tcp".into(),
+                addr: make_addr(8080),
+                source: AddressSource::SelfReported,
+                last_seen_ms: now,
+                expires_at_ms: now + 60_000,
+            });
+        }
+
+        // LAN replace не должен его трогать.
+        dir.replace_lan_addresses(
+            &pid,
+            &[("tcp".into(), make_addr(9090))],
+            now + 60_000,
+            now,
+        );
+
+        let book = dir.dial_book(now);
+        let ports: Vec<u16> = book[&pid].iter().map(|(_, a)| a.port()).collect();
+        assert!(ports.contains(&8080), "SelfReported адрес должен остаться");
+        assert!(ports.contains(&9090), "LAN адрес должен добавиться");
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod addressing;
 pub mod autonomy;
 pub mod builder;
 pub mod direct_upgrade;
+pub mod lan_discovery;
 pub mod distribution;
 pub mod flow_trace;
 pub mod health_server;

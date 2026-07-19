@@ -16,6 +16,7 @@ use crate::node::runtime::startup::context::{RuntimeService, StartupContext};
 use crate::node::runtime::startup::direct_upgrade::DirectUpgradeService;
 use crate::node::runtime::startup::flow_trace::FlowTraceRuntimeService;
 use crate::node::runtime::startup::incoming::IncomingService;
+use crate::node::runtime::startup::lan_discovery::LanDiscoveryService;
 use crate::node::runtime::startup::router::RouterService;
 use crate::node::runtime::startup::topology::TopologyService;
 use crate::node::supervisor::NodeSupervisor;
@@ -200,6 +201,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         Box::new(IncomingService),
         Box::new(BootstrapService),
         Box::new(TopologyService),
+        Box::new(LanDiscoveryService),
     ];
     for service in services {
         if service.enabled(&startup_ctx) {
