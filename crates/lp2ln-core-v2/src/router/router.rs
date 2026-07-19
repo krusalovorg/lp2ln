@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     crypto::peer_cache::PeerCryptoCache,
     crypto::signature::SignatureFormat,
+    dht::records::{node_id_of, xor_distance},
     node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
     packet::Packet,
     packet_processor::PacketProcessor,
@@ -22,12 +23,14 @@ use crate::{
         LinkKind, Session, SessionMetrics, manager::SessionManager, session::IncomingPacket,
     },
     transport::tcp::codec::encode_packet,
-    types::{PeerId, SessionId},
+    types::{NodeId, PeerId, SessionId},
 };
 
 pub const ROUTER_INCOMING_QUEUE_CAP: usize = 16384;
 const ROUTER_BROADCAST_CAP: usize = 4096;
 pub const ROUTER_PROCESS_SEMAPHORE_PERMITS: usize = 256;
+/// Maximum forwarding hops before a packet is dropped (loop / TTL budget).
+const MAX_HOP_COUNT: usize = 10;
 /// Outcome of [`Router::run`]. Replaces the previous `Result<()>` plus
 /// `is_ingress_closed()` side-channel so the supervised loop decides whether
 /// to restart from a typed value.
@@ -52,6 +55,7 @@ pub struct Router {
     peer_cache: Arc<PeerCryptoCache>,
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
+    our_node_id: NodeId,
 }
 
 impl Router {
@@ -88,7 +92,8 @@ impl Router {
         worker_concurrency: usize,
         signature_format: SignatureFormat,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
-        let our_peer_id = our_peer_id.into();
+        let our_peer_id: String = our_peer_id.into();
+        let our_node_id = node_id_of(&our_peer_id);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
         let (incoming_broadcast_tx, _rx) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
@@ -123,6 +128,7 @@ impl Router {
                 peer_cache,
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
+                our_node_id,
             },
             incoming_rx,
         )
@@ -272,25 +278,56 @@ impl Router {
             ));
         }
 
+        // Hop budget: drop packets that have already traversed too many nodes.
+        if packet.nodes.len() >= MAX_HOP_COUNT {
+            return Err(anyhow::anyhow!(
+                "Hop budget exceeded ({} hops) routing to '{}'",
+                packet.nodes.len(),
+                peer_id
+            ));
+        }
+
         let peers = SessionSelector::peers_sorted_by_score(self.session_manager.as_ref());
         if peers.is_empty() {
             return Err(anyhow::anyhow!(
-                "No sessions for peer '{}' and no neighbors to broadcast",
+                "No sessions for peer '{}' and no neighbors to forward through",
                 peer_id
             ));
         }
         self.try_record_direct_upgrade_fallback(&peer_id, packet.wire_size_estimate());
-        let hop_nodes = packet.nodes.clone();
+
+        // Progress routing: prefer neighbors with XOR distance to target strictly
+        // less than our own distance. Utility score (peers_sorted_by_score ordering)
+        // is the tie-breaker within each group.
+        //
+        // If no progress-making neighbor exists we still forward to the best-score
+        // neighbor (current behavior) and log a no-progress warning. The hop budget
+        // above prevents infinite loops on a stale mesh.
+        let target_nid = node_id_of(peer_id.as_str());
+        let our_dist = xor_distance(&self.our_node_id, &target_nid);
+
+        let (progress_neighbors, fallback_neighbors): (Vec<_>, Vec<_>) = peers
+            .into_iter()
+            .filter(|n| {
+                exclude_from.as_ref() != Some(n)
+                    && !packet.nodes.iter().any(|h| h == n.as_str())
+            })
+            .partition(|n| xor_distance(&node_id_of(n.as_str()), &target_nid) < our_dist);
+
+        if progress_neighbors.is_empty() {
+            crate::debug!(
+                "[Router] no progress-making neighbor for '{}'; using score-based fallback",
+                peer_id
+            );
+        }
+
+        let candidates: Vec<PeerId> =
+            progress_neighbors.into_iter().chain(fallback_neighbors).collect();
+
         let wire = encode_packet(packet)?;
         let mut any_ok = false;
         let mut last_err = None;
-        for neighbor in peers {
-            if exclude_from.as_ref() == Some(&neighbor) {
-                continue;
-            }
-            if hop_nodes.iter().any(|n| n == neighbor.as_str()) {
-                continue;
-            }
+        for neighbor in candidates {
             if let Some(session) =
                 SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &neighbor)
             {
