@@ -174,7 +174,7 @@ impl PacketProcessor for DefaultPacketProcessor {
         let from = incoming_packet
             .from_node
             .as_deref()
-            .unwrap_or_else(|| packet.sender.as_str());
+            .unwrap_or(packet.sender.as_str());
         let peer_id = PeerId::from_str(from);
         let registry: &dyn SessionRegistry = router.as_ref();
         registry.set_peer_for_session(session_id.clone(), peer_id.clone());

@@ -65,7 +65,7 @@ impl Session for RecordingSession {
     }
 
     async fn send(&self, packet: Packet) -> Result<u64> {
-        let bytes = packet.wire_size_estimate() as u64;
+        let bytes = packet.wire_size_estimate();
         self.sent.lock().expect("sent lock").push(packet);
         Ok(bytes)
     }
@@ -73,7 +73,7 @@ impl Session for RecordingSession {
     async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
         use lp2ln_core_v2::transport::tcp::codec::decode_packet;
         let packet = decode_packet(encoded)?;
-        let bytes = packet.wire_size_estimate() as u64;
+        let bytes = packet.wire_size_estimate();
         self.sent.lock().expect("sent lock").push(packet);
         Ok(bytes)
     }

@@ -87,35 +87,6 @@ pub struct ReplayWindow {
     initialized: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::NodeKeypair;
-
-    #[test]
-    fn secure_envelope_roundtrip() {
-        let a = NodeKeypair::generate();
-        let b = NodeKeypair::generate();
-        let key_ab = derive_shared_key(a.signing_key(), b.peer_id()).expect("derive key_ab");
-        let key_ba = derive_shared_key(b.signing_key(), a.peer_id()).expect("derive key_ba");
-        let payload = b"hello secure world".to_vec();
-        let enc = encode_secure_envelope(&payload, key_ab, 7).expect("encrypt");
-        let (seq, dec) = decode_secure_envelope(&enc, key_ba).expect("decrypt");
-        assert_eq!(seq, 7);
-        assert_eq!(dec, payload);
-    }
-
-    #[test]
-    fn replay_window_rejects_duplicates() {
-        let mut rw = ReplayWindow::default();
-        assert!(rw.check_and_record(10));
-        assert!(rw.check_and_record(11));
-        assert!(!rw.check_and_record(10));
-        assert!(!rw.check_and_record(11));
-        assert!(rw.check_and_record(12));
-    }
-}
-
 impl ReplayWindow {
     pub fn check_and_record(&mut self, seq: u64) -> bool {
         if !self.initialized {
@@ -145,5 +116,34 @@ impl ReplayWindow {
         }
         self.bitmap |= bit;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::NodeKeypair;
+
+    #[test]
+    fn secure_envelope_roundtrip() {
+        let a = NodeKeypair::generate();
+        let b = NodeKeypair::generate();
+        let key_ab = derive_shared_key(a.signing_key(), b.peer_id()).expect("derive key_ab");
+        let key_ba = derive_shared_key(b.signing_key(), a.peer_id()).expect("derive key_ba");
+        let payload = b"hello secure world".to_vec();
+        let enc = encode_secure_envelope(&payload, key_ab, 7).expect("encrypt");
+        let (seq, dec) = decode_secure_envelope(&enc, key_ba).expect("decrypt");
+        assert_eq!(seq, 7);
+        assert_eq!(dec, payload);
+    }
+
+    #[test]
+    fn replay_window_rejects_duplicates() {
+        let mut rw = ReplayWindow::default();
+        assert!(rw.check_and_record(10));
+        assert!(rw.check_and_record(11));
+        assert!(!rw.check_and_record(10));
+        assert!(!rw.check_and_record(11));
+        assert!(rw.check_and_record(12));
     }
 }

@@ -17,6 +17,7 @@ impl PeerId {
         self.0
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(id: &str) -> Self {
         Self(id.to_string())
     }

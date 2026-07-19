@@ -598,8 +598,8 @@ pub fn peers_to_drop_when_overloaded(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let ordered: Vec<PeerId> = match node_role {
-        NodeRole::Regular => boot.into_iter().chain(regular.into_iter()).collect(),
-        NodeRole::BootstrapJoin => regular.into_iter().chain(boot.into_iter()).collect(),
+        NodeRole::Regular => boot.into_iter().chain(regular).collect(),
+        NodeRole::BootstrapJoin => regular.into_iter().chain(boot).collect(),
     };
     ordered.into_iter().take(drop_n).collect()
 }

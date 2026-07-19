@@ -132,7 +132,7 @@ fn verify_packet_v1(
     let sig_bytes = hex::decode(sig_hex).map_err(|e| e.to_string())?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|e| e.to_string())?;
     let verifying_key = match verifying_key {
-        Some(k) => k.clone(),
+        Some(k) => *k,
         None => {
             let pub_bytes = hex::decode(&packet.sender).map_err(|e| e.to_string())?;
             VerifyingKey::from_sec1_bytes(&pub_bytes).map_err(|e| e.to_string())?
@@ -153,7 +153,7 @@ fn verify_packet_v2(
     let sig_bytes = hex::decode(sig_hex).map_err(|e| e.to_string())?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|e| e.to_string())?;
     let verifying_key = match verifying_key {
-        Some(k) => k.clone(),
+        Some(k) => *k,
         None => {
             let pub_bytes = hex::decode(&packet.sender).map_err(|e| e.to_string())?;
             VerifyingKey::from_sec1_bytes(&pub_bytes).map_err(|e| e.to_string())?

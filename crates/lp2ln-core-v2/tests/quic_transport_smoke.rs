@@ -9,6 +9,9 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn quic_transport_start_dial_and_exchange_packet() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let options = QuicTransportOptions::default();
     let listener = Arc::new(QuicTransport::new_listener(
         Some("127.0.0.1:0".parse().expect("valid addr")),

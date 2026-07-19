@@ -207,7 +207,8 @@ impl SimNetwork {
         let started = Instant::now();
         for i in 0..batch {
             let rid = base_request_id + i as u64;
-            let pkt = make_routing_packet_with_id(sender, receiver, payload_size, max_hops, Some(rid));
+            let pkt =
+                make_routing_packet_with_id(sender, receiver, payload_size, max_hops, Some(rid));
             let _ = self.send_from(from, pkt).await;
         }
         let remaining = deadline.saturating_sub(started.elapsed());

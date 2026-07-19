@@ -1,3 +1,8 @@
+#![allow(clippy::module_inception)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+
 pub mod app_plane;
 pub mod crypto;
 pub mod db;

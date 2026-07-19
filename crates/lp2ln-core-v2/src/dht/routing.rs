@@ -18,7 +18,11 @@ struct KBucket {
 impl KBucket {
     fn update(&mut self, record: NodeRecord) {
         // Move to tail (most-recently-seen) if already present.
-        if let Some(pos) = self.contacts.iter().position(|r| r.peer_id == record.peer_id) {
+        if let Some(pos) = self
+            .contacts
+            .iter()
+            .position(|r| r.peer_id == record.peer_id)
+        {
             self.contacts.remove(pos);
         } else if self.contacts.len() >= K {
             // ponytail: evict head without ping; add LRU-with-ping in DHT-3

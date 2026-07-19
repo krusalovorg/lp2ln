@@ -60,7 +60,8 @@ impl DhtService {
     }
 
     fn next_rid(&self) -> u64 {
-        self.next_rid.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_rid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Store self in DHT and seed routing table with bootstrap contacts.
@@ -96,7 +97,9 @@ impl DhtService {
 
     /// Handle a raw incoming packet (called from the listener task).
     pub fn handle_raw(self: &Arc<Self>, from_peer: &str, data: &[u8]) {
-        let Ok(msg) = postcard::from_bytes::<DhtMsg>(data) else { return };
+        let Ok(msg) = postcard::from_bytes::<DhtMsg>(data) else {
+            return;
+        };
         let svc = self.clone();
         let from = from_peer.to_string();
         tokio::spawn(async move { svc.handle_msg(&from, msg).await });
@@ -113,7 +116,9 @@ impl DhtService {
                 // Update routing table with received contacts.
                 {
                     let mut rt = self.routing.lock().expect("rt");
-                    for r in &closer { rt.update(r.clone()); }
+                    for r in &closer {
+                        rt.update(r.clone());
+                    }
                 }
                 if let Some((_, tx)) = self.pending_fn.remove(&request_id) {
                     tx.send(closer).ok();
@@ -124,7 +129,10 @@ impl DhtService {
                 self.routing.lock().expect("rt").update(record.clone());
                 self.store.put_node(record, None);
             }
-            DhtMsg::GetRecord { node_id, request_id } => {
+            DhtMsg::GetRecord {
+                node_id,
+                request_id,
+            } => {
                 let record = self.store.get_node(&node_id);
                 let reply = DhtMsg::GetRecordReply { request_id, record };
                 self.send_to(from, &reply).await.ok();
@@ -140,12 +148,21 @@ impl DhtService {
             DhtMsg::AnnounceProvider { record } => {
                 self.store.put_provider(record, None);
             }
-            DhtMsg::FindProviders { content_id, request_id } => {
+            DhtMsg::FindProviders {
+                content_id,
+                request_id,
+            } => {
                 let providers = self.store.get_providers(&content_id);
-                let reply = DhtMsg::FindProvidersReply { request_id, providers };
+                let reply = DhtMsg::FindProvidersReply {
+                    request_id,
+                    providers,
+                };
                 self.send_to(from, &reply).await.ok();
             }
-            DhtMsg::FindProvidersReply { request_id, providers } => {
+            DhtMsg::FindProvidersReply {
+                request_id,
+                providers,
+            } => {
                 if let Some((_, tx)) = self.pending_fp.remove(&request_id) {
                     tx.send(providers).ok();
                 }
@@ -168,7 +185,9 @@ impl DhtService {
                 .take(ALPHA)
                 .cloned()
                 .collect();
-            if to_query.is_empty() { break; }
+            if to_query.is_empty() {
+                break;
+            }
 
             // Send all ALPHA queries before waiting — parallel, single shared deadline.
             let mut rids = Vec::new();
@@ -178,7 +197,15 @@ impl DhtService {
                 let rid = self.next_rid();
                 let (tx, rx) = oneshot::channel();
                 self.pending_fn.insert(rid, tx);
-                self.send_to(&contact.peer_id, &DhtMsg::FindNode { target, request_id: rid }).await.ok();
+                self.send_to(
+                    &contact.peer_id,
+                    &DhtMsg::FindNode {
+                        target,
+                        request_id: rid,
+                    },
+                )
+                .await
+                .ok();
                 rids.push(rid);
                 rxs.push(rx);
             }
@@ -189,7 +216,9 @@ impl DhtService {
                     replies.extend(closer);
                 }
             }
-            for rid in rids { self.pending_fn.remove(&rid); }
+            for rid in rids {
+                self.pending_fn.remove(&rid);
+            }
 
             // Merge replies into best set.
             for r in replies {
@@ -208,7 +237,9 @@ impl DhtService {
     pub async fn announce_self(&self) {
         let target = self.local_record.node_id;
         let closest = self.routing.lock().expect("rt").find_closest(&target, K);
-        let msg = DhtMsg::PutRecord { record: self.local_record.clone() };
+        let msg = DhtMsg::PutRecord {
+            record: self.local_record.clone(),
+        };
         for contact in closest.iter().take(K) {
             self.send_to(&contact.peer_id, &msg).await.ok();
         }
@@ -220,8 +251,14 @@ impl DhtService {
             content_id,
             provider: self.local_record.clone(),
         };
-        let msg = DhtMsg::AnnounceProvider { record: record.clone() };
-        let closest = self.routing.lock().expect("rt").find_closest(&content_id, K);
+        let msg = DhtMsg::AnnounceProvider {
+            record: record.clone(),
+        };
+        let closest = self
+            .routing
+            .lock()
+            .expect("rt")
+            .find_closest(&content_id, K);
         for contact in closest.iter().take(K) {
             self.send_to(&contact.peer_id, &msg).await.ok();
         }
@@ -232,16 +269,30 @@ impl DhtService {
     /// ponytail: single-round ALPHA query, no iterative refinement; add in DHT-3 if needed.
     pub async fn find_providers(&self, content_id: [u8; 32]) -> Vec<ProviderRecord> {
         let local = self.store.get_providers(&content_id);
-        if !local.is_empty() { return local; }
+        if !local.is_empty() {
+            return local;
+        }
 
-        let closest = self.routing.lock().expect("rt").find_closest(&content_id, ALPHA);
+        let closest = self
+            .routing
+            .lock()
+            .expect("rt")
+            .find_closest(&content_id, ALPHA);
         let mut rids = Vec::new();
         let mut rxs = Vec::new();
         for contact in &closest {
             let rid = self.next_rid();
             let (tx, rx) = oneshot::channel();
             self.pending_fp.insert(rid, tx);
-            self.send_to(&contact.peer_id, &DhtMsg::FindProviders { content_id, request_id: rid }).await.ok();
+            self.send_to(
+                &contact.peer_id,
+                &DhtMsg::FindProviders {
+                    content_id,
+                    request_id: rid,
+                },
+            )
+            .await
+            .ok();
             rids.push(rid);
             rxs.push(rx);
         }
@@ -252,7 +303,9 @@ impl DhtService {
                 results.append(&mut providers);
             }
         }
-        for rid in rids { self.pending_fp.remove(&rid); }
+        for rid in rids {
+            self.pending_fp.remove(&rid);
+        }
         results
     }
 
@@ -283,15 +336,22 @@ impl DhtService {
         });
 
         // Periodic: re-announce self + evict expired records.
+        // Skip the immediate first tick (tokio Interval fires once at once)
+        // and make announce cancellable so node/test shutdown cannot wedge on
+        // a mid-flight `send_to_peer`.
         let svc = self;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(600));
+            interval.tick().await;
             loop {
                 tokio::select! {
                     _ = cancel2.cancelled() => break,
                     _ = interval.tick() => {
                         svc.store.evict_expired();
-                        svc.announce_self().await;
+                        tokio::select! {
+                            _ = cancel2.cancelled() => break,
+                            _ = svc.announce_self() => {}
+                        }
                     }
                 }
             }

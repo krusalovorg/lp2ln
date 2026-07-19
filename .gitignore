@@ -56,6 +56,8 @@ Thumbs.db
 
 # Storage directories
 storage/
+!crates/lp2ln-core-v2/src/storage/
+!crates/lp2ln-core-v2/src/storage/**
 storage-2/
 wallet/node_modules/
 wallet/dist/
@@ -68,4 +70,10 @@ copy-to-server.bat
 temp_configs/
 temp_db/
 .cursor/
+docs/
 crates/lp2lnd/options-*.json
+ClAUDE.md
+db
+crates/lp2lnd-vpn/
+crates/lp2ln-magic-folder/
+wintun.dll

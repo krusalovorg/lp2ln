@@ -61,6 +61,7 @@ impl PacketJobQueue {
 /// Ingress scheduling: metrics, chunk assembly, broadcast fanout, processor workers.
 pub struct PacketIngressDispatcher {
     session_manager: Arc<SessionManager>,
+    #[allow(dead_code)]
     packet_processor: Arc<dyn PacketProcessor>,
     chunk_assembler: Arc<ChunkAssembler>,
     incoming_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
@@ -120,11 +121,23 @@ impl PacketIngressDispatcher {
         }
     }
 
-    pub async fn shutdown_workers(&self) {
+    pub async fn shutdown_workers(&self, drain_timeout: std::time::Duration) {
         self.worker_cancel.cancel();
-        let handles: Vec<_> = self.worker_handles.lock().unwrap().drain(..).collect();
-        for handle in handles {
-            let _ = handle.await;
+        let mut handles: Vec<_> = self.worker_handles.lock().unwrap().drain(..).collect();
+        // A worker stuck inside `process()` (e.g. session send backpressure) must
+        // not block node shutdown forever — honor the caller's drain budget.
+        let join_all = futures::future::join_all(handles.iter_mut());
+        if tokio::time::timeout(drain_timeout, join_all).await.is_err() {
+            crate::warn!(
+                "[Router] packet workers did not finish within {:?}, aborting",
+                drain_timeout
+            );
+            for handle in &handles {
+                handle.abort();
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
         }
     }
 
@@ -158,10 +171,11 @@ impl PacketIngressDispatcher {
 
         // `from_node` is the immediate link neighbor (set by transports). Fallback
         // to logical sender only when the session has no peer binding (e.g. fakes).
-        if incoming.from_node.is_none() && incoming.packet.nodes.is_empty() {
-            if !incoming.packet.sender.is_empty() {
-                incoming.from_node = Some(incoming.packet.sender.clone());
-            }
+        if incoming.from_node.is_none()
+            && incoming.packet.nodes.is_empty()
+            && !incoming.packet.sender.is_empty()
+        {
+            incoming.from_node = Some(incoming.packet.sender.clone());
         }
 
         let skip_early_ipc =

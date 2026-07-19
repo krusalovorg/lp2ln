@@ -215,7 +215,7 @@ impl NodeRuntime {
             let via = incoming
                 .from_node
                 .as_deref()
-                .unwrap_or_else(|| packet.sender.as_str());
+                .unwrap_or(packet.sender.as_str());
             if via != peer_str {
                 continue;
             }

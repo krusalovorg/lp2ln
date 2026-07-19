@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -115,7 +115,16 @@ fn default_initial_mtu() -> u16 {
     1200
 }
 
+/// Quinn/rustls needs an explicit process-level CryptoProvider when more than
+/// one rustls backend feature is linked. Idempotent: second call is a no-op.
+fn ensure_rustls_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}
+
 pub fn build_server_config(options: &QuicTransportOptions) -> Result<ServerConfig> {
+    ensure_rustls_crypto_provider();
     let (certs, key) = load_or_generate_tls_material(&options.tls)?;
     let mut rustls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -135,6 +144,7 @@ pub fn build_server_config(options: &QuicTransportOptions) -> Result<ServerConfi
 }
 
 pub fn build_client_config(options: &QuicTransportOptions) -> Result<ClientConfig> {
+    ensure_rustls_crypto_provider();
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
@@ -295,6 +305,9 @@ mod tests {
 
     #[tokio::test]
     async fn raw_quinn_client_open_server_accept() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let options = QuicTransportOptions::default();
         let server_config = build_server_config(&options).expect("server config");
         let client_config = build_client_config(&options).expect("client config");
@@ -333,6 +346,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_session_exchange_packet() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         use crate::packet::Packet;
         use crate::sessions::Session;
         use crate::sessions::session::LinkKind;

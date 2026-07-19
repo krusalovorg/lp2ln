@@ -69,7 +69,7 @@ impl ChunkAssembler {
         let from = incoming
             .from_node
             .as_deref()
-            .unwrap_or_else(|| packet.sender.as_str())
+            .unwrap_or(packet.sender.as_str())
             .to_string();
 
         let key = ChunkStreamKey {

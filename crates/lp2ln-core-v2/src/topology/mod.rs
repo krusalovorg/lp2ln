@@ -405,6 +405,12 @@ pub struct PeerCatalog {
     max_peers: usize,
 }
 
+impl Default for PeerCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerCatalog {
     pub fn new() -> Self {
         Self::with_max_peers(4096)

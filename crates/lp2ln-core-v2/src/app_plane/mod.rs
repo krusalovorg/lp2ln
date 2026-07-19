@@ -88,15 +88,21 @@ impl AppPlaneRouter {
     /// Dispatch an incoming event to all live subscribers for `protocol_id`.
     /// Dead senders are lazily pruned.
     pub fn dispatch(&self, protocol_id: u16, ev: AppEvent) {
-        let AppEvent::Incoming { from, payload, .. } = ev else { return };
+        let AppEvent::Incoming { from, payload, .. } = ev else {
+            return;
+        };
         if let Some(mut entry) = self.subs.get_mut(&protocol_id) {
             // try_send: if full, drop for this subscriber — never block.
-            entry.retain(|tx| !tx.is_closed() &&
-                tx.try_send(AppEvent::Incoming {
-                    from: from.clone(),
-                    protocol_id,
-                    payload: payload.clone(),
-                }).is_ok());
+            entry.retain(|tx| {
+                !tx.is_closed()
+                    && tx
+                        .try_send(AppEvent::Incoming {
+                            from: from.clone(),
+                            protocol_id,
+                            payload: payload.clone(),
+                        })
+                        .is_ok()
+            });
         }
     }
 }

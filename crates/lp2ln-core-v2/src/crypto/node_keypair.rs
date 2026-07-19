@@ -11,7 +11,7 @@ pub struct NodeKeypair {
 impl NodeKeypair {
     pub fn generate() -> Self {
         let signing_key = SigningKey::random(&mut OsRng);
-        let peer_id = Self::public_key_to_peer_id(&signing_key.verifying_key());
+        let peer_id = Self::public_key_to_peer_id(*signing_key.verifying_key());
         Self {
             signing_key,
             peer_id,
@@ -34,7 +34,7 @@ impl NodeKeypair {
             .map_err(|_| "Private key must be 32 bytes".to_string())?;
         let signing_key =
             SigningKey::from_bytes(GenericArray::from_slice(&arr)).map_err(|e| e.to_string())?;
-        let peer_id = Self::public_key_to_peer_id(&signing_key.verifying_key());
+        let peer_id = Self::public_key_to_peer_id(*signing_key.verifying_key());
         Ok(Self {
             signing_key,
             peer_id,
@@ -42,7 +42,7 @@ impl NodeKeypair {
     }
 
     pub fn from_signing_key(signing_key: SigningKey) -> Self {
-        let peer_id = Self::public_key_to_peer_id(&signing_key.verifying_key());
+        let peer_id = Self::public_key_to_peer_id(*signing_key.verifying_key());
         Self {
             signing_key,
             peer_id,
@@ -61,7 +61,7 @@ impl NodeKeypair {
             .to_vec()
     }
 
-    fn public_key_to_peer_id(verifying_key: &k256::ecdsa::VerifyingKey) -> String {
+    fn public_key_to_peer_id(verifying_key: k256::ecdsa::VerifyingKey) -> String {
         let point = verifying_key.to_encoded_point(true);
         hex::encode(point.as_bytes())
     }

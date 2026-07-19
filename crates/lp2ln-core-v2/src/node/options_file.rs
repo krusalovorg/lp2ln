@@ -206,7 +206,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             node_role: file.node_role,
             catalog_max_peers: file
                 .catalog_max_peers
-                .map(|n| (n as usize).min(1_000_000).max(128)),
+                .map(|n| (n as usize).clamp(128, 1_000_000)),
             peer_discovery_random_fraction: file.peer_discovery_random_fraction.clamp(0.0, 0.9),
             transport_obfuscation: {
                 let mut map = default_transport_obfuscation();

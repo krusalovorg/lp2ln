@@ -185,9 +185,7 @@ impl ConfigAutonomy {
         node: Arc<NodeRuntime>,
         applied_options: Arc<RwLock<NodeOptions>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let Some(path) = self.options_path.clone() else {
-            return None;
-        };
+        let path = self.options_path.clone()?;
         let lkg_path = self.lkg_path.clone();
         let journal = self.journal.clone();
         Some(tokio::spawn(async move {

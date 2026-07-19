@@ -58,7 +58,7 @@ pub fn less_loaded_bootstrap_descriptors(
         .filter(|d| d.peer_id != our_peer_id && d.peer_id != exclude_peer_id)
         .filter(|d| d.capabilities.bootstrap_entry)
         .filter(|d| d.dynamic_status.active_connections < our_active_connections)
-        .filter(|d| descriptor_ok_for_discovery_redirect(d))
+        .filter(descriptor_ok_for_discovery_redirect)
         .collect();
     candidates.sort_by_key(|d| {
         (
@@ -130,7 +130,7 @@ pub async fn send_discovery_redirect_and_close_with_preamble(
                 .into_iter()
                 .filter(|d| d.peer_id != newcomer.as_str())
                 .filter(|d| !exclude_ids.contains(&d.peer_id))
-                .filter(|d| descriptor_ok_for_discovery_redirect(d))
+                .filter(descriptor_ok_for_discovery_redirect)
                 .collect(),
             Some(newcomer.as_str()),
             remaining_limit,
@@ -478,7 +478,7 @@ pub(crate) async fn run_incoming_session_handler(
                         .into_iter()
                         .filter(|d| d.peer_id != peer_id_str)
                         .filter(|d| !d.capabilities.bootstrap_entry)
-                        .filter(|d| descriptor_ok_for_discovery_redirect(d))
+                        .filter(descriptor_ok_for_discovery_redirect)
                         .collect(),
                     Some(&peer_id_str),
                     BOOTSTRAP_PROACTIVE_PEERS_LIMIT,
@@ -562,7 +562,7 @@ mod tests {
         }
 
         async fn send(&self, packet: Packet) -> Result<u64> {
-            let bytes = packet.wire_size_estimate() as u64;
+            let bytes = packet.wire_size_estimate();
             self.sent.lock().expect("sent lock").push(packet);
             Ok(bytes)
         }
@@ -570,7 +570,7 @@ mod tests {
         async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
             use crate::transport::tcp::codec::decode_packet;
             let packet = decode_packet(encoded)?;
-            let bytes = packet.wire_size_estimate() as u64;
+            let bytes = packet.wire_size_estimate();
             self.sent.lock().expect("sent lock").push(packet);
             Ok(bytes)
         }

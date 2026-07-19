@@ -15,16 +15,28 @@ use tokio_util::sync::CancellationToken;
 
 use crate::packet::Packet;
 use crate::router::Router;
-use crate::storage::{hash_bytes, BlockStore, ContentId};
+use crate::storage::{BlockStore, ContentId, hash_bytes};
 
 pub const BLOCK_PROTOCOL_ID: u16 = 0x424C; // "BL"
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockMsg {
-    Request { content_id: ContentId, request_id: u64 },
-    Response { request_id: u64, data: Option<Vec<u8>> },
-    Push { content_id: ContentId, data: Vec<u8> },
-    PushAck { content_id: ContentId, stored: bool },
+    Request {
+        content_id: ContentId,
+        request_id: u64,
+    },
+    Response {
+        request_id: u64,
+        data: Option<Vec<u8>>,
+    },
+    Push {
+        content_id: ContentId,
+        data: Vec<u8>,
+    },
+    PushAck {
+        content_id: ContentId,
+        stored: bool,
+    },
 }
 
 pub struct BlockTransferService {
@@ -51,7 +63,8 @@ impl BlockTransferService {
     }
 
     fn next_rid(&self) -> u64 {
-        self.next_rid.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_rid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn send_msg(&self, peer_id: &str, msg: &BlockMsg) -> anyhow::Result<()> {
@@ -73,7 +86,9 @@ impl BlockTransferService {
     }
 
     pub fn handle_raw(self: &Arc<Self>, from_peer: &str, data: &[u8]) {
-        let Ok(msg) = postcard::from_bytes::<BlockMsg>(data) else { return };
+        let Ok(msg) = postcard::from_bytes::<BlockMsg>(data) else {
+            return;
+        };
         let svc = self.clone();
         let from = from_peer.to_string();
         tokio::spawn(async move { svc.handle_msg(&from, msg).await });
@@ -81,7 +96,10 @@ impl BlockTransferService {
 
     async fn handle_msg(self: &Arc<Self>, from: &str, msg: BlockMsg) {
         match msg {
-            BlockMsg::Request { content_id, request_id } => {
+            BlockMsg::Request {
+                content_id,
+                request_id,
+            } => {
                 let data = self.store.get(&content_id).ok().flatten();
                 self.send_msg(from, &BlockMsg::Response { request_id, data })
                     .await
@@ -107,12 +125,22 @@ impl BlockTransferService {
     }
 
     /// Pull a block from `peer_id`, verify hash. Err on timeout/missing/mismatch.
-    pub async fn fetch_from(&self, peer_id: &str, content_id: ContentId) -> anyhow::Result<Vec<u8>> {
+    pub async fn fetch_from(
+        &self,
+        peer_id: &str,
+        content_id: ContentId,
+    ) -> anyhow::Result<Vec<u8>> {
         let rid = self.next_rid();
         let (tx, rx) = oneshot::channel();
         self.pending.insert(rid, tx);
         match self
-            .send_msg(peer_id, &BlockMsg::Request { content_id, request_id: rid })
+            .send_msg(
+                peer_id,
+                &BlockMsg::Request {
+                    content_id,
+                    request_id: rid,
+                },
+            )
             .await
         {
             Ok(_) => {}
@@ -123,9 +151,7 @@ impl BlockTransferService {
         }
         let data = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(Some(d))) => d,
-            Ok(Ok(None)) => {
-                return Err(anyhow::anyhow!("peer {} does not have block", peer_id))
-            }
+            Ok(Ok(None)) => return Err(anyhow::anyhow!("peer {} does not have block", peer_id)),
             Ok(Err(_)) => return Err(anyhow::anyhow!("channel closed")),
             Err(_) => {
                 self.pending.remove(&rid);
@@ -161,7 +187,8 @@ impl BlockTransferService {
         content_id: ContentId,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        self.send_msg(peer_id, &BlockMsg::Push { content_id, data }).await
+        self.send_msg(peer_id, &BlockMsg::Push { content_id, data })
+            .await
     }
 
     pub fn spawn(self: Arc<Self>, cancel: CancellationToken) {

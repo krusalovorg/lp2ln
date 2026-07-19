@@ -26,6 +26,9 @@ async fn start_test_node() -> NodeRuntime {
 
 #[tokio::test]
 async fn stop_terminates_quic_listener() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let options = QuicTransportOptions::default();
     let mut opts =
         NodeOptions::empty().with_listen("quic", "127.0.0.1:0".parse().expect("valid addr"));

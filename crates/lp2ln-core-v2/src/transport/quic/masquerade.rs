@@ -116,11 +116,16 @@ mod tests {
 
     #[tokio::test]
     async fn masquerade_static_404_responds() {
-        let mut opts = QuicTransportOptions::default();
-        opts.masquerade = MasqueradeConfig {
-            enabled: true,
-            mode: MasqueradeMode::Static404,
-            proxy_url: None,
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let opts = QuicTransportOptions {
+            masquerade: MasqueradeConfig {
+                enabled: true,
+                mode: MasqueradeMode::Static404,
+                proxy_url: None,
+            },
+            ..Default::default()
         };
 
         let server_cfg = build_server_config(&opts).expect("server config");

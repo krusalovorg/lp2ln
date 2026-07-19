@@ -1,4 +1,4 @@
-﻿use std::fmt;
+use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -239,6 +239,9 @@ mod tests {
 
     #[tokio::test]
     async fn obfs_two_endpoints_exchange_packet() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         use crate::packet::Packet;
         use crate::sessions::Session;
         use crate::sessions::session::LinkKind;
@@ -249,10 +252,12 @@ mod tests {
         use tokio::sync::mpsc;
 
         let password = "test-obfs-password";
-        let mut options = QuicTransportOptions::default();
-        options.obfs = QuicObfsConfig {
-            mode: QuicObfsMode::QuicInitialObfs,
-            password: Some(password.to_string()),
+        let options = QuicTransportOptions {
+            obfs: QuicObfsConfig {
+                mode: QuicObfsMode::QuicInitialObfs,
+                password: Some(password.to_string()),
+            },
+            ..Default::default()
         };
 
         let server_config = build_server_config(&options).expect("server config");

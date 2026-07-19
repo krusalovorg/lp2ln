@@ -2,7 +2,9 @@
 members = [
   "crates/lp2ln-core-v2",
   "crates/lp2lnd",
-  "crates/lp2ln-db-export"
+  "crates/lp2ln-db-export",
+  "crates/lp2lnd-vpn",
+  "crates/lp2ln-magic-folder"
 ]
 exclude = [
   "archive/lp2ln-core",

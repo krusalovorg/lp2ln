@@ -37,6 +37,7 @@ impl PacketEgressSecurity {
         }
     }
 
+    #[allow(dead_code)]
     pub fn peer_cache(&self) -> &Arc<PeerCryptoCache> {
         &self.peer_cache
     }

@@ -62,7 +62,7 @@ impl Session for RelayTestSession {
     }
 
     async fn send(&self, packet: lp2ln_core_v2::packet::Packet) -> Result<u64> {
-        Ok(packet.wire_size_estimate() as u64)
+        Ok(packet.wire_size_estimate())
     }
 
     async fn close(&self) -> Result<()> {

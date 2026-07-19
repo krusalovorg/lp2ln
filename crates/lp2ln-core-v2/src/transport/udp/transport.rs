@@ -24,6 +24,12 @@ pub struct UdpTransport {
     obfuscator: Arc<Obfuscator>,
 }
 
+impl Default for UdpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UdpTransport {
     pub fn new() -> Self {
         Self {
@@ -170,8 +176,8 @@ impl Transport for UdpTransport {
                                             match incoming_sessions_tx.send(session_dyn.clone()).await {
                                                 Ok(()) => {
                                                     let mut sessions_guard = sessions_clone.lock().await;
-                                                    if !sessions_guard.contains_key(&peer_addr) {
-                                                        sessions_guard.insert(peer_addr, session_dyn);
+                                                    if let std::collections::hash_map::Entry::Vacant(e) = sessions_guard.entry(peer_addr) {
+                                                        e.insert(session_dyn);
                                                         crate::session!("[UdpTransport] Session registered: {}", session.id());
                                                     }
                                                 }

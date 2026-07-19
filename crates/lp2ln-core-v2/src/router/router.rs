@@ -188,8 +188,7 @@ impl Router {
     }
 
     pub async fn shutdown_packet_tasks(&self, drain_timeout: std::time::Duration) {
-        let _ = drain_timeout;
-        self.ingress.shutdown_workers().await;
+        self.ingress.shutdown_workers(drain_timeout).await;
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<IncomingPacket>> {

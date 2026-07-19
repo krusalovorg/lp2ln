@@ -51,17 +51,9 @@ impl Default for ObfuscationConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Obfuscator {
     config: ObfuscationConfig,
-}
-
-impl Default for Obfuscator {
-    fn default() -> Self {
-        Self {
-            config: ObfuscationConfig::default(),
-        }
-    }
 }
 
 impl Obfuscator {

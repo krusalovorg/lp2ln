@@ -208,7 +208,7 @@ mod tests {
         }
 
         async fn send(&self, packet: crate::packet::Packet) -> Result<u64> {
-            let bytes = packet.wire_size_estimate() as u64;
+            let bytes = packet.wire_size_estimate();
             self.sent.lock().expect("sent lock").push(packet);
             Ok(bytes)
         }

@@ -74,7 +74,7 @@ impl Packet {
     ) -> Vec<Packet> {
         let sender = sender.into();
         let receiver = receiver.into();
-        let total = (data.len().max(1) + chunk_size - 1) / chunk_size;
+        let total = data.len().max(1).div_ceil(chunk_size);
         let total_chunks = total as u32;
         (0..total)
             .map(|i| {

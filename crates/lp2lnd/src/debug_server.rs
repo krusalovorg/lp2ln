@@ -781,6 +781,7 @@ async fn collect_peer_rankings(node: Arc<NodeRuntime>) -> Value {
 }
 
 async fn collect_peer_rollup(node: Arc<NodeRuntime>) -> Value {
+    #[allow(clippy::type_complexity)]
     let mut by_peer: std::collections::BTreeMap<String, (u64, u64, u64, u64, u64, u64, usize)> =
         std::collections::BTreeMap::new();
     for s in node.debug_sessions() {
@@ -1226,17 +1227,21 @@ async fn block_put(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
     };
     let b64 = match value.get("data_base64").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
-        None => return json!({
-            "event": "command_result", "ts_ms": now_ms(),
-            "ok": false, "cmd": "block_put", "error": "data_base64 is required",
-        }),
+        None => {
+            return json!({
+                "event": "command_result", "ts_ms": now_ms(),
+                "ok": false, "cmd": "block_put", "error": "data_base64 is required",
+            });
+        }
     };
     let data = match STANDARD.decode(&b64) {
         Ok(d) => d,
-        Err(e) => return json!({
-            "event": "command_result", "ts_ms": now_ms(),
-            "ok": false, "cmd": "block_put", "error": format!("base64 decode: {e}"),
-        }),
+        Err(e) => {
+            return json!({
+                "event": "command_result", "ts_ms": now_ms(),
+                "ok": false, "cmd": "block_put", "error": format!("base64 decode: {e}"),
+            });
+        }
     };
     let store = lp2ln_core_v2::storage::BlockStore::new(db);
     match store.put(&data) {
@@ -1261,17 +1266,21 @@ async fn block_get(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
     };
     let cid_hex = match value.get("content_id").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
-        None => return json!({
-            "event": "command_result", "ts_ms": now_ms(),
-            "ok": false, "cmd": "block_get", "error": "content_id is required",
-        }),
+        None => {
+            return json!({
+                "event": "command_result", "ts_ms": now_ms(),
+                "ok": false, "cmd": "block_get", "error": "content_id is required",
+            });
+        }
     };
     let cid = match lp2ln_core_v2::storage::content_id_from_hex(&cid_hex) {
         Some(id) => id,
-        None => return json!({
-            "event": "command_result", "ts_ms": now_ms(),
-            "ok": false, "cmd": "block_get", "error": "invalid content_id hex",
-        }),
+        None => {
+            return json!({
+                "event": "command_result", "ts_ms": now_ms(),
+                "ok": false, "cmd": "block_get", "error": "invalid content_id hex",
+            });
+        }
     };
     let store = lp2ln_core_v2::storage::BlockStore::new(db);
     match store.get(&cid) {

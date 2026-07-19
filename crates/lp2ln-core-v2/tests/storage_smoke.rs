@@ -4,16 +4,13 @@
 use std::sync::Arc;
 
 use lp2ln_core_v2::db::P2PDatabase;
-use lp2ln_core_v2::storage::{BlockStore, ContentId};
-use lp2ln_core_v2::storage::encrypt::{
-    decrypt_chunk, encrypt_chunk, generate_key, CHUNK_SIZE,
-};
+use lp2ln_core_v2::storage::encrypt::{CHUNK_SIZE, decrypt_chunk, encrypt_chunk, generate_key};
 use lp2ln_core_v2::storage::lease::{LeaseStore, ReplicaLease};
 use lp2ln_core_v2::storage::manifest::{DirEntry, DirectoryManifest, FileManifest};
+use lp2ln_core_v2::storage::{BlockStore, ContentId};
 
 fn temp_db() -> Arc<P2PDatabase> {
-    let dir = std::env::temp_dir()
-        .join(format!("lp2ln_storage_smoke_{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("lp2ln_storage_smoke_{}", uuid::Uuid::new_v4()));
     Arc::new(P2PDatabase::new(dir.to_str().unwrap()).expect("db"))
 }
 
@@ -114,8 +111,20 @@ fn dir_manifest_versioning_and_tombstone() {
     });
     assert_eq!(dm.version, 3);
     assert_eq!(dm.entries.len(), 2); // same count, upserted
-    assert!(dm.entries.iter().find(|e| e.path == "a.txt").unwrap().tombstone);
-    assert!(!dm.entries.iter().find(|e| e.path == "b.txt").unwrap().tombstone);
+    assert!(
+        dm.entries
+            .iter()
+            .find(|e| e.path == "a.txt")
+            .unwrap()
+            .tombstone
+    );
+    assert!(
+        !dm.entries
+            .iter()
+            .find(|e| e.path == "b.txt")
+            .unwrap()
+            .tombstone
+    );
 }
 
 #[test]
@@ -181,4 +190,3 @@ fn lease_store_put_get_count() {
     ls.remove(&cid, "peer-abc").unwrap();
     assert_eq!(ls.live_count(&cid).unwrap(), 1);
 }
-

@@ -78,9 +78,7 @@ fn tier_for_observed(addr: SocketAddr, prefer_lan: bool, locals: &[Ipv4Addr]) ->
     };
     if is_global_ipv4(ip) {
         AddrRankTier::GlobalRoutable
-    } else if prefer_lan && lan_match_score(addr, locals) >= 2 {
-        AddrRankTier::LanPreferred
-    } else if prefer_lan && ip.is_private() {
+    } else if prefer_lan && (lan_match_score(addr, locals) >= 2 || ip.is_private()) {
         AddrRankTier::LanPreferred
     } else {
         AddrRankTier::OtherObserved

@@ -29,7 +29,11 @@ pub fn encrypt_chunk(key: &ChunkKey, chunk_index: u32, plaintext: &[u8]) -> Vec<
         .expect("encrypt")
 }
 
-pub fn decrypt_chunk(key: &ChunkKey, chunk_index: u32, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_chunk(
+    key: &ChunkKey,
+    chunk_index: u32,
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let n = make_nonce(chunk_index);
     ChaCha20Poly1305::new(Key::from_slice(key))
         .decrypt(Nonce::from_slice(&n), ciphertext)

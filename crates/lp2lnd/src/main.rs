@@ -13,21 +13,14 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+#[derive(Default)]
 struct Args {
     options_path: String,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            options_path: String::new(),
-        }
-    }
-}
-
 impl fmt::Display for Args {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        return write!(f, "options_path = {}", self.options_path);
+        write!(f, "options_path = {}", self.options_path)
     }
 }
 
@@ -43,7 +36,7 @@ fn parse_args() -> Args {
             result.options_path = item.clone();
         }
     }
-    return result;
+    result
 }
 
 fn developer_options() -> NodeOptions {

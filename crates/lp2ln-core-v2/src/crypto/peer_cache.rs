@@ -29,7 +29,7 @@ impl PeerCryptoCache {
 
     pub fn verifying_key(&self, sender_peer_id: &str) -> Result<VerifyingKey> {
         if let Some(entry) = self.verifying_keys.get(sender_peer_id) {
-            return Ok(entry.value().clone());
+            return Ok(*entry.value());
         }
         let pub_bytes = hex::decode(sender_peer_id)
             .map_err(|e| anyhow::anyhow!("Invalid sender peer_id hex: {}", e))?;

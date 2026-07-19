@@ -17,6 +17,7 @@ static SHOW_DEBUG: AtomicBool = AtomicBool::new(true);
 static SHOW_INFO: AtomicBool = AtomicBool::new(true);
 static SHOW_WARNING: AtomicBool = AtomicBool::new(true);
 static SHOW_ERROR: AtomicBool = AtomicBool::new(true);
+static FILE_LOGGING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 pub struct LoggerOptions {
@@ -82,6 +83,7 @@ pub fn init(options: &LoggerOptions) {
     SHOW_INFO.store(options.show_info, Ordering::SeqCst);
     SHOW_WARNING.store(options.show_warning, Ordering::SeqCst);
     SHOW_ERROR.store(options.show_error, Ordering::SeqCst);
+    FILE_LOGGING.store(options.file_enabled, Ordering::SeqCst);
 
     if !options.file_enabled {
         return;
@@ -110,6 +112,13 @@ pub fn init(options: &LoggerOptions) {
         let mut guard = LOG_FILE.lock().await;
         *guard = Some(file);
     });
+}
+
+fn spawn_file_write(message: String) {
+    if !FILE_LOGGING.load(Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(write_to_file(message));
 }
 
 fn get_timestamp() -> String {
@@ -190,7 +199,7 @@ pub fn debug(message: &str) {
     if SHOW_DEBUG.load(Ordering::SeqCst) {
         println!("{}", log_message.blue().bold());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 pub fn info(message: &str) {
@@ -199,7 +208,7 @@ pub fn info(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message);
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 pub fn warning(message: &str) {
@@ -208,7 +217,7 @@ pub fn warning(message: &str) {
     if SHOW_WARNING.load(Ordering::SeqCst) {
         println!("{}", log_message.yellow().bold());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 pub fn error(message: &str) {
@@ -217,7 +226,7 @@ pub fn error(message: &str) {
     if SHOW_ERROR.load(Ordering::SeqCst) {
         println!("{}", log_message.red().bold());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 pub fn session(message: &str) {
@@ -226,7 +235,7 @@ pub fn session(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.cyan());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 pub fn processor(message: &str) {
@@ -235,7 +244,7 @@ pub fn processor(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.magenta());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 /// Expected peer / TCP session teardown (colored on stderr).
@@ -245,7 +254,7 @@ pub fn net_disconnect(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.cyan().bold());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 /// Failed outbound dial / reachability (colored on stderr).
@@ -255,7 +264,7 @@ pub fn net_dial(message: &str) {
     if SHOW_DEBUG.load(Ordering::SeqCst) {
         println!("{}", log_message.yellow().bold());
     }
-    tokio::spawn(write_to_file(log_message));
+    spawn_file_write(log_message);
 }
 
 #[macro_export]

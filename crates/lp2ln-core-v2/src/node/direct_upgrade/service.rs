@@ -52,7 +52,7 @@ pub async fn run_direct_upgrade_loop(
     let nat = ctx.nat.clone();
     let tracker = ctx.tracker.clone();
     let our_peer_id = ctx.our_peer_id.clone();
-    let parallel = Arc::new(Semaphore::new(cfg.max_parallel_attempts.max(1).min(32)));
+    let parallel = Arc::new(Semaphore::new(cfg.max_parallel_attempts.clamp(1, 32)));
 
     let mut interval = tokio::time::interval(tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -351,9 +351,11 @@ mod service_tests {
         let nat_c = Arc::new(AtomicU64::new(0));
         let nat: Arc<dyn NatTraversalTrigger> = Arc::new(CountNat(nat_c.clone()));
         let tracker = TrafficDemandTracker::new(128);
-        let mut cfg = DirectUpgradeConfig::default();
-        cfg.try_nat_traversal = true;
-        cfg.cooldown_secs = 1;
+        let cfg = DirectUpgradeConfig {
+            try_nat_traversal: true,
+            cooldown_secs: 1,
+            ..Default::default()
+        };
 
         run_one_upgrade_attempt(
             PeerId::from("p-x"),
@@ -390,9 +392,11 @@ mod service_tests {
         let dial_c = Arc::new(AtomicU64::new(0));
         let dialer: Arc<dyn DirectDialer> = Arc::new(CountDialer(dial_c.clone()));
         let tracker = TrafficDemandTracker::new(128);
-        let mut cfg = DirectUpgradeConfig::default();
-        cfg.try_nat_traversal = false;
-        cfg.direct_dial_timeout_ms = 100;
+        let cfg = DirectUpgradeConfig {
+            try_nat_traversal: false,
+            direct_dial_timeout_ms: 100,
+            ..Default::default()
+        };
 
         run_one_upgrade_attempt(
             peer.clone(),

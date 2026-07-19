@@ -48,16 +48,12 @@ impl BootstrapNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AdaptiveTopologyProfile {
     Conservative,
+    #[default]
     Balanced,
     Aggressive,
-}
-
-impl Default for AdaptiveTopologyProfile {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +346,12 @@ pub struct NodeOptions {
     pub dial_policy: DialPolicy,
 }
 
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeOptions {
     pub fn new() -> Self {
         let mut options = Self {
@@ -444,10 +446,10 @@ impl NodeOptions {
         match role {
             NodeRole::Regular => p,
             NodeRole::BootstrapJoin => {
-                let target = p.target_active_peers.min(8).max(1);
+                let target = p.target_active_peers.clamp(1, 8);
                 let max = p.max_active_peers.min(24).max(target);
                 PeerConnectionPolicy {
-                    min_active_peers: p.min_active_peers.min(2).max(1),
+                    min_active_peers: p.min_active_peers.clamp(1, 2),
                     target_active_peers: target,
                     max_active_peers: max,
                 }
