@@ -5,7 +5,6 @@ use std::time::Duration;
 use crate::types::PeerId;
 
 pub(crate) struct MaintenanceState {
-    pub(crate) dial_cooldown_until: HashMap<PeerId, u64>,
     pub(crate) bootstrap_deny_until: HashMap<SocketAddr, u64>,
     pub(crate) peer_admission_ms: HashMap<PeerId, u64>,
     pub(crate) last_bootstrap_reseed_ms: u64,
@@ -18,7 +17,6 @@ pub(crate) struct MaintenanceState {
 impl MaintenanceState {
     pub(crate) fn new(descriptor_interval: Duration, now: u64) -> Self {
         Self {
-            dial_cooldown_until: HashMap::new(),
             bootstrap_deny_until: HashMap::new(),
             peer_admission_ms: HashMap::new(),
             last_bootstrap_reseed_ms: 0,

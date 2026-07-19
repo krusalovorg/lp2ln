@@ -1,3 +1,14 @@
+pub mod planner;
+pub mod reconciler;
+pub mod snapshot;
+
+pub use planner::{
+    AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent, DropReason, LegacyTopologyPlanner,
+    PeerCandidate, TopologyPlan, TopologyPlanner,
+};
+pub use reconciler::TopologyReconciler;
+pub use snapshot::TopologySnapshot;
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::net::SocketAddr;

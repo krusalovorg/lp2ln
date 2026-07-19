@@ -15,13 +15,12 @@ mod policy;
 mod session_reactions;
 mod state;
 
-use self::policy::compute_policy_snapshot;
+pub(crate) use self::policy::compute_policy_snapshot;
 use self::state::MaintenanceState;
 use crate::db::P2PDatabase;
 use crate::metrics::MetricsAggregator;
 use crate::node::distribution::{
-    capacity_target_factor, dial_reserve_slots, peers_to_drop_when_overloaded,
-    regular_auto_dial_target,
+    capacity_target_factor, dial_reserve_slots, regular_auto_dial_target,
 };
 use crate::node::nat_traversal::NatTraversalState;
 use crate::node::options::{BootstrapNode, DialPolicy, NodeOptions, NodeRole, TopologyTuning};
@@ -32,13 +31,16 @@ use crate::protocol::control::NetworkControlPayload;
 use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
-use crate::topology::{CapacityBudget, PeerCatalog, now_ms, parse_observed_addr_line};
+use crate::topology::{
+    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, TopologyPlanner, TopologyReconciler,
+    TopologySnapshot, now_ms, parse_observed_addr_line,
+};
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
 use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
 use dialing::{build_dial_plan, execute_dial_plan};
-use packet_helpers::{control_packet, handshake_packet, observe_failure_and_close};
+use packet_helpers::{control_packet, handshake_packet};
 pub use session_reactions::{
     SessionRedialQueue, TopologySessionReactionHandler, TransportDegradedReactionHandler,
 };
@@ -116,7 +118,6 @@ fn descriptor_announces_bootstrap_target(
 
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const MAINTENANCE_START_JITTER_MS: u64 = 3_000;
-const REGULAR_MAX_HEADROOM: usize = 2;
 pub(super) const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
 pub(super) const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
 pub(super) const SHEPHERD_SWEEP_INTERVAL_MS: u64 = 10_000;
@@ -198,6 +199,62 @@ pub(crate) async fn dial_bootstrap_address(
         }
     }
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_topology_snapshot(
+    ctx: &TopologyMaintenanceCtx<'_>,
+    topology_tuning: &TopologyTuning,
+    policy: &PeerConnectionPolicy,
+    capacity: CapacityBudget,
+    node_role: NodeRole,
+    connected_peers: Vec<PeerId>,
+    connected_bootstrap_count: usize,
+    known_peer_count: usize,
+    dial_cooldowns: &HashMap<PeerId, u64>,
+    bootstrap_targets_count: usize,
+    last_bootstrap_reseed_ms: u64,
+    now: u64,
+) -> TopologySnapshot {
+    let peer_scores = ctx.peer_store.snapshot();
+    let peer_total_scores: HashMap<PeerId, f32> = peer_scores
+        .into_iter()
+        .map(|(pid, score)| (pid, crate::peer_score::total_score(&score, ctx.weights)))
+        .collect();
+
+    let descriptors = ctx.catalog.descriptors();
+    let bootstrap_peer_ids: HashSet<PeerId> = descriptors
+        .iter()
+        .filter(|d| d.capabilities.bootstrap_entry)
+        .map(|d| PeerId::from(d.peer_id.as_str()))
+        .collect();
+    let descriptor_active_conns: HashMap<PeerId, u16> = descriptors
+        .iter()
+        .map(|d| (PeerId::from(d.peer_id.as_str()), d.dynamic_status.active_connections))
+        .collect();
+    let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> =
+        ctx.dial_book.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+
+    TopologySnapshot {
+        our_peer_id: PeerId::from(ctx.our_peer_maint),
+        node_role,
+        policy: policy.clone(),
+        weights: ctx.weights.clone(),
+        topology_tuning: topology_tuning.clone(),
+        connected_peers,
+        connected_bootstrap_count,
+        known_peer_count,
+        peer_total_scores,
+        bootstrap_peer_ids,
+        descriptor_active_conns,
+        catalog_descriptors: descriptors,
+        capacity,
+        dial_book,
+        dial_cooldowns: dial_cooldowns.clone(),
+        bootstrap_targets_count,
+        last_bootstrap_reseed_ms,
+        now_ms: now,
+    }
 }
 
 struct TopologyMaintenanceCtx<'a> {
@@ -413,6 +470,8 @@ pub(crate) async fn run_topology_maintenance_loop(
     let descriptor_ttl_secs = 120u64;
     let descriptor_interval = Duration::from_secs(30);
     let mut state = MaintenanceState::new(descriptor_interval, now_ms());
+    let mut reconciler = TopologyReconciler::new();
+    let planner = LegacyTopologyPlanner;
     let loop_ctx = TopologyMaintenanceCtx {
         transports_maint: &transports_maint,
         router_maint: &router_maint,
@@ -437,7 +496,7 @@ pub(crate) async fn run_topology_maintenance_loop(
         if react_to_session_events {
             if let Some(queue) = session_redial_queue.as_ref() {
                 for peer_id in queue.drain_ready(now_ms()) {
-                    state.dial_cooldown_until.remove(&peer_id);
+                    reconciler.dial_cooldowns.remove(&peer_id);
                 }
             }
         }
@@ -472,29 +531,6 @@ pub(crate) async fn run_topology_maintenance_loop(
         );
         let auto_target_regular =
             regular_auto_dial_target(known_peers, &topology_tuning, self_capacity_factor);
-        if n > adaptive.max_active_peers {
-            let drop_n = n.saturating_sub(adaptive.max_active_peers);
-            let connected = router_maint.connected_peers();
-            let to_drop = peers_to_drop_when_overloaded(
-                connected,
-                drop_n,
-                catalog.as_ref(),
-                peer_store.as_ref(),
-                &weights,
-                node_role,
-            );
-            for pid in to_drop {
-                observe_failure_and_close(
-                    &catalog,
-                    &sm,
-                    &mut state.dial_cooldown_until,
-                    &pid,
-                    now.saturating_add(topology_tuning.prune_redial_cooldown_ms),
-                )
-                .await;
-            }
-            n = sm.distinct_peer_count();
-        }
         let mut desired = adaptive
             .target_active_peers
             .max(adaptive.min_active_peers)
@@ -544,6 +580,35 @@ pub(crate) async fn run_topology_maintenance_loop(
         let dial_target_high = policy_snapshot.dial_target_high;
         let reseed_for_low = policy_snapshot.reseed_for_low;
         let reseed_for_bridge = policy_snapshot.reseed_for_bridge;
+
+        // Planner decides all keep/drop/dial/discovery from a pure snapshot.
+        // Replaces the four inline drop passes that used to live below.
+        let topology_snapshot = build_topology_snapshot(
+            &loop_ctx,
+            &topology_tuning,
+            &policy,
+            budget.clone(),
+            node_role,
+            connected_snapshot_for_policy.clone(),
+            connected_bootstrap_now,
+            known_peers,
+            &reconciler.dial_cooldowns,
+            bootstrap_targets_maint.len(),
+            state.last_bootstrap_reseed_ms,
+            now,
+        );
+        let topology_plan = planner.plan(&topology_snapshot);
+        if !topology_plan.drop.is_empty() {
+            crate::debug!(
+                "[NodeRuntime] planner: drop={} dial={} discovery={}",
+                topology_plan.drop.len(),
+                topology_plan.dial.len(),
+                topology_plan.discovery.len(),
+            );
+        }
+        reconciler.execute_drops(&topology_plan.drop, &catalog, &sm).await;
+        n = sm.distinct_peer_count();
+
         if handle_bootstrap_reseed(
             reseed_for_low,
             reseed_for_bridge,
@@ -566,64 +631,6 @@ pub(crate) async fn run_topology_maintenance_loop(
         .await
         {
             state.last_bootstrap_reseed_ms = now;
-            n = sm.distinct_peer_count();
-        }
-        let mut max_allowed = adaptive.max_active_peers;
-        if matches!(node_role, NodeRole::Regular) {
-            max_allowed = max_allowed.min(desired.saturating_add(REGULAR_MAX_HEADROOM));
-        }
-        if n > max_allowed {
-            let drop_n = n.saturating_sub(max_allowed);
-            let connected = router_maint.connected_peers();
-            let to_drop = peers_to_drop_when_overloaded(
-                connected,
-                drop_n,
-                catalog.as_ref(),
-                peer_store.as_ref(),
-                &weights,
-                node_role,
-            );
-            for pid in to_drop {
-                observe_failure_and_close(
-                    &catalog,
-                    &sm,
-                    &mut state.dial_cooldown_until,
-                    &pid,
-                    now.saturating_add(topology_tuning.prune_redial_cooldown_ms),
-                )
-                .await;
-            }
-            n = sm.distinct_peer_count();
-        }
-        if matches!(node_role, NodeRole::Regular) && n > dial_target_high {
-            let drop_n = n.saturating_sub(dial_target);
-            let connected = router_maint.connected_peers();
-            let to_drop = peers_to_drop_when_overloaded(
-                connected,
-                drop_n,
-                catalog.as_ref(),
-                peer_store.as_ref(),
-                &weights,
-                node_role,
-            );
-            if !to_drop.is_empty() {
-                crate::info!(
-                    "[NodeRuntime] pruning {} peer(s) to stay near desired={} (current={})",
-                    to_drop.len(),
-                    desired,
-                    n
-                );
-            }
-            for pid in to_drop {
-                observe_failure_and_close(
-                    &catalog,
-                    &sm,
-                    &mut state.dial_cooldown_until,
-                    &pid,
-                    now.saturating_add(topology_tuning.prune_redial_cooldown_ms),
-                )
-                .await;
-            }
             n = sm.distinct_peer_count();
         }
         // Exploration только на нижней границе гистерезиса: иначе при
@@ -692,7 +699,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &incoming_maint,
                 &our_peer_maint,
                 &maintenance_handshake_payload,
-                &mut state.dial_cooldown_until,
+                &mut reconciler.dial_cooldowns,
                 &topology_tuning,
                 loop_ctx.dial_policy.transport_order.as_slice(),
                 now,
@@ -702,64 +709,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 state.last_exploration_ms = now;
             }
         }
-        if matches!(node_role, NodeRole::Regular) {
-            let min_keep = adaptive.min_active_peers;
-            let desired_keep = desired;
-            let connected = router_maint.connected_peers();
-            let non_boot = connected
-                .iter()
-                .filter(|p| !catalog.peer_is_bootstrap_entry(p))
-                .count();
-            // Ослабленное условие: как только регуляр набрал min_active_peers
-            // non-bootstrap соседей, начинаем отпускать bootstrap'ы, а не ждём
-            // полного desired_keep. Это ускоряет миграцию из hub-фазы в mesh.
-            if non_boot >= min_keep.max(1) {
-                let mut boot_peers: Vec<_> = connected
-                    .into_iter()
-                    .filter(|p| catalog.peer_is_bootstrap_entry(p))
-                    .collect();
-                let connected_bootstrap = boot_peers.len();
-                if connected_bootstrap > topology_tuning.regular_bootstrap_min_keep {
-                    boot_peers.sort_by(|a, b| {
-                        let ta = total_score(&peer_store.get(a), &weights);
-                        let tb = total_score(&peer_store.get(b), &weights);
-                        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let max_bootstrap_drop = connected_bootstrap
-                        .saturating_sub(topology_tuning.regular_bootstrap_min_keep);
-                    // Раньше: `n - desired_keep` → ждём пока n доберётся до desired.
-                    // Теперь: как только mesh ≥ min_keep, агрессивно отпускаем все
-                    // bootstrap сверх regular_bootstrap_min_keep.
-                    let drop_n = max_bootstrap_drop;
-                    if drop_n > 0 {
-                        crate::info!(
-                            "[NodeRuntime] shedding {} bootstrap_entry peer(s); {} non-bootstrap neighbor(s) (min_keep={}, desired={}, bootstrap_keep={})",
-                            drop_n,
-                            non_boot,
-                            min_keep,
-                            desired_keep,
-                            topology_tuning.regular_bootstrap_min_keep
-                        );
-                    }
-                    for pid in boot_peers.into_iter().take(drop_n) {
-                        // После целевого offload не даём тут же перецепиться
-                        // обратно на bootstrap.
-                        observe_failure_and_close(
-                            &catalog,
-                            &sm,
-                            &mut state.dial_cooldown_until,
-                            &pid,
-                            now.saturating_add(
-                                topology_tuning
-                                    .regular_bootstrap_rejoin_interval_ms
-                                    .saturating_mul(2),
-                            ),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
+        // Bootstrap shedding is now handled by LegacyTopologyPlanner (Pass 4) above.
         n = sm.distinct_peer_count();
         let now = now_ms();
 

@@ -31,6 +31,7 @@ pub(super) fn handshake_packet(sender: &str, payload: &[u8]) -> Packet {
     control_packet(sender, String::new(), payload.to_vec(), 8)
 }
 
+#[allow(dead_code)]
 pub(super) async fn observe_failure_and_close(
     catalog: &Arc<PeerCatalog>,
     sm: &Arc<SessionManager>,
