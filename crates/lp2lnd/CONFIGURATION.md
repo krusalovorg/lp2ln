@@ -106,6 +106,43 @@ Allow packets without signatures.
   - dev/test: `true`
   - production/untrusted networks: prefer `false` if your full stack supports strict signing
 
+#### `signature_format: "v1_json" | "v2_hash" | "v3_hash"`
+
+Outgoing packet signature wire format. Ingress always accepts V1/V2/V3 by prefix.
+
+| Value | Payload | Wire prefix |
+|---|---|---|
+| `v1_json` | JSON of packet fields (full `data`) | bare hex |
+| `v2_hash` | postcard of fields + SHA-256(`data`) | `v2:` |
+| `v3_hash` (default) | V2 fields + `protocol_id` | `v3:` |
+
+- Why V3: `protocol_id` is an App Plane multiplex tag; without it in the signed payload a relay can rewrite the tag without invalidating the signature.
+- Recommended: `v3_hash` for all new deployments. Keep `v2_hash` only while mixed peers cannot verify V3.
+
+#### `experimental` (P0-04)
+
+Opt-in flags for unfinished DHT / content / repair / App Plane skeletons. **All default to `false`.**
+
+```json
+{
+  "experimental": {
+    "dht": false,
+    "content": false,
+    "repair": false,
+    "app_plane": false
+  }
+}
+```
+
+| Flag | Meaning |
+|---|---|
+| `dht` | Reserved for DHT background lifecycle (not started by `lp2lnd` yet) |
+| `content` | Enables debug `block_put` / `block_get` on debug WS / IPC TCP |
+| `repair` | Reserved for RepairWorker (not started by `lp2lnd` yet) |
+| `app_plane` | Reserved for binary App Plane TCP server (module exists; not started by default) |
+
+These are **not** a production distributed storage stack. Library APIs under `dht` / `storage` / `app_plane` remain available for tests and sidecars; the default daemon does not promise their lifecycle until the P4 content-runtime gate.
+
 ### 3) Connectivity policy
 
 #### `peer_connection_policy`

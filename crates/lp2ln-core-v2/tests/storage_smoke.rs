@@ -20,8 +20,8 @@ fn temp_db() -> Arc<P2PDatabase> {
 fn encrypt_decrypt_roundtrip() {
     let key = generate_key();
     let plain = b"hello M5 content-encrypted world";
-    let ct = encrypt_chunk(&key, 0, plain);
-    assert_ne!(ct.as_slice(), plain.as_slice());
+    let ct = encrypt_chunk(&key, 0, plain).unwrap();
+    assert_ne!(&ct[24..], plain.as_slice());
     let recovered = decrypt_chunk(&key, 0, &ct).unwrap();
     assert_eq!(recovered.as_slice(), plain.as_slice());
 }
@@ -29,7 +29,7 @@ fn encrypt_decrypt_roundtrip() {
 #[test]
 fn wrong_chunk_index_fails_auth() {
     let key = generate_key();
-    let ct = encrypt_chunk(&key, 0, b"important data");
+    let ct = encrypt_chunk(&key, 0, b"important data").unwrap();
     assert!(decrypt_chunk(&key, 1, &ct).is_err());
 }
 
@@ -37,7 +37,7 @@ fn wrong_chunk_index_fails_auth() {
 fn wrong_key_fails_auth() {
     let key1 = generate_key();
     let key2 = generate_key();
-    let ct = encrypt_chunk(&key1, 0, b"secret");
+    let ct = encrypt_chunk(&key1, 0, b"secret").unwrap();
     assert!(decrypt_chunk(&key2, 0, &ct).is_err());
 }
 
@@ -47,11 +47,21 @@ fn multi_chunk_encrypt() {
     let data: Vec<u8> = (0u8..=255).cycle().take(CHUNK_SIZE * 3 + 7).collect();
     let mut reconstructed = Vec::new();
     for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
-        let ct = encrypt_chunk(&key, i as u32, chunk);
+        let ct = encrypt_chunk(&key, i as u32, chunk).unwrap();
         let plain = decrypt_chunk(&key, i as u32, &ct).unwrap();
         reconstructed.extend_from_slice(&plain);
     }
     assert_eq!(reconstructed, data);
+}
+
+#[test]
+fn reencrypt_same_index_fresh_nonce() {
+    let key = generate_key();
+    let a = encrypt_chunk(&key, 0, b"v1").unwrap();
+    let b = encrypt_chunk(&key, 0, b"v2").unwrap();
+    assert_ne!(&a[..24], &b[..24]);
+    assert_eq!(decrypt_chunk(&key, 0, &a).unwrap(), b"v1");
+    assert_eq!(decrypt_chunk(&key, 0, &b).unwrap(), b"v2");
 }
 
 // ── manifest ─────────────────────────────────────────────────────────────────

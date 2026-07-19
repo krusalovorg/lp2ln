@@ -1,7 +1,13 @@
-// Global Discovery DHT — roadmap 03
-//
-// DHT-0: NodeRecord, iterative find_node, k-buckets, TTL
-// DHT-1: ProviderRecord, find_providers, announce_provider
+//! # EXPERIMENTAL
+//!
+//! Global Discovery DHT — experimental content runtime.
+//!
+//! This module is a **library skeleton**. The default `lp2lnd` daemon does **not**
+//! start DHT background lifecycle. Opt-in via `options.experimental.dht`
+//! (flag only until a production lifecycle gate).
+//!
+//! DHT-0: NodeRecord, iterative find_node, k-buckets, TTL  
+//! DHT-1: ProviderRecord, find_providers, announce_provider
 
 pub mod records;
 pub mod routing;

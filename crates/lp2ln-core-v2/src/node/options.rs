@@ -190,6 +190,33 @@ impl Default for IpcTcpOptions {
     }
 }
 
+/// Opt-in skeletons for DHT / content / repair / App Plane.
+///
+/// All flags default to `false`. The default daemon does **not** start these
+/// as a production lifecycle; enabling a flag is an explicit experimental
+/// surface until the P4 content-runtime gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExperimentalOptions {
+    /// DHT library + future background lifecycle. Off by default.
+    #[serde(default)]
+    pub dht: bool,
+    /// Local BlockStore / content debug commands. Off by default.
+    #[serde(default)]
+    pub content: bool,
+    /// RepairWorker background loop. Off by default; requires content+dht when wired.
+    #[serde(default)]
+    pub repair: bool,
+    /// Binary App Plane IPC server. Off by default (not started by lp2lnd yet).
+    #[serde(default)]
+    pub app_plane: bool,
+}
+
+impl ExperimentalOptions {
+    pub fn any_enabled(&self) -> bool {
+        self.dht || self.content || self.repair || self.app_plane
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectUpgradeConfig {
     #[serde(default)]
@@ -333,8 +360,10 @@ pub struct NodeOptions {
     pub router_broadcast_cap: usize,
     /// Concurrent packet processor workers (bounded pool).
     pub router_process_concurrency: usize,
-    /// Outgoing packet signature format (`v1_json` legacy, `v2_hash` fast).
+    /// Outgoing packet signature format (`v1_json` / `v2_hash` legacy, `v3_hash` binds `protocol_id`).
     pub signature_format: SignatureFormat,
+    /// Experimental DHT/content/repair/App Plane opt-ins (default all off ).
+    pub experimental: ExperimentalOptions,
     /// When false the topology-maintenance task is not started (useful for test nodes).
     pub enable_topology_maintenance: bool,
     /// Broadcast capacity for the internal CoreBus observer channel.
@@ -381,7 +410,8 @@ impl NodeOptions {
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
             router_process_concurrency: crate::router::ROUTER_PROCESS_SEMAPHORE_PERMITS,
-            signature_format: SignatureFormat::V2Hash,
+            signature_format: SignatureFormat::V3Hash,
+            experimental: ExperimentalOptions::default(),
             enable_topology_maintenance: true,
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,
@@ -428,7 +458,8 @@ impl NodeOptions {
             router_incoming_queue_cap: 16384,
             router_broadcast_cap: 4096,
             router_process_concurrency: crate::router::ROUTER_PROCESS_SEMAPHORE_PERMITS,
-            signature_format: SignatureFormat::V2Hash,
+            signature_format: SignatureFormat::V3Hash,
+            experimental: ExperimentalOptions::default(),
             enable_topology_maintenance: true,
             event_bus_broadcast_cap: 4096,
             stop_on_permanent_degradation: false,
@@ -715,4 +746,22 @@ pub(super) fn default_transport_obfuscation() -> HashMap<String, ObfuscationConf
         ("udp".to_string(), ObfuscationConfig::default()),
         ("quic".to_string(), ObfuscationConfig::default()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn experimental_defaults_all_off() {
+        let opts = NodeOptions::empty();
+        assert!(!opts.experimental.any_enabled());
+        assert!(!opts.experimental.dht);
+        assert!(!opts.experimental.content);
+        assert!(!opts.experimental.repair);
+        assert!(!opts.experimental.app_plane);
+
+        let parsed: ExperimentalOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, ExperimentalOptions::default());
+    }
 }

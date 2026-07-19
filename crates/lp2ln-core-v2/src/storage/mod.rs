@@ -1,8 +1,15 @@
-// M3 — local content-addressed block store (slice 10)
-// M5 — encryption, manifests, leases, block transfer, repair, magic folder
-//
-// ContentId = SHA-256 of ciphertext bytes (encrypt-then-hash per roadmap 04).
-// BlockStore wraps the existing redb P2PDatabase via the BLOCK_TABLE.
+//! # EXPERIMENTAL 
+//!
+//! Local content-addressed block store, encryption, manifests, leases, transfer, repair.
+//!
+//! **Not** a completed distributed storage system. Default `lp2lnd` does not start
+//! content/repair lifecycle. Opt-in surfaces:
+//! - `experimental.content` — debug `block_put` / `block_get`
+//! - `experimental.repair` — reserved for RepairWorker (not started by daemon yet)
+//!
+//! ContentId = SHA-256 of the chunk envelope (nonce || ciphertext||tag)
+//! after encrypt-then-hash (roadmap 04 / P0-03). See `encrypt` module docs.
+//! BlockStore wraps the existing redb P2PDatabase via the BLOCK_TABLE.
 
 pub mod block_transfer;
 pub mod encrypt;

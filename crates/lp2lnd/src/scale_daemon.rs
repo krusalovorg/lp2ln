@@ -480,7 +480,9 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let dbg_cfg = options.debug_server.clone();
-        let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp);
+        let experimental_content = options.experimental.content;
+        let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp)
+            .with_experimental_content(experimental_content);
         let mut node = builder.build(options)?;
         node.start().await?;
         let node = Arc::new(node);
@@ -490,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
                 enabled: dbg_cfg.enabled,
                 bind_addr: dbg_cfg.bind_addr,
                 push_interval_ms: dbg_cfg.push_interval_ms,
+                experimental_content,
             },
             node.clone(),
             db_for_debug.clone(),

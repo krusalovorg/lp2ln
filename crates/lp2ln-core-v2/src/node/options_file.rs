@@ -107,6 +107,8 @@ struct NodeOptionsFile {
     router_process_concurrency: usize,
     #[serde(default)]
     signature_format: crate::crypto::signature::SignatureFormat,
+    #[serde(default)]
+    experimental: crate::node::options::ExperimentalOptions,
     #[serde(default = "super::options::default_true")]
     enable_topology_maintenance: bool,
     #[serde(default = "default_event_bus_broadcast_cap")]
@@ -234,6 +236,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             router_broadcast_cap: file.router_broadcast_cap,
             router_process_concurrency: file.router_process_concurrency,
             signature_format: file.signature_format,
+            experimental: file.experimental,
             enable_topology_maintenance: file.enable_topology_maintenance,
             event_bus_broadcast_cap: file.event_bus_broadcast_cap,
             stop_on_permanent_degradation: file.stop_on_permanent_degradation,
@@ -387,6 +390,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             router_broadcast_cap: opts.router_broadcast_cap,
             router_process_concurrency: opts.router_process_concurrency,
             signature_format: opts.signature_format,
+            experimental: opts.experimental.clone(),
             enable_topology_maintenance: opts.enable_topology_maintenance,
             event_bus_broadcast_cap: opts.event_bus_broadcast_cap,
             stop_on_permanent_degradation: opts.stop_on_permanent_degradation,

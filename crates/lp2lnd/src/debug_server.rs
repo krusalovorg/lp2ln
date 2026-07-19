@@ -19,6 +19,7 @@ pub struct DebugServerConfig {
     pub enabled: bool,
     pub bind_addr: String,
     pub push_interval_ms: u64,
+    pub experimental_content: bool,
 }
 
 pub fn spawn_debug_server(
@@ -47,9 +48,10 @@ pub fn spawn_debug_server(
         };
 
         lp2ln_core_v2::info!(
-            "[DebugServer] listening on ws://{} (push_interval_ms={})",
+            "[DebugServer] listening on ws://{} (push_interval_ms={}, experimental.content={})",
             bind_addr,
-            cfg.push_interval_ms
+            cfg.push_interval_ms,
+            cfg.experimental_content
         );
 
         loop {
@@ -58,9 +60,17 @@ pub fn spawn_debug_server(
                     let node = node.clone();
                     let db = db.clone();
                     let push_interval_ms = cfg.push_interval_ms.max(250);
+                    let experimental_content = cfg.experimental_content;
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_ws_client(stream, peer, node, db, push_interval_ms).await
+                        if let Err(e) = handle_ws_client(
+                            stream,
+                            peer,
+                            node,
+                            db,
+                            push_interval_ms,
+                            experimental_content,
+                        )
+                        .await
                         {
                             lp2ln_core_v2::warn!("[DebugServer] client {} dropped: {}", peer, e);
                         }
@@ -80,37 +90,45 @@ async fn handle_ws_client(
     node: Arc<NodeRuntime>,
     db: Option<Arc<P2PDatabase>>,
     push_interval_ms: u64,
+    experimental_content: bool,
 ) -> anyhow::Result<()> {
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
     lp2ln_core_v2::info!("[DebugServer] ws connected: {}", peer);
+
+    let mut commands = vec![
+        "get_db_tables",
+        "connect_peer",
+        "disconnect_peer",
+        "close_session",
+        "send_to_peer",
+        "send_packet",
+        "send_to_session",
+        "get_peer_rankings",
+        "get_peer_rollup",
+        "set_peer_connection_policy",
+        "get_file_by_hash",
+        "remove_file",
+        "register_known_peer_addr",
+        "connect_batch",
+        "disconnect_peer_batch",
+        "refresh_snapshot",
+        "stop_node",
+    ];
+    if experimental_content {
+        commands.push("block_put");
+        commands.push("block_get");
+    }
 
     let hello = json!({
         "event": "hello",
         "ts_ms": now_ms(),
         "peer_id": node.peer_id(),
         "push_interval_ms": push_interval_ms,
-        "commands": [
-            "get_db_tables",
-            "connect_peer",
-            "disconnect_peer",
-            "close_session",
-            "send_to_peer",
-            "send_packet",
-            "send_to_session",
-            "get_peer_rankings",
-            "get_peer_rollup",
-            "set_peer_connection_policy",
-            "get_file_by_hash",
-            "remove_file",
-            "register_known_peer_addr",
-            "connect_batch",
-            "disconnect_peer_batch",
-            "refresh_snapshot",
-            "stop_node",
-            "block_put",
-            "block_get",
-        ],
+        "experimental": {
+            "content": experimental_content,
+        },
+        "commands": commands,
     });
     ws_tx.send(Message::Text(hello.to_string())).await?;
 
@@ -130,7 +148,14 @@ async fn handle_ws_client(
                 let msg = msg?;
                 match msg {
                     Message::Text(text) => {
-                        if let Some(reply) = handle_client_command(&text, node.clone(), db.clone()).await {
+                        if let Some(reply) = handle_client_command(
+                            &text,
+                            node.clone(),
+                            db.clone(),
+                            experimental_content,
+                        )
+                        .await
+                        {
                             ws_tx.send(Message::Text(reply.to_string())).await?;
                         }
                     }
@@ -150,6 +175,7 @@ pub(crate) async fn handle_client_command(
     text: &str,
     node: Arc<NodeRuntime>,
     db: Option<Arc<P2PDatabase>>,
+    experimental_content: bool,
 ) -> Option<Value> {
     let value: Value = serde_json::from_str(text).ok()?;
     let cmd = value.get("cmd")?.as_str()?;
@@ -623,14 +649,32 @@ pub(crate) async fn handle_client_command(
                 "error": e.to_string(),
             })),
         },
-        "block_put" => Some(block_put(db, &value).await),
-        "block_get" => Some(block_get(db, &value).await),
+        "block_put" => Some(if experimental_content {
+            block_put(db, &value).await
+        } else {
+            experimental_content_disabled("block_put")
+        }),
+        "block_get" => Some(if experimental_content {
+            block_get(db, &value).await
+        } else {
+            experimental_content_disabled("block_get")
+        }),
         _ => Some(json!({
             "event": "error",
             "ts_ms": now_ms(),
             "message": format!("unknown command: {}", cmd),
         })),
     }
+}
+
+fn experimental_content_disabled(cmd: &str) -> Value {
+    json!({
+        "event": "command_result",
+        "ts_ms": now_ms(),
+        "ok": false,
+        "cmd": cmd,
+        "error": "experimental.content is disabled (P0-04; set experimental.content=true for debug block cmds)",
+    })
 }
 
 async fn connect_batch(node: Arc<NodeRuntime>, value: &Value) -> Value {

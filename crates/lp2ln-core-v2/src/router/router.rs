@@ -72,7 +72,7 @@ impl Router {
             ROUTER_INCOMING_QUEUE_CAP,
             ROUTER_BROADCAST_CAP,
             ROUTER_PROCESS_SEMAPHORE_PERMITS,
-            SignatureFormat::V2Hash,
+            SignatureFormat::V3Hash,
         )
     }
 

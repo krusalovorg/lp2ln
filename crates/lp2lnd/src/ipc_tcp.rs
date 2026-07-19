@@ -77,6 +77,7 @@ pub struct IpcTcpServerConfig {
     pub bind_addr: String,
     pub push_incoming_packets: bool,
     pub max_frame_bytes: u32,
+    pub experimental_content: bool,
 }
 
 impl From<&IpcTcpOptions> for IpcTcpServerConfig {
@@ -86,7 +87,15 @@ impl From<&IpcTcpOptions> for IpcTcpServerConfig {
             bind_addr: o.bind_addr.clone(),
             push_incoming_packets: o.push_incoming_packets,
             max_frame_bytes: o.max_frame_bytes.clamp(4096, 64 * 1024 * 1024),
+            experimental_content: false,
         }
+    }
+}
+
+impl IpcTcpServerConfig {
+    pub fn with_experimental_content(mut self, enabled: bool) -> Self {
+        self.experimental_content = enabled;
+        self
     }
 }
 
@@ -116,10 +125,11 @@ pub fn spawn_ipc_tcp_server(
         };
 
         lp2ln_core_v2::info!(
-            "[IpcTcp] listening on tcp://{} (push_incoming_packets={}, max_frame_bytes={})",
+            "[IpcTcp] listening on tcp://{} (push_incoming_packets={}, max_frame_bytes={}, experimental.content={})",
             bind_addr,
             cfg.push_incoming_packets,
-            cfg.max_frame_bytes
+            cfg.max_frame_bytes,
+            cfg.experimental_content
         );
 
         loop {
@@ -129,9 +139,18 @@ pub fn spawn_ipc_tcp_server(
                     let db = db.clone();
                     let max_frame = cfg.max_frame_bytes;
                     let push = cfg.push_incoming_packets;
+                    let experimental_content = cfg.experimental_content;
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_tcp_client(stream, peer, node, db, max_frame, push).await
+                        if let Err(e) = handle_tcp_client(
+                            stream,
+                            peer,
+                            node,
+                            db,
+                            max_frame,
+                            push,
+                            experimental_content,
+                        )
+                        .await
                         {
                             lp2ln_core_v2::warn!("[IpcTcp] client {} disconnected: {}", peer, e);
                         }
@@ -152,6 +171,7 @@ async fn handle_tcp_client(
     db: Option<Arc<P2PDatabase>>,
     max_frame_bytes: u32,
     push_incoming_packets: bool,
+    experimental_content: bool,
 ) -> anyhow::Result<()> {
     let (mut read_half, write_half) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(IPC_TCP_OUTBOUND_QUEUE_CAP);
@@ -280,7 +300,13 @@ async fn handle_tcp_client(
             continue;
         }
 
-        let reply = match debug_server::handle_client_command(text, node.clone(), db.clone()).await
+        let reply = match debug_server::handle_client_command(
+            text,
+            node.clone(),
+            db.clone(),
+            experimental_content,
+        )
+        .await
         {
             Some(mut r) => {
                 attach_client_request_id(&mut r, &value);

@@ -134,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let dbg_cfg = options.debug_server.clone();
-    let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp);
+    let ipc_cfg = ipc_tcp::IpcTcpServerConfig::from(&options.ipc_tcp)
+        .with_experimental_content(options.experimental.content);
     let mut node = builder.build(options.clone())?;
     node.start().await?;
     let node = Arc::new(node);
@@ -164,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
             enabled: dbg_cfg.enabled,
             bind_addr: dbg_cfg.bind_addr,
             push_interval_ms: dbg_cfg.push_interval_ms,
+            experimental_content: options.experimental.content,
         },
         node.clone(),
         db_handle.clone(),
@@ -172,6 +174,26 @@ async fn main() -> anyhow::Result<()> {
     let _health_task = health_server::spawn_health_server(node.clone(), None);
     let _config_watcher_task =
         config_engine.spawn_runtime_config_watcher(node.clone(), applied_options);
+
+    lp2ln_core_v2::info!(
+        "[Main] experimental flags: dht={} content={} repair={} app_plane={}",
+        options.experimental.dht,
+        options.experimental.content,
+        options.experimental.repair,
+        options.experimental.app_plane
+    );
+    if options.experimental.any_enabled() {
+        lp2ln_core_v2::warn!(
+            "[Main] experimental.* enabled — DHT/content/repair/App Plane are skeletons until P4; \
+             default daemon does not promise a production content lifecycle"
+        );
+    }
+    if options.experimental.dht || options.experimental.repair || options.experimental.app_plane {
+        lp2ln_core_v2::warn!(
+            "[Main] experimental.dht/repair/app_plane are opt-in flags only; \
+             lp2lnd does not start those background services yet"
+        );
+    }
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

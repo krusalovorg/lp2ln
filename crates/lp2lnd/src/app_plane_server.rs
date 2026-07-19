@@ -1,5 +1,8 @@
 // M2 — App Plane v2 binary IPC server (slice 09)
 //
+// EXPERIMENTAL (P0-04): not started by default `lp2lnd`. Reserved behind
+// `options.experimental.app_plane` until P3/P4 lifecycle wiring.
+//
 // Listens on a separate TCP port. Each connection can subscribe to protocol_ids
 // and send raw payloads without base64 encoding.
 //

@@ -1,11 +1,17 @@
-// M2 — App Plane v2 binary IPC (slice 08-09)
-//
-// Wire protocol: 4-byte LE length prefix + postcard-encoded AppMsg.
-// Sidecar apps register a protocol_id; packets with that id are routed to
-// a bounded mpsc channel. Slow consumers are dropped from the tail — they
-// cannot block the router broadcast.
-//
-// A separate JSON debug IPC (ipc_tcp.rs) remains unchanged.
+//! # EXPERIMENTAL
+//!
+//! App Plane v2 binary IPC (slice 08-09).
+//!
+//! Library types for sidecar ↔ node framing. The binary App Plane TCP server in
+//! `lp2lnd` (`app_plane_server.rs`) is **not** started by the default daemon;
+//! opt-in flag `experimental.app_plane` is reserved until P3/P4 lifecycle.
+//!
+//! Wire protocol: 4-byte LE length prefix + postcard-encoded AppMsg.
+//! Sidecar apps register a protocol_id; packets with that id are routed to
+//! a bounded mpsc channel. Slow consumers are dropped from the tail — they
+//! cannot block the router broadcast.
+//!
+//! A separate JSON debug IPC (`ipc_tcp.rs`) remains unchanged.
 
 use std::sync::Arc;
 

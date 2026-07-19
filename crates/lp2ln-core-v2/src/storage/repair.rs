@@ -1,8 +1,13 @@
-// M5 — RepairWorker: restores replication factor when replicas go missing.
-//
-// Periodically checks tracked blocks, finds peers via DHT, and pushes blocks
-// to under-replicated ones. Leases are created optimistically (no negotiation
-// — that belongs to the storage market in roadmap 06).
+//! # EXPERIMENTAL
+//!
+//! RepairWorker: restores replication factor when replicas go missing.
+//!
+//! Not started by default `lp2lnd`. Requires explicit `experimental.repair`
+//! (and a future lifecycle wiring in ). This is a skeleton, not production repair.
+//!
+//! Periodically checks tracked blocks, finds peers via DHT, and pushes blocks
+//! to under-replicated ones. Leases are created optimistically (no negotiation
+//! — that belongs to the storage market).
 
 use std::sync::Arc;
 use std::time::Duration;

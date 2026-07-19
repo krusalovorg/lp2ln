@@ -129,6 +129,7 @@ impl NodeRuntime {
                 router_broadcast_cap: options.router_broadcast_cap,
                 router_process_concurrency: options.router_process_concurrency,
                 signature_format: options.signature_format,
+                experimental: options.experimental,
                 enable_topology_maintenance: options.enable_topology_maintenance,
                 event_bus_broadcast_cap: options.event_bus_broadcast_cap,
                 stop_on_permanent_degradation: options.stop_on_permanent_degradation,
