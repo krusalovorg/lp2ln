@@ -22,7 +22,7 @@ use crate::peer_score::PeerConnectionPolicy;
 use crate::router::Router;
 use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
-use crate::topology::PeerCatalog;
+use crate::topology::{PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 
 /// Shared state passed to each runtime service spawner during `start()`.
@@ -39,6 +39,7 @@ pub(crate) struct StartupContext<'a> {
     pub session_manager: Arc<SessionManager>,
     pub peer_catalog: Arc<PeerCatalog>,
     pub nat_state: Arc<NatTraversalState>,
+    pub peer_dir: Arc<PeerDirectory>,
     pub dial_book: Arc<DashMap<crate::types::PeerId, Vec<(String, SocketAddr)>>>,
     pub bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
     pub bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,

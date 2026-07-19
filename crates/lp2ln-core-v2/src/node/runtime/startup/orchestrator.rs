@@ -172,6 +172,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         session_manager: runtime.session_manager.clone(),
         peer_catalog: runtime.peer_catalog.clone(),
         nat_state: runtime.nat_state.clone(),
+        peer_dir: runtime.peer_dir.clone(),
         dial_book: runtime.dial_book.clone(),
         bootstrap_dial_dedupe: runtime.bootstrap_dial_dedupe.clone(),
         bootstrap_dial_ok_ms: runtime.bootstrap_dial_ok_ms.clone(),

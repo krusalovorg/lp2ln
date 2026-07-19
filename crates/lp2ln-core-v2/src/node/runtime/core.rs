@@ -25,7 +25,7 @@ use crate::peer_score::{PeerConnectionPolicy, PeerScoreStore};
 use crate::router::Router;
 use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
-use crate::topology::PeerCatalog;
+use crate::topology::{PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 
 pub struct NodeRuntime {
@@ -38,6 +38,7 @@ pub struct NodeRuntime {
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) peer_catalog: Arc<PeerCatalog>,
     pub(crate) nat_state: Arc<NatTraversalState>,
+    pub(crate) peer_dir: Arc<PeerDirectory>,
     pub(crate) dial_book: Arc<DashMap<crate::types::PeerId, Vec<(String, SocketAddr)>>>,
     pub(crate) bootstrap_dial_dedupe: Arc<Mutex<HashSet<(String, SocketAddr)>>>,
     pub(crate) bootstrap_dial_ok_ms: Arc<Mutex<HashMap<SocketAddr, u64>>>,
@@ -143,6 +144,7 @@ impl NodeRuntime {
             session_manager,
             peer_catalog,
             nat_state,
+            peer_dir: Arc::new(PeerDirectory::new()),
             dial_book: Arc::new(DashMap::new()),
             bootstrap_dial_dedupe: Arc::new(Mutex::new(HashSet::new())),
             bootstrap_dial_ok_ms: Arc::new(Mutex::new(HashMap::new())),

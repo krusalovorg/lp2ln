@@ -9,7 +9,7 @@ mod types;
 
 pub use adapters::RUNTIME_INTEGRATION_HOOKS;
 pub use adapters::{
-    BasicHeuristicAdapter, IntegrationHook, NodeActionPlan, SimNodeObservation,
+    BasicHeuristicAdapter, IntegrationHook, NodeActionPlan, PlannerAdapter, SimNodeObservation,
     TopologyDecisionAdapter,
 };
 pub use clock::SimClock;

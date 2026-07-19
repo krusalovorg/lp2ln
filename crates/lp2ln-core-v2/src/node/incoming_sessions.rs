@@ -1,10 +1,7 @@
 ﻿use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::node::distribution::{
-    BOOTSTRAP_INCOMING_HEADROOM, INCOMING_ROTATION_INTERVAL_MS, OVERLOAD_REDIRECT_DESCRIPTOR_LIMIT,
-    peers_to_drop_when_overloaded,
-};
+use crate::node::distribution::OVERLOAD_REDIRECT_DESCRIPTOR_LIMIT;
 
 /// Сколько regular-дескрипторов слать newcomer'у proactive-сразу после handshake
 /// (чтобы не ждать RequestPeers → быстрое переключение на mesh).
@@ -18,28 +15,6 @@ pub const BOOTSTRAP_PEER_REDIRECT_PREAMBLE: usize = 3;
 /// не раздувать degree из-за лавины входящих дозвонов.
 pub const REGULAR_INCOMING_HEADROOM: usize = 2;
 
-fn adaptive_bootstrap_hard_limit(
-    tuning: &TopologyTuning,
-    policy: &PeerConnectionPolicy,
-    known_peers: usize,
-) -> usize {
-    if !tuning.adaptive_topology_enabled {
-        return policy
-            .target_active_peers
-            .saturating_add(BOOTSTRAP_INCOMING_HEADROOM)
-            .min(policy.max_active_peers);
-    }
-    let base = policy.target_active_peers.max(1);
-    let cap = tuning.adaptive_bootstrap_hard_max.max(4);
-    let candidate = if known_peers <= 24 {
-        base.saturating_add(3)
-    } else if known_peers <= 96 {
-        base.saturating_add(2)
-    } else {
-        base.saturating_add(1)
-    };
-    candidate.min(cap).min(policy.max_active_peers.max(base))
-}
 
 /// Собирает до `limit` дескрипторов других bootstrap-нод, у которых
 /// `active_connections` меньше `our_ac`, отсортированных по возрастанию
@@ -79,7 +54,9 @@ use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    PeerCatalog, descriptor_ok_for_discovery_redirect, now_ms, select_peers_for_discovery_response,
+    AdmissionDecision, CapacityBudget, LegacyTopologyPlanner, PeerCandidate, PeerCatalog,
+    TopologyPlanner, TopologySnapshot, descriptor_ok_for_discovery_redirect, now_ms,
+    select_peers_for_discovery_response,
 };
 use crate::types::{PeerId, SessionId};
 
@@ -169,14 +146,13 @@ pub(crate) async fn run_incoming_session_handler(
     our_peer_id_for_incoming: String,
     policy_live_incoming: Arc<RwLock<PeerConnectionPolicy>>,
     incoming_catalog: Arc<PeerCatalog>,
-    incoming_peer_store: Arc<PeerScoreStore>,
-    incoming_weights: PeerScoreWeights,
+    _incoming_peer_store: Arc<PeerScoreStore>,
+    _incoming_weights: PeerScoreWeights,
     incoming_node_role: NodeRole,
     incoming_topology_tuning: TopologyTuning,
     incoming_discovery_random_fraction: f32,
     incoming_packets_tx_for_sessions: tokio::sync::mpsc::Sender<IncomingPacket>,
 ) -> anyhow::Result<()> {
-    let mut last_rotation_ms = 0u64;
     let mut recent_redirect_until: std::collections::HashMap<PeerId, u64> =
         std::collections::HashMap::new();
     let mut recent_bootstrap_hints: std::collections::HashMap<String, u32> =
@@ -264,31 +240,32 @@ pub(crate) async fn run_incoming_session_handler(
                 }
             }
             let known_peers = incoming_catalog.known_peer_ids().len().max(1);
-            let hard_limit = if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                adaptive_bootstrap_hard_limit(
-                    &incoming_topology_tuning,
-                    &incoming_policy,
-                    known_peers,
-                )
-            } else {
-                incoming_policy
-                    .target_active_peers
-                    .saturating_add(REGULAR_INCOMING_HEADROOM)
-                    .min(incoming_policy.max_active_peers)
+            // ponytail: minimal snapshot — evaluate_incoming only needs connected count, policy,
+            // role, tuning, known_peer_count; other fields are zero-defaults
+            let admission_snapshot = TopologySnapshot {
+                our_peer_id: crate::types::PeerId::from(our_peer_id_for_incoming.as_str()),
+                node_role: incoming_node_role,
+                policy: incoming_policy.clone(),
+                weights: crate::peer_score::PeerScoreWeights::default(),
+                topology_tuning: incoming_topology_tuning.clone(),
+                connected_peers: router_for_incoming.connected_peers(),
+                connected_bootstrap_count: 0,
+                known_peer_count: known_peers,
+                peer_total_scores: std::collections::HashMap::new(),
+                bootstrap_peer_ids: std::collections::HashSet::new(),
+                descriptor_active_conns: std::collections::HashMap::new(),
+                catalog_descriptors: Vec::new(),
+                capacity: CapacityBudget::default(),
+                dial_book: std::collections::HashMap::new(),
+                dial_cooldowns: std::collections::HashMap::new(),
+                bootstrap_targets_count: 0,
+                last_bootstrap_reseed_ms: 0,
+                now_ms: now,
             };
-            let soft_limit = if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                hard_limit
-                    .saturating_sub(1)
-                    .max(incoming_policy.target_active_peers)
-            } else {
-                incoming_policy.max_active_peers
-            };
-            if connected_now >= hard_limit {
-                crate::debug!(
-                    "[NodeRuntime] Redirect incoming session from {}: hard peer limit reached ({})",
-                    pid,
-                    hard_limit
-                );
+            if let AdmissionDecision::Redirect { .. } = LegacyTopologyPlanner.evaluate_incoming(
+                &admission_snapshot,
+                &PeerCandidate { peer_id: pid.clone(), is_bootstrap_entry: false },
+            ) {
                 let preamble = if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
                     less_loaded_bootstrap_descriptors(
                         incoming_catalog.as_ref(),
@@ -301,6 +278,7 @@ pub(crate) async fn run_incoming_session_handler(
                 } else {
                     Vec::new()
                 };
+                crate::debug!("[NodeRuntime] Redirect incoming session from {}: planner limit", pid);
                 send_discovery_redirect_and_close_with_preamble(
                     &router_for_incoming,
                     session.clone(),
@@ -322,95 +300,6 @@ pub(crate) async fn run_incoming_session_handler(
                     );
                 }
                 continue;
-            }
-
-            if connected_now >= soft_limit {
-                if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                    crate::debug!(
-                        "[NodeRuntime] Redirect incoming session from {}: bootstrap soft limit reached ({})",
-                        pid,
-                        incoming_policy.max_active_peers
-                    );
-                    let preamble = less_loaded_bootstrap_descriptors(
-                        incoming_catalog.as_ref(),
-                        &our_peer_id_for_incoming,
-                        connected_now.min(u16::MAX as usize) as u16,
-                        pid.as_str(),
-                        &recent_bootstrap_hints,
-                        BOOTSTRAP_PEER_REDIRECT_PREAMBLE,
-                    );
-                    send_discovery_redirect_and_close_with_preamble(
-                        &router_for_incoming,
-                        session.clone(),
-                        &session_id,
-                        &pid,
-                        &our_peer_id_for_incoming,
-                        incoming_catalog.as_ref(),
-                        incoming_discovery_random_fraction,
-                        preamble.clone(),
-                    )
-                    .await;
-                    for d in preamble {
-                        *recent_bootstrap_hints.entry(d.peer_id).or_insert(0) += 1;
-                    }
-                    recent_redirect_until.insert(
-                        pid.clone(),
-                        now.saturating_add(incoming_topology_tuning.adaptive_redirect_memory_ms),
-                    );
-                    continue;
-                }
-                if now.saturating_sub(last_rotation_ms) < INCOMING_ROTATION_INTERVAL_MS {
-                    crate::debug!(
-                        "[NodeRuntime] Redirect incoming session from {}: rotation cooldown",
-                        pid
-                    );
-                    send_discovery_redirect_and_close(
-                        &router_for_incoming,
-                        session.clone(),
-                        &session_id,
-                        &pid,
-                        &our_peer_id_for_incoming,
-                        incoming_catalog.as_ref(),
-                        incoming_discovery_random_fraction,
-                    )
-                    .await;
-                    continue;
-                }
-                let connected = session_manager.get_all_peers();
-                let mut to_drop = peers_to_drop_when_overloaded(
-                    connected,
-                    1,
-                    incoming_catalog.as_ref(),
-                    incoming_peer_store.as_ref(),
-                    &incoming_weights,
-                    incoming_node_role,
-                );
-                if let Some(victim) = to_drop.pop() {
-                    incoming_catalog.observe_failure(&victim);
-                    let _ = session_manager.close_all_sessions_for_peer(&victim).await;
-                    last_rotation_ms = now;
-                    crate::debug!(
-                        "[NodeRuntime] Rotated peer {} to admit newcomer {}",
-                        victim,
-                        pid
-                    );
-                } else {
-                    crate::debug!(
-                        "[NodeRuntime] Redirect incoming session from {}: no rotation candidate",
-                        pid
-                    );
-                    send_discovery_redirect_and_close(
-                        &router_for_incoming,
-                        session.clone(),
-                        &session_id,
-                        &pid,
-                        &our_peer_id_for_incoming,
-                        incoming_catalog.as_ref(),
-                        incoming_discovery_random_fraction,
-                    )
-                    .await;
-                    continue;
-                }
             }
             session_manager.register(pid, session_id.clone(), session.clone());
         } else {
@@ -619,39 +508,6 @@ mod tests {
         );
         sign_descriptor(&mut desc, keypair.signing_key()).expect("sign descriptor");
         desc
-    }
-
-    #[test]
-    fn bootstrap_admission_hard_limit_uses_static_headroom_without_adaptive_topology() {
-        let tuning = TopologyTuning::default();
-        let policy = PeerConnectionPolicy {
-            min_active_peers: 2,
-            target_active_peers: 5,
-            max_active_peers: 10,
-        };
-
-        assert_eq!(
-            adaptive_bootstrap_hard_limit(&tuning, &policy, 1),
-            policy.target_active_peers + BOOTSTRAP_INCOMING_HEADROOM
-        );
-    }
-
-    #[test]
-    fn bootstrap_admission_hard_limit_tightens_as_catalog_grows_when_adaptive() {
-        let tuning = TopologyTuning {
-            adaptive_topology_enabled: true,
-            adaptive_bootstrap_hard_max: 8,
-            ..TopologyTuning::default()
-        };
-        let policy = PeerConnectionPolicy {
-            min_active_peers: 2,
-            target_active_peers: 5,
-            max_active_peers: 10,
-        };
-
-        assert_eq!(adaptive_bootstrap_hard_limit(&tuning, &policy, 24), 8);
-        assert_eq!(adaptive_bootstrap_hard_limit(&tuning, &policy, 96), 7);
-        assert_eq!(adaptive_bootstrap_hard_limit(&tuning, &policy, 97), 6);
     }
 
     #[test]

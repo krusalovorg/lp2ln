@@ -1,7 +1,9 @@
+pub mod peer_directory;
 pub mod planner;
 pub mod reconciler;
 pub mod snapshot;
 
+pub use peer_directory::{AddressRecord, AddressSource, DialRecord, PeerDirectory};
 pub use planner::{
     AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent, DropReason, LegacyTopologyPlanner,
     PeerCandidate, TopologyPlan, TopologyPlanner,

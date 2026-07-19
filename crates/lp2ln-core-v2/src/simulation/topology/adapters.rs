@@ -1,4 +1,12 @@
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+
 use super::types::{SimNodeId, SimNodeState, TopologySnapshot};
+use crate::node::options::{NodeRole, TopologyTuning};
+use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
+use crate::topology::{CapacityBudget, LegacyTopologyPlanner, TopologyPlanner};
+use crate::topology::snapshot::TopologySnapshot as RealSnapshot;
+use crate::types::PeerId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimNodeObservation {
@@ -104,6 +112,95 @@ impl TopologyDecisionAdapter for BasicHeuristicAdapter {
         }
 
         plan
+    }
+}
+
+/// Wraps `LegacyTopologyPlanner` so the simulator exercises the same planner as the runtime.
+/// Converts SimNodeId ↔ PeerId via `u64.to_string()`, uses fake loopback addresses for
+/// the dial book (simulator never connects to them; it only uses the PeerId round-trip).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannerAdapter {
+    pub policy: PeerConnectionPolicy,
+    pub max_new_dials_per_tick: usize,
+}
+
+impl Default for PlannerAdapter {
+    fn default() -> Self {
+        Self {
+            policy: PeerConnectionPolicy {
+                min_active_peers: 4,
+                target_active_peers: 6,
+                max_active_peers: 10,
+            },
+            max_new_dials_per_tick: 2,
+        }
+    }
+}
+
+impl TopologyDecisionAdapter for PlannerAdapter {
+    fn plan_actions(&self, observation: &SimNodeObservation, snapshot: &TopologySnapshot) -> NodeActionPlan {
+        let to_pid = |id: SimNodeId| PeerId::from(id.to_string().as_str());
+
+        let connected_set: HashSet<SimNodeId> = observation
+            .node_state
+            .peers
+            .values()
+            .filter(|p| p.connected)
+            .map(|p| p.peer_id)
+            .collect();
+
+        let connected_peers: Vec<PeerId> =
+            connected_set.iter().map(|id| to_pid(*id)).collect();
+
+        // ponytail: fake loopback ports — simulator ignores addresses, only uses PeerId key
+        let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> = snapshot
+            .nodes
+            .iter()
+            .filter(|(id, state)| {
+                state.online && **id != observation.node_id && !connected_set.contains(*id)
+            })
+            .map(|(id, _)| {
+                let port = (id % 60000 + 1024) as u16;
+                (to_pid(*id), vec![("tcp".to_string(), ([127u8, 0, 0, 1], port).into())])
+            })
+            .collect();
+
+        let real_snap = RealSnapshot {
+            our_peer_id: to_pid(observation.node_id),
+            node_role: NodeRole::Regular,
+            policy: self.policy.clone(),
+            weights: PeerScoreWeights::default(),
+            topology_tuning: TopologyTuning::default(),
+            connected_peers,
+            connected_bootstrap_count: 0,
+            known_peer_count: observation.known_peers,
+            peer_total_scores: HashMap::new(),
+            bootstrap_peer_ids: HashSet::new(),
+            descriptor_active_conns: HashMap::new(),
+            catalog_descriptors: Vec::new(),
+            capacity: CapacityBudget::default(),
+            dial_book,
+            dial_cooldowns: HashMap::new(),
+            bootstrap_targets_count: 0,
+            last_bootstrap_reseed_ms: 0,
+            now_ms: observation.now_ms,
+        };
+
+        let plan = LegacyTopologyPlanner.plan(&real_snap);
+
+        let mut node_plan = NodeActionPlan::default();
+        for intent in plan.dial.into_iter().take(self.max_new_dials_per_tick) {
+            if let Ok(sim_id) = intent.peer_id.as_str().parse::<SimNodeId>() {
+                node_plan.dial_candidates.push(sim_id);
+            }
+        }
+        for intent in plan.drop {
+            if let Ok(sim_id) = intent.peer_id.as_str().parse::<SimNodeId>() {
+                node_plan.drop_candidates.push(sim_id);
+            }
+        }
+        node_plan.request_peer_exchange = !plan.discovery.is_empty();
+        node_plan
     }
 }
 

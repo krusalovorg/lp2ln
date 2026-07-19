@@ -14,7 +14,7 @@ use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
 use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
-use crate::topology::{NodeDescriptor, PeerCatalog};
+use crate::topology::{NodeDescriptor, PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 use crate::types::{PeerId, SessionId};
 
@@ -134,7 +134,7 @@ pub(super) async fn execute_dial_plan(
     incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
     our_peer_maint: &str,
     maintenance_handshake_payload: &[u8],
-    dial_cooldown_until: &mut HashMap<PeerId, u64>,
+    peer_dir: &Arc<PeerDirectory>,
     topology_tuning: &TopologyTuning,
     transport_order: &[String],
     now: u64,
@@ -164,10 +164,8 @@ pub(super) async fn execute_dial_plan(
                 continue;
             }
         }
-        if let Some(until) = dial_cooldown_until.get(&pid).copied() {
-            if now < until {
-                continue;
-            }
+        if peer_dir.in_backoff(&pid, now) {
+            continue;
         }
         if let Some(desc) = plan.desc_by_peer.get(&pid) {
             if plan.force_non_bootstrap && desc.capabilities.bootstrap_entry {
@@ -258,6 +256,7 @@ pub(super) async fn execute_dial_plan(
                             handshake_packet(our_peer_maint, maintenance_handshake_payload);
                         let _ = router_maint.send_to_session(session_id, handshake).await;
                         catalog.observe_success(&pid, 80);
+                        peer_dir.record_dial_success(&pid, now);
                         if plan
                             .desc_by_peer
                             .get(&pid)
@@ -265,16 +264,16 @@ pub(super) async fn execute_dial_plan(
                         {
                             plan.connected_bootstrap = plan.connected_bootstrap.saturating_add(1);
                         }
-                        dial_cooldown_until.remove(&pid);
                         dialed_any = true;
                         active_peers = sm.distinct_peer_count();
                         break;
                     }
                     Err(_) => {
                         catalog.observe_failure(&pid);
-                        dial_cooldown_until.insert(
-                            pid.clone(),
-                            now.saturating_add(topology_tuning.dial_retry_cooldown_ms),
+                        peer_dir.record_dial_failure(
+                            &pid,
+                            topology_tuning.dial_retry_cooldown_ms,
+                            now,
                         );
                     }
                 }

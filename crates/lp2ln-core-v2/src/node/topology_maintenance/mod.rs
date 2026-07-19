@@ -32,8 +32,8 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, TopologyPlanner, TopologyReconciler,
-    TopologySnapshot, now_ms, parse_observed_addr_line,
+    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, PeerDirectory, TopologyPlanner,
+    TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
 };
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
@@ -211,7 +211,6 @@ fn build_topology_snapshot(
     connected_peers: Vec<PeerId>,
     connected_bootstrap_count: usize,
     known_peer_count: usize,
-    dial_cooldowns: &HashMap<PeerId, u64>,
     bootstrap_targets_count: usize,
     last_bootstrap_reseed_ms: u64,
     now: u64,
@@ -250,7 +249,7 @@ fn build_topology_snapshot(
         catalog_descriptors: descriptors,
         capacity,
         dial_book,
-        dial_cooldowns: dial_cooldowns.clone(),
+        dial_cooldowns: ctx.peer_dir.cooldowns(),
         bootstrap_targets_count,
         last_bootstrap_reseed_ms,
         now_ms: now,
@@ -265,6 +264,7 @@ struct TopologyMaintenanceCtx<'a> {
     nat_state: &'a Arc<NatTraversalState>,
     catalog: &'a Arc<PeerCatalog>,
     peer_store: &'a Arc<PeerScoreStore>,
+    peer_dir: &'a Arc<PeerDirectory>,
     db: &'a Option<Arc<P2PDatabase>>,
     weights: &'a PeerScoreWeights,
     log_peer_scores: bool,
@@ -401,6 +401,9 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
         if desc.peer_id == ctx.our_peer_maint {
             continue;
         }
+        // PeerDirectory is the authoritative freshness-aware store.
+        ctx.peer_dir.upsert_from_descriptor(&desc, &our_listen_addrs);
+        // DashMap stays for build_dial_plan and direct_upgrade until Step 7.
         for addr_s in &desc.observed_addrs {
             let Some((proto, addr)) = parse_observed_addr_line(addr_s) else {
                 continue;
@@ -433,6 +436,7 @@ pub(crate) async fn run_topology_maintenance_loop(
     node_role: NodeRole,
     weights: PeerScoreWeights,
     sm: Arc<SessionManager>,
+    peer_dir: Arc<PeerDirectory>,
     dial_book: Arc<DashMap<PeerId, Vec<(String, SocketAddr)>>>,
     peer_store: Arc<PeerScoreStore>,
     catalog: Arc<PeerCatalog>,
@@ -470,7 +474,7 @@ pub(crate) async fn run_topology_maintenance_loop(
     let descriptor_ttl_secs = 120u64;
     let descriptor_interval = Duration::from_secs(30);
     let mut state = MaintenanceState::new(descriptor_interval, now_ms());
-    let mut reconciler = TopologyReconciler::new();
+    let reconciler = TopologyReconciler::new();
     let planner = LegacyTopologyPlanner;
     let loop_ctx = TopologyMaintenanceCtx {
         transports_maint: &transports_maint,
@@ -480,6 +484,7 @@ pub(crate) async fn run_topology_maintenance_loop(
         nat_state: &nat_state,
         catalog: &catalog,
         peer_store: &peer_store,
+        peer_dir: &peer_dir,
         db: &db,
         weights: &weights,
         log_peer_scores,
@@ -496,7 +501,7 @@ pub(crate) async fn run_topology_maintenance_loop(
         if react_to_session_events {
             if let Some(queue) = session_redial_queue.as_ref() {
                 for peer_id in queue.drain_ready(now_ms()) {
-                    reconciler.dial_cooldowns.remove(&peer_id);
+                    peer_dir.clear_backoff(&peer_id);
                 }
             }
         }
@@ -592,11 +597,11 @@ pub(crate) async fn run_topology_maintenance_loop(
             connected_snapshot_for_policy.clone(),
             connected_bootstrap_now,
             known_peers,
-            &reconciler.dial_cooldowns,
             bootstrap_targets_maint.len(),
             state.last_bootstrap_reseed_ms,
             now,
         );
+        peer_dir.cleanup_expired(now);
         let topology_plan = planner.plan(&topology_snapshot);
         if !topology_plan.drop.is_empty() {
             crate::debug!(
@@ -606,7 +611,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 topology_plan.discovery.len(),
             );
         }
-        reconciler.execute_drops(&topology_plan.drop, &catalog, &sm).await;
+        reconciler.execute_drops(&topology_plan.drop, &catalog, &sm, &peer_dir).await;
         n = sm.distinct_peer_count();
 
         if handle_bootstrap_reseed(
@@ -699,7 +704,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &incoming_maint,
                 &our_peer_maint,
                 &maintenance_handshake_payload,
-                &mut reconciler.dial_cooldowns,
+                &peer_dir,
                 &topology_tuning,
                 loop_ctx.dial_policy.transport_order.as_slice(),
                 now,

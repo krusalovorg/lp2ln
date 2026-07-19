@@ -29,6 +29,7 @@ impl RuntimeService for TopologyService {
         let node_role = ctx.options.node_role;
         let weights = ctx.options.peer_score_weights.clone();
         let sm = ctx.session_manager.clone();
+        let peer_dir = ctx.peer_dir.clone();
         let dial_book = ctx.dial_book.clone();
         let peer_store = ctx.session_manager.peer_score_store();
         let catalog = ctx.peer_catalog.clone();
@@ -74,6 +75,7 @@ impl RuntimeService for TopologyService {
                         node_role,
                         weights.clone(),
                         sm.clone(),
+                        peer_dir.clone(),
                         dial_book.clone(),
                         peer_store.clone(),
                         catalog.clone(),
