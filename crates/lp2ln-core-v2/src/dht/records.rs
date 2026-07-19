@@ -1,16 +1,13 @@
 // DHT record types (roadmap 03 — DHT-0/1)
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-/// 256-bit XOR-metric node identifier (SHA-256 of peer_id string bytes).
-pub type NodeId = [u8; 32];
+pub use crate::types::NodeId;
+use crate::types::PeerId;
 
-/// Derive NodeId from a PeerId string.
+/// Derive NodeId from a peer_id string slice — delegates to [`PeerId::to_node_id`].
 pub fn node_id_of(peer_id: &str) -> NodeId {
-    let mut h = Sha256::new();
-    h.update(peer_id.as_bytes());
-    h.finalize().into()
+    PeerId::from(peer_id).to_node_id()
 }
 
 /// XOR distance between two NodeIds.

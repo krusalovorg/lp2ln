@@ -14,9 +14,8 @@ pub mod routing;
 pub mod service;
 pub mod store;
 
-pub use records::{
-    DHT_PROTOCOL_ID, DhtMsg, NodeId, NodeRecord, ProviderRecord, node_id_of, unix_now,
-};
+pub use crate::types::NodeId;
+pub use records::{DHT_PROTOCOL_ID, DhtMsg, NodeRecord, ProviderRecord, node_id_of, unix_now};
 pub use routing::{ALPHA, K, RoutingTable};
 pub use service::DhtService;
 pub use store::DhtStore;
