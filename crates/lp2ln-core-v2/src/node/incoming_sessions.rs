@@ -54,7 +54,7 @@ use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    AdmissionDecision, CapacityBudget, LegacyTopologyPlanner, PeerCandidate, PeerCatalog,
+    AdmissionDecision, CapacityBudget, PeerCandidate, PeerCatalog, SmartMeshPlanner,
     TopologyPlanner, TopologySnapshot, descriptor_ok_for_discovery_redirect, now_ms,
     select_peers_for_discovery_response,
 };
@@ -262,7 +262,7 @@ pub(crate) async fn run_incoming_session_handler(
                 last_bootstrap_reseed_ms: 0,
                 now_ms: now,
             };
-            if let AdmissionDecision::Redirect { .. } = LegacyTopologyPlanner.evaluate_incoming(
+            if let AdmissionDecision::Redirect { .. } = SmartMeshPlanner.evaluate_incoming(
                 &admission_snapshot,
                 &PeerCandidate { peer_id: pid.clone(), is_bootstrap_entry: false },
             ) {

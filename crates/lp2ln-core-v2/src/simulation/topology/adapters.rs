@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use super::types::{SimNodeId, SimNodeState, TopologySnapshot};
 use crate::node::options::{NodeRole, TopologyTuning};
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
-use crate::topology::{CapacityBudget, LegacyTopologyPlanner, TopologyPlanner};
+use crate::topology::{CapacityBudget, SmartMeshPlanner, TopologyPlanner};
 use crate::topology::snapshot::TopologySnapshot as RealSnapshot;
 use crate::types::PeerId;
 
@@ -186,7 +186,7 @@ impl TopologyDecisionAdapter for PlannerAdapter {
             now_ms: observation.now_ms,
         };
 
-        let plan = LegacyTopologyPlanner.plan(&real_snap);
+        let plan = SmartMeshPlanner.plan(&real_snap);
 
         let mut node_plan = NodeActionPlan::default();
         for intent in plan.dial.into_iter().take(self.max_new_dials_per_tick) {

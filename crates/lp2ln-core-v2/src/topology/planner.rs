@@ -407,7 +407,7 @@ impl TopologyPlanner for LegacyTopologyPlanner {
 }
 
 /// Mirrors `incoming_sessions::adaptive_bootstrap_hard_limit`.
-fn adaptive_bootstrap_hard_limit(
+pub(crate) fn adaptive_bootstrap_hard_limit(
     tuning: &TopologyTuning,
     policy: &crate::peer_score::PeerConnectionPolicy,
     known_peers: usize,

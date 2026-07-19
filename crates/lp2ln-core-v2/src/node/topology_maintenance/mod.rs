@@ -32,7 +32,7 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, LegacyTopologyPlanner, PeerCatalog, PeerDirectory, TopologyPlanner,
+    CapacityBudget, PeerCatalog, PeerDirectory, SmartMeshPlanner, TopologyPlanner,
     TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
 };
 use crate::transport::{Transport, TunnelPunchParams};
@@ -475,7 +475,8 @@ pub(crate) async fn run_topology_maintenance_loop(
     let descriptor_interval = Duration::from_secs(30);
     let mut state = MaintenanceState::new(descriptor_interval, now_ms());
     let reconciler = TopologyReconciler::new();
-    let planner = LegacyTopologyPlanner;
+    // ponytail: feature-gate LegacyTopologyPlanner fallback in step 8 for safe migration rollout
+    let planner = SmartMeshPlanner;
     let loop_ctx = TopologyMaintenanceCtx {
         transports_maint: &transports_maint,
         router_maint: &router_maint,
@@ -714,7 +715,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 state.last_exploration_ms = now;
             }
         }
-        // Bootstrap shedding is now handled by LegacyTopologyPlanner (Pass 4) above.
+        // Bootstrap shedding is handled by the planner's capacity ceiling pass above.
         n = sm.distinct_peer_count();
         let now = now_ms();
 
