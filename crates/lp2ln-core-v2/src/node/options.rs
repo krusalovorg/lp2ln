@@ -244,20 +244,19 @@ pub fn default_app_plane_path() -> String {
     }
 }
 
-/// Opt-in skeletons for DHT / content / repair / App Plane.
+/// DHT / content / repair / App Plane feature flags.
 ///
-/// All flags default to `false`. The default daemon does **not** start these
-/// as a production lifecycle; enabling a flag is an explicit experimental
-/// surface until the P4 content-runtime gate.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// `dht` and `content` default to `true` — nodes ship with content routing
+/// enabled. `repair` and `app_plane` remain opt-in until their gates close.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExperimentalOptions {
-    /// DHT library + future background lifecycle. Off by default.
-    #[serde(default)]
+    /// DHT provider records + routing. On by default.
+    #[serde(default = "default_true")]
     pub dht: bool,
-    /// Local BlockStore / content debug commands. Off by default.
-    #[serde(default)]
+    /// Block store + block transfer service. On by default.
+    #[serde(default = "default_true")]
     pub content: bool,
-    /// RepairWorker background loop. Off by default; requires content+dht when wired.
+    /// RepairWorker background loop. Off by default; requires content+dht.
     #[serde(default)]
     pub repair: bool,
     /// Binary App Plane IPC server (local UDS/named pipe). Off by default.
@@ -269,6 +268,19 @@ pub struct ExperimentalOptions {
     /// Max pushed blocks this node accepts before refusing further pushes (0 = unlimited).
     #[serde(default)]
     pub content_max_local_blocks: usize,
+}
+
+impl Default for ExperimentalOptions {
+    fn default() -> Self {
+        Self {
+            dht: true,
+            content: true,
+            repair: false,
+            app_plane: false,
+            dht_max_records: 0,
+            content_max_local_blocks: 0,
+        }
+    }
 }
 
 impl ExperimentalOptions {
@@ -874,15 +886,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn experimental_defaults_all_off() {
+    fn experimental_defaults() {
+        // dht + content are on by default; repair + app_plane remain opt-in.
         let opts = NodeOptions::empty();
-        assert!(!opts.experimental.any_enabled());
-        assert!(!opts.experimental.dht);
-        assert!(!opts.experimental.content);
+        assert!(opts.experimental.dht);
+        assert!(opts.experimental.content);
         assert!(!opts.experimental.repair);
         assert!(!opts.experimental.app_plane);
+        assert!(opts.experimental.any_enabled());
 
+        // serde: missing fields get their defaults (dht/content → true).
         let parsed: ExperimentalOptions = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, ExperimentalOptions::default());
+        assert!(parsed.dht);
+        assert!(parsed.content);
+
+        // explicit false is honoured.
+        let disabled: ExperimentalOptions =
+            serde_json::from_str(r#"{"dht":false,"content":false}"#).unwrap();
+        assert!(!disabled.dht);
+        assert!(!disabled.content);
     }
 }
