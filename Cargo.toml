@@ -5,6 +5,7 @@ members = [
   "crates/lp2ln-db-export",
   "crates/lp2ln-app-protocol",
   "crates/lp2ln-app-sdk",
+  "crates/lp2ln-content",
 ]
 exclude = [
   "archive/lp2ln-core",

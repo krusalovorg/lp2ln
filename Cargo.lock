@@ -1991,6 +1991,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lp2ln-content"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "hex",
+ "postcard",
+ "rand 0.9.2",
+ "redb",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lp2ln-core-v2"
 version = "0.0.2"
 dependencies = [
@@ -2014,6 +2028,7 @@ dependencies = [
  "k256",
  "lazy_static",
  "lp2ln-app-protocol",
+ "lp2ln-content",
  "postcard",
  "quinn",
  "rand 0.9.2",

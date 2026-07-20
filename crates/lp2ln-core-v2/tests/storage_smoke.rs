@@ -1,13 +1,10 @@
-// M5 smoke tests — storage layer: encrypt, manifest, lease.
-// Magic folder tests live in lp2ln-magic-folder/tests/storage_smoke.rs.
-
 use std::sync::Arc;
 
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::storage::encrypt::{CHUNK_SIZE, decrypt_chunk, encrypt_chunk, generate_key};
-use lp2ln_core_v2::storage::lease::{LeaseStore, ReplicaLease};
+use lp2ln_core_v2::storage::lease::ReplicaLease;
 use lp2ln_core_v2::storage::manifest::{DirEntry, DirectoryManifest, FileManifest};
-use lp2ln_core_v2::storage::{BlockStore, ContentId};
+use lp2ln_core_v2::storage::{ContentId, block_store_from_db, lease_store_from_db};
 
 fn temp_db() -> Arc<P2PDatabase> {
     let dir = std::env::temp_dir().join(format!("lp2ln_storage_smoke_{}", uuid::Uuid::new_v4()));
@@ -69,7 +66,7 @@ fn reencrypt_same_index_fresh_nonce() {
 #[test]
 fn file_manifest_store_load_roundtrip() {
     let db = temp_db();
-    let store = BlockStore::new(db);
+    let store = block_store_from_db(db);
     let key = generate_key();
     let manifest = FileManifest {
         original_name: "hello.txt".to_string(),
@@ -140,7 +137,7 @@ fn dir_manifest_versioning_and_tombstone() {
 #[test]
 fn dir_manifest_store_load() {
     let db = temp_db();
-    let store = BlockStore::new(db);
+    let store = block_store_from_db(db);
     let mut dm = DirectoryManifest::new([5u8; 32]);
     dm.apply(DirEntry {
         path: "readme.md".to_string(),
@@ -160,7 +157,7 @@ fn dir_manifest_store_load() {
 #[test]
 fn lease_store_put_get_count() {
     let db = temp_db();
-    let ls = LeaseStore::new(db);
+    let ls = lease_store_from_db(db);
     let cid: ContentId = [7u8; 32];
 
     let lease = ReplicaLease {

@@ -1287,7 +1287,7 @@ async fn block_put(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
             });
         }
     };
-    let store = lp2ln_core_v2::storage::BlockStore::new(db);
+    let store = lp2ln_core_v2::storage::block_store_from_db(db);
     match store.put(&data) {
         Ok(id) => json!({
             "event": "command_result", "ts_ms": now_ms(),
@@ -1326,7 +1326,7 @@ async fn block_get(db: Option<Arc<P2PDatabase>>, value: &Value) -> Value {
             });
         }
     };
-    let store = lp2ln_core_v2::storage::BlockStore::new(db);
+    let store = lp2ln_core_v2::storage::block_store_from_db(db);
     match store.get(&cid) {
         Ok(Some(data)) => json!({
             "event": "command_result", "ts_ms": now_ms(),

@@ -1,0 +1,21 @@
+[package]
+name = "lp2ln-content"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "LP2LN pure content primitives (IDs, encrypt, manifests, block store)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chacha20poly1305 = "0.10.1"
+hex = "0.4.3"
+postcard = { version = "1", features = ["alloc"] }
+rand = { version = "0.9.1", features = ["std"] }
+redb = "2.4.0"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10.8"
+thiserror = "2"
+
+[lib]
+name = "lp2ln_content"
+path = "src/lib.rs"

@@ -1,4 +1,4 @@
-//! content encryption invariant
+//! Content encryption invariant
 //!
 //! # Strategy (chosen)
 //!
@@ -28,6 +28,8 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
+
+use crate::error::ContentError;
 
 /// MVP plaintext chunk size before encryption.
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
@@ -61,7 +63,7 @@ pub fn encrypt_chunk(
     key: &ChunkKey,
     chunk_index: u32,
     plaintext: &[u8],
-) -> anyhow::Result<Vec<u8>> {
+) -> Result<Vec<u8>, ContentError> {
     let nonce_bytes = random_nonce();
     let nonce = XNonce::from_slice(&nonce_bytes);
     let aad = aad_for_index(chunk_index);
@@ -74,7 +76,7 @@ pub fn encrypt_chunk(
                 aad: &aad,
             },
         )
-        .map_err(|_| anyhow::anyhow!("chunk {chunk_index} encryption failed"))?;
+        .map_err(|_| ContentError::Crypto(format!("chunk {chunk_index} encryption failed")))?;
 
     let mut envelope = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     envelope.extend_from_slice(&nonce_bytes);
@@ -85,12 +87,16 @@ pub fn encrypt_chunk(
 /// Decrypt a chunk envelope produced by [`encrypt_chunk`].
 ///
 /// `chunk_index` must match the AAD used at encrypt time.
-pub fn decrypt_chunk(key: &ChunkKey, chunk_index: u32, envelope: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_chunk(
+    key: &ChunkKey,
+    chunk_index: u32,
+    envelope: &[u8],
+) -> Result<Vec<u8>, ContentError> {
     if envelope.len() <= NONCE_LEN {
-        anyhow::bail!(
+        return Err(ContentError::Crypto(format!(
             "chunk {chunk_index} envelope too short ({} bytes)",
             envelope.len()
-        );
+        )));
     }
     let (nonce_bytes, ciphertext) = envelope.split_at(NONCE_LEN);
     let nonce = XNonce::from_slice(nonce_bytes);
@@ -104,7 +110,7 @@ pub fn decrypt_chunk(key: &ChunkKey, chunk_index: u32, envelope: &[u8]) -> anyho
                 aad: &aad,
             },
         )
-        .map_err(|_| anyhow::anyhow!("chunk {chunk_index} decryption failed"))
+        .map_err(|_| ContentError::Crypto(format!("chunk {chunk_index} decryption failed")))
 }
 
 /// Extract the stored nonce from an envelope (for tests / diagnostics).
@@ -152,8 +158,6 @@ mod tests {
 
     #[test]
     fn same_index_reencrypt_uses_fresh_nonce() {
-        // Cross-version / in-place rewrite under the same file key must not
-        // reuse a nonce (the old chunk_index-derived scheme failed this).
         let key = generate_key();
         let a = encrypt_chunk(&key, 0, b"version-a").unwrap();
         let b = encrypt_chunk(&key, 0, b"version-b").unwrap();
@@ -177,8 +181,6 @@ mod tests {
 
     #[test]
     fn cross_file_keys_independent() {
-        // Two files (distinct keys) encrypting chunk 0 must not share nonce space
-        // in a way that couples security — each envelope carries its own nonce.
         let key_a = generate_key();
         let key_b = generate_key();
         let a = encrypt_chunk(&key_a, 0, b"file-a").unwrap();
