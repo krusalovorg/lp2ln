@@ -1,4 +1,5 @@
 pub(crate) mod bootstrap;
+pub(crate) mod content;
 pub(crate) mod context;
 pub(crate) mod direct_upgrade;
 pub(crate) mod flow_trace;

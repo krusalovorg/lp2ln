@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::event_core::prelude::{CoreBus, HandlerRegistration};
 use crate::nat::NatTraversalState;
 use crate::node::options::NodeOptions;
@@ -59,6 +61,8 @@ pub(crate) struct StartupContext<'a> {
     pub event_handler_regs: &'a mut Vec<HandlerRegistration>,
     pub lifecycle: &'a Mutex<NodeLifecycleState>,
     pub bootstrap_targets: Option<Vec<crate::node::options::BootstrapNode>>,
+    pub dht_svc: Option<Arc<DhtService>>,
+    pub block_transfer_svc: Option<Arc<BlockTransferService>>,
 }
 
 pub(crate) trait RuntimeService: Send + Sync {

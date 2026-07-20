@@ -14,6 +14,7 @@
 //! after encrypt-then-hash. See `encrypt` module docs.
 
 pub mod block_transfer;
+pub mod dht;
 pub mod repair;
 
 use std::sync::Arc;
@@ -28,6 +29,9 @@ pub use lp2ln_content::{
     BlockStore as BlockStoreTrait, ContentError, ContentId, FsBlockStore, MemoryBlockStore,
     RedbBlockStore, content_id_from_hex, content_id_hex, hash_bytes,
 };
+
+pub use block_transfer::BlockTransferService;
+pub use dht::{DhtService, DhtStore, ProviderRecord};
 
 pub type BlockStore = RedbBlockStore;
 

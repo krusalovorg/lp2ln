@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use crate::node::options::NodeRole;
 use crate::node::runtime::NodeRuntime;
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::node::runtime::health::{RuntimeHealthSnapshot, RuntimeMode};
 use crate::node::runtime::lifecycle::NodeLifecycleState;
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
@@ -110,5 +112,13 @@ impl NodeRuntime {
 
     pub fn peer_score_weights(&self) -> &PeerScoreWeights {
         &self.options.peer_score_weights
+    }
+
+    pub fn dht_service(&self) -> Option<Arc<DhtService>> {
+        self.dht_svc.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn block_transfer_service(&self) -> Option<Arc<BlockTransferService>> {
+        self.block_transfer_svc.lock().ok().and_then(|g| g.clone())
     }
 }

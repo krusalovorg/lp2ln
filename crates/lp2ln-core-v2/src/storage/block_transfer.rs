@@ -1,11 +1,15 @@
-// M5 — peer-to-peer block transfer protocol.
+// P4 — peer-to-peer block transfer protocol.
 //
 // BLOCK_PROTOCOL_ID rides on App Plane (same pattern as DHT).
-// Pull: Request → Response (None = not found).
-// Push: Push → PushAck (for replication; receiver verifies hash before storing).
-// Hash is always verified on receipt; corrupted/wrong providers are silently skipped.
+// Pull:  Request  → Response (None = not found).
+// Push:  Push     → PushAck(stored=true) — receiver verifies hash and durably
+//                   stores before acking; sender awaits ack.
+//
+// Limits: Push payload > MAX_BLOCK_SIZE is rejected (stored=false ack).
+//         max_local_blocks > 0 caps how many pushed blocks this node accepts.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -18,6 +22,7 @@ use crate::router::Router;
 use crate::storage::{BlockStore, ContentId, hash_bytes};
 
 pub const BLOCK_PROTOCOL_ID: u16 = 0x424C; // "BL"
+pub const MAX_BLOCK_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockMsg {
@@ -32,9 +37,11 @@ pub enum BlockMsg {
     Push {
         content_id: ContentId,
         data: Vec<u8>,
+        request_id: u64,
     },
     PushAck {
         content_id: ContentId,
+        request_id: u64,
         stored: bool,
     },
 }
@@ -44,7 +51,10 @@ pub struct BlockTransferService {
     router: Arc<Router>,
     local_peer_id: String,
     pending: DashMap<u64, oneshot::Sender<Option<Vec<u8>>>>,
+    push_ack_pending: DashMap<u64, oneshot::Sender<bool>>,
     next_rid: std::sync::atomic::AtomicU64,
+    max_local_blocks: usize,
+    received_blocks: AtomicUsize,
 }
 
 impl BlockTransferService {
@@ -52,13 +62,17 @@ impl BlockTransferService {
         store: BlockStore,
         router: Arc<Router>,
         local_peer_id: impl Into<String>,
+        max_local_blocks: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             router,
             local_peer_id: local_peer_id.into(),
             pending: DashMap::new(),
+            push_ack_pending: DashMap::new(),
             next_rid: std::sync::atomic::AtomicU64::new(1),
+            max_local_blocks,
+            received_blocks: AtomicUsize::new(0),
         })
     }
 
@@ -110,17 +124,31 @@ impl BlockTransferService {
                     tx.send(data).ok();
                 }
             }
-            BlockMsg::Push { content_id, data } => {
-                let stored = if hash_bytes(&data) == content_id {
-                    self.store.put(&data).is_ok()
+            BlockMsg::Push { content_id, data, request_id } => {
+                let stored = if data.len() > MAX_BLOCK_SIZE {
+                    false
+                } else if self.max_local_blocks > 0
+                    && self.received_blocks.load(Ordering::Relaxed) >= self.max_local_blocks
+                {
+                    false
+                } else if hash_bytes(&data) == content_id {
+                    let ok = self.store.put(&data).is_ok();
+                    if ok {
+                        self.received_blocks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ok
                 } else {
                     false
                 };
-                self.send_msg(from, &BlockMsg::PushAck { content_id, stored })
+                self.send_msg(from, &BlockMsg::PushAck { content_id, request_id, stored })
                     .await
                     .ok();
             }
-            BlockMsg::PushAck { .. } => {}
+            BlockMsg::PushAck { request_id, stored, .. } => {
+                if let Some((_, tx)) = self.push_ack_pending.remove(&request_id) {
+                    tx.send(stored).ok();
+                }
+            }
         }
     }
 
@@ -180,15 +208,35 @@ impl BlockTransferService {
         anyhow::bail!("no valid provider for {}", hex::encode(content_id))
     }
 
-    /// Push a block to a peer for replication.
+    /// Push a block to `peer_id`; waits for PushAck confirming durable store.
     pub async fn push_to(
         &self,
         peer_id: &str,
         content_id: ContentId,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        self.send_msg(peer_id, &BlockMsg::Push { content_id, data })
+        let rid = self.next_rid();
+        let (tx, rx) = oneshot::channel();
+        self.push_ack_pending.insert(rid, tx);
+        match self
+            .send_msg(peer_id, &BlockMsg::Push { content_id, data, request_id: rid })
             .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                self.push_ack_pending.remove(&rid);
+                return Err(e);
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(anyhow::anyhow!("peer {} did not store block", peer_id)),
+            Ok(Err(_)) => Err(anyhow::anyhow!("push ack channel closed")),
+            Err(_) => {
+                self.push_ack_pending.remove(&rid);
+                Err(anyhow::anyhow!("timeout waiting for PushAck from {}", peer_id))
+            }
+        }
     }
 
     pub fn spawn(self: Arc<Self>, cancel: CancellationToken) {

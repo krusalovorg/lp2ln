@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::NodeKeypair;
 use crate::crypto::peer_cache::PeerCryptoCache;
 use crate::db::P2PDatabase;
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::event_core::prelude::{CoreBus, HandlerRegistration};
 use crate::logger;
 use crate::nat::NatTraversalState;
@@ -57,6 +59,8 @@ pub struct NodeRuntime {
     pub(crate) degradation_stop_tx: Mutex<Option<mpsc::Sender<()>>>,
     pub(crate) stop_notifier: Arc<Notify>,
     pub(crate) stop_on_degradation_armed: AtomicBool,
+    pub(crate) dht_svc: Mutex<Option<Arc<DhtService>>>,
+    pub(crate) block_transfer_svc: Mutex<Option<Arc<BlockTransferService>>>,
 }
 
 impl NodeRuntime {
@@ -167,6 +171,8 @@ impl NodeRuntime {
             degradation_stop_tx: Mutex::new(None),
             stop_notifier: Arc::new(Notify::new()),
             stop_on_degradation_armed: AtomicBool::new(false),
+            dht_svc: Mutex::new(None),
+            block_transfer_svc: Mutex::new(None),
         }
     }
 

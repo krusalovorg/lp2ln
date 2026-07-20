@@ -12,6 +12,7 @@ use crate::node::runtime::events::runtime_lifecycle_event;
 use crate::node::runtime::health_bridge::RuntimeHealthBridge;
 use crate::node::runtime::lifecycle::{NodeLifecycleError, NodeLifecycleState};
 use crate::node::runtime::startup::bootstrap::{BootstrapService, TransportListenerService};
+use crate::node::runtime::startup::content::{BlockTransferRuntimeService, DhtRuntimeService};
 use crate::node::runtime::startup::context::{RuntimeService, StartupContext};
 use crate::node::runtime::startup::direct_upgrade::DirectUpgradeService;
 use crate::node::runtime::startup::flow_trace::FlowTraceRuntimeService;
@@ -191,6 +192,8 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         event_handler_regs: &mut runtime.event_handler_regs,
         lifecycle: &runtime.lifecycle,
         bootstrap_targets: None,
+        dht_svc: None,
+        block_transfer_svc: None,
     };
 
     let services: Vec<Box<dyn RuntimeService>> = vec![
@@ -202,11 +205,24 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         Box::new(BootstrapService),
         Box::new(TopologyService),
         Box::new(LanDiscoveryService),
+        Box::new(DhtRuntimeService),
+        Box::new(BlockTransferRuntimeService),
     ];
     for service in services {
         if service.enabled(&startup_ctx) {
             crate::debug!("[NodeRuntime] spawning service: {}", service.name());
             service.spawn(&mut startup_ctx)?;
+        }
+    }
+
+    if let Some(svc) = startup_ctx.dht_svc.take() {
+        if let Ok(mut g) = runtime.dht_svc.lock() {
+            *g = Some(svc);
+        }
+    }
+    if let Some(svc) = startup_ctx.block_transfer_svc.take() {
+        if let Ok(mut g) = runtime.block_transfer_svc.lock() {
+            *g = Some(svc);
         }
     }
 

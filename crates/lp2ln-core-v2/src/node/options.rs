@@ -263,11 +263,21 @@ pub struct ExperimentalOptions {
     /// Binary App Plane IPC server (local UDS/named pipe). Off by default.
     #[serde(default)]
     pub app_plane: bool,
+    /// Max records in the in-memory DHT store (0 → 4096).
+    #[serde(default)]
+    pub dht_max_records: usize,
+    /// Max pushed blocks this node accepts before refusing further pushes (0 = unlimited).
+    #[serde(default)]
+    pub content_max_local_blocks: usize,
 }
 
 impl ExperimentalOptions {
     pub fn any_enabled(&self) -> bool {
         self.dht || self.content || self.repair || self.app_plane
+    }
+
+    pub fn effective_dht_max_records(&self) -> usize {
+        if self.dht_max_records == 0 { 4096 } else { self.dht_max_records }
     }
 }
 
