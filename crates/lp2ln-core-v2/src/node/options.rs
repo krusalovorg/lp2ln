@@ -48,7 +48,7 @@ impl BootstrapNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub enum AdaptiveTopologyProfile {
     Conservative,
     #[default]
@@ -202,6 +202,48 @@ impl Default for IpcTcpOptions {
     }
 }
 
+/// Local App Plane IPC endpoint (AD-07: UDS / named pipe by default).
+///
+/// Gated by [`ExperimentalOptions::app_plane`]. Loopback TCP is opt-in via
+/// [`Self::dev_tcp_bind`] for debug only — never the production default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPlaneIpcOptions {
+    /// Unix: filesystem socket path. Windows: `\\.\pipe\…` or pipe name.
+    #[serde(default = "default_app_plane_path")]
+    pub path: String,
+    /// Optional loopback TCP bind (e.g. `127.0.0.1:17999`). Empty/None = off.
+    #[serde(default)]
+    pub dev_tcp_bind: Option<String>,
+    /// If set, `Hello.token` must match (P3-04). `None` = no token required.
+    #[serde(default)]
+    pub app_token: Option<String>,
+    /// Allowed `protocol_id`s. Empty = allow any (open registry).
+    #[serde(default)]
+    pub allowed_protocol_ids: Vec<u16>,
+}
+
+impl Default for AppPlaneIpcOptions {
+    fn default() -> Self {
+        Self {
+            path: default_app_plane_path(),
+            dev_tcp_bind: None,
+            app_token: None,
+            allowed_protocol_ids: Vec::new(),
+        }
+    }
+}
+
+pub fn default_app_plane_path() -> String {
+    #[cfg(windows)]
+    {
+        r"\\.\pipe\lp2ln-app".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "/tmp/lp2ln-app.sock".to_string()
+    }
+}
+
 /// Opt-in skeletons for DHT / content / repair / App Plane.
 ///
 /// All flags default to `false`. The default daemon does **not** start these
@@ -218,7 +260,7 @@ pub struct ExperimentalOptions {
     /// RepairWorker background loop. Off by default; requires content+dht when wired.
     #[serde(default)]
     pub repair: bool,
-    /// Binary App Plane IPC server. Off by default (not started by lp2lnd yet).
+    /// Binary App Plane IPC server (local UDS/named pipe). Off by default.
     #[serde(default)]
     pub app_plane: bool,
 }
@@ -365,6 +407,8 @@ pub struct NodeOptions {
     pub flow_trace: FlowTraceOptions,
     pub debug_server: DebugServerOptions,
     pub ipc_tcp: IpcTcpOptions,
+    /// Local App Plane IPC path / optional dev TCP (see [`AppPlaneIpcOptions`]).
+    pub app_plane_ipc: AppPlaneIpcOptions,
     pub direct_upgrade: DirectUpgradeConfig,
     pub session_join_timeout_secs: u64,
     pub supervisor_shutdown_timeout_secs: u64,
@@ -386,6 +430,10 @@ pub struct NodeOptions {
     pub topology_react_to_session_events: bool,
     pub dial_policy: DialPolicy,
     pub lan_discovery: LanDiscoveryOptions,
+    /// Config schema version (P3-07). Missing on disk ⇒ treated as 1 at load.
+    pub schema_version: u32,
+    /// Named topology profile (public surface). Synced into `topology_tuning.adaptive_profile`.
+    pub topology_profile: AdaptiveTopologyProfile,
 }
 
 impl Default for NodeOptions {
@@ -417,6 +465,7 @@ impl NodeOptions {
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
             ipc_tcp: IpcTcpOptions::default(),
+            app_plane_ipc: AppPlaneIpcOptions::default(),
             direct_upgrade: DirectUpgradeConfig::default(),
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
@@ -431,6 +480,8 @@ impl NodeOptions {
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
             lan_discovery: LanDiscoveryOptions::default(),
+            schema_version: super::config_v2::CONFIG_SCHEMA_VERSION,
+            topology_profile: AdaptiveTopologyProfile::default(),
             logger_options: Some(LoggerOptions {
                 log_dir: Some(PathBuf::from("./logs")),
                 file_enabled: true,
@@ -466,6 +517,7 @@ impl NodeOptions {
             flow_trace: FlowTraceOptions::default(),
             debug_server: DebugServerOptions::default(),
             ipc_tcp: IpcTcpOptions::default(),
+            app_plane_ipc: AppPlaneIpcOptions::default(),
             direct_upgrade: DirectUpgradeConfig::default(),
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
@@ -480,6 +532,8 @@ impl NodeOptions {
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
             lan_discovery: LanDiscoveryOptions::default(),
+            schema_version: super::config_v2::CONFIG_SCHEMA_VERSION,
+            topology_profile: AdaptiveTopologyProfile::default(),
             logger_options: Some(LoggerOptions::default()),
         }
     }

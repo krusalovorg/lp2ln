@@ -1,0 +1,15 @@
+[package]
+name = "lp2ln-app-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "LP2LN App Plane client SDK for sidecars"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lp2ln-app-protocol = { path = "../lp2ln-app-protocol" }
+tokio = { version = "1.28", features = ["full"] }
+
+[lib]
+name = "lp2ln_app_sdk"
+path = "src/lib.rs"

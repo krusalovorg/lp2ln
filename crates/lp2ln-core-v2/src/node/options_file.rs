@@ -14,9 +14,9 @@ use crate::transport::quic::QuicTransportOptions;
 use crate::types::PeerId;
 
 use super::options::{
-    BootstrapNode, DebugServerOptions, DialPolicy, DirectUpgradeConfig, FlowTraceOptions,
-    IpcTcpOptions, LanDiscoveryOptions, NodeOptions, NodeRole, TopologyTuning,
-    default_transport_obfuscation,
+    AdaptiveTopologyProfile, AppPlaneIpcOptions, BootstrapNode, DebugServerOptions, DialPolicy,
+    DirectUpgradeConfig, FlowTraceOptions, IpcTcpOptions, LanDiscoveryOptions, NodeOptions,
+    NodeRole, TopologyTuning, default_transport_obfuscation,
 };
 
 pub(super) fn from_file(path: impl AsRef<Path>) -> Result<NodeOptions, String> {
@@ -54,6 +54,9 @@ struct LoggerOptionsFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeOptionsFile {
+    /// Absent ⇒ schema v1. Current public schema is 2 (P3-07).
+    #[serde(default)]
+    schema_version: Option<u32>,
     #[serde(default)]
     listens: HashMap<String, String>,
     #[serde(default)]
@@ -82,6 +85,9 @@ struct NodeOptionsFile {
     /// Deprecated: `bootstrap_join` is treated as `regular` (seed = address book).
     #[serde(default)]
     node_role: NodeRole,
+    /// Public named topology profile (P3-07). Overrides `topology_tuning.adaptive_profile`.
+    #[serde(default)]
+    topology_profile: Option<AdaptiveTopologyProfile>,
     #[serde(default)]
     catalog_max_peers: Option<u64>,
     #[serde(default = "default_peer_discovery_random_fraction")]
@@ -100,6 +106,8 @@ struct NodeOptionsFile {
     debug_server: DebugServerOptions,
     #[serde(default)]
     ipc_tcp: IpcTcpOptions,
+    #[serde(default)]
+    app_plane_ipc: AppPlaneIpcOptions,
     #[serde(default)]
     direct_upgrade: DirectUpgradeConfig,
     #[serde(default = "default_router_incoming_queue_cap")]
@@ -197,6 +205,13 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
     type Error = String;
 
     fn try_from(file: NodeOptionsFile) -> Result<Self, String> {
+        let schema_version = file.schema_version.unwrap_or(1);
+        let topology_profile = file
+            .topology_profile
+            .unwrap_or_else(|| file.topology_tuning.adaptive_profile.clone());
+        let mut topology_tuning = file.topology_tuning;
+        topology_tuning.adaptive_profile = topology_profile.clone();
+
         let mut options = Self {
             listens: DashMap::new(),
             advertise_addrs: HashMap::new(),
@@ -230,10 +245,11 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
                 map
             },
             quic: file.quic,
-            topology_tuning: file.topology_tuning,
+            topology_tuning,
             flow_trace: file.flow_trace,
             debug_server: file.debug_server,
             ipc_tcp: file.ipc_tcp,
+            app_plane_ipc: file.app_plane_ipc,
             direct_upgrade: file.direct_upgrade,
             session_join_timeout_secs: 2,
             supervisor_shutdown_timeout_secs: 10,
@@ -248,6 +264,8 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             topology_react_to_session_events: file.topology_react_to_session_events,
             dial_policy: file.dial_policy,
             lan_discovery: file.lan_discovery,
+            schema_version,
+            topology_profile,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -362,6 +380,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             )
         };
         Self {
+            schema_version: Some(opts.schema_version.max(1)),
             listens,
             advertise_addrs,
             default_nodes,
@@ -378,6 +397,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
                 .map(|p| p.to_string_lossy().into_owned()),
             log_peer_score_snapshot: opts.log_peer_score_snapshot,
             node_role: opts.node_role,
+            topology_profile: Some(opts.topology_profile.clone()),
             catalog_max_peers: opts.catalog_max_peers.map(|n| n as u64),
             peer_discovery_random_fraction: opts.peer_discovery_random_fraction,
             transport_obfuscation: opts.transport_obfuscation.clone(),
@@ -391,6 +411,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             flow_trace: opts.flow_trace.clone(),
             debug_server: opts.debug_server.clone(),
             ipc_tcp: opts.ipc_tcp.clone(),
+            app_plane_ipc: opts.app_plane_ipc.clone(),
             direct_upgrade: opts.direct_upgrade.clone(),
             router_incoming_queue_cap: opts.router_incoming_queue_cap,
             router_broadcast_cap: opts.router_broadcast_cap,

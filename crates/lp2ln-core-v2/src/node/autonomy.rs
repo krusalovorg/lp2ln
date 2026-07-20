@@ -116,8 +116,14 @@ impl ConfigAutonomy {
                 ));
             }
         };
-        let candidate = match NodeOptions::from_json(&raw) {
-            Ok(v) => v,
+        let candidate = match crate::node::config_v2::load_json_with_report(&raw) {
+            Ok((v, report)) => {
+                for w in report.all_soft_messages() {
+                    self.journal
+                        .append_event("diagnose", json!({"warning": w}));
+                }
+                v
+            }
             Err(err) => {
                 self.journal
                     .append_event("rollback", json!({"reason": "parse_failed", "error": err}));
@@ -448,6 +454,40 @@ mod tests {
             .load_startup(NodeOptions::new)
             .expect("must fallback to lkg");
         assert_eq!(second.source, StartupConfigSource::LastKnownGood);
+    }
+
+    #[test]
+    fn startup_uses_lkg_after_strict_validation_failure() {
+        let path = temp_test_path("core-autonomy-strict-fail");
+        let engine = ConfigAutonomy::new(Some(path.clone()));
+        let valid = NodeOptions::new();
+        valid.save(&path).expect("save valid");
+        let _ = engine.load_startup(NodeOptions::new).expect("seed lkg");
+
+        // Empty listens → strict error → LKG
+        fs::write(&path, r#"{"schema_version":2,"listens":{}}"#).expect("write bad");
+        let rolled = engine
+            .load_startup(NodeOptions::new)
+            .expect("rollback");
+        assert_eq!(rolled.source, StartupConfigSource::LastKnownGood);
+        assert!(!rolled.options.listens.is_empty());
+    }
+
+    #[test]
+    fn v1_config_still_loads() {
+        let path = temp_test_path("core-autonomy-v1");
+        fs::write(
+            &path,
+            r#"{
+                "listens": {"tcp": "127.0.0.1:0"},
+                "allow_unsigned_packets": true
+            }"#,
+        )
+        .unwrap();
+        let engine = ConfigAutonomy::new(Some(path));
+        let loaded = engine.load_startup(NodeOptions::new).unwrap();
+        assert_eq!(loaded.source, StartupConfigSource::PrimaryConfig);
+        assert_eq!(loaded.options.schema_version, 1);
     }
 
     fn temp_test_path(name: &str) -> PathBuf {

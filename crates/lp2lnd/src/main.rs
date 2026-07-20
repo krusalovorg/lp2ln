@@ -1,16 +1,19 @@
 use core::fmt;
 mod app_plane_server;
+mod app_plane_streams;
 mod debug_server;
 mod ipc_tcp;
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::logger::info;
 use lp2ln_core_v2::node::{
-    ConfigAutonomy, NodeBuilder, NodeOptions, StartupConfigSource, health_server,
+    ConfigAutonomy, NodeBuilder, NodeOptions, StartupConfigSource, check_file, health_server,
+    migrate_file, public_example_json,
 };
 use lp2ln_core_v2::peer_score::PeerConnectionPolicy;
 use std::env;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 
 #[derive(Default)]
@@ -39,6 +42,88 @@ fn parse_args() -> Args {
     result
 }
 
+fn resolve_options_path(cli: &str) -> Option<String> {
+    if !cli.is_empty() {
+        return Some(cli.to_string());
+    }
+    let default_path = PathBuf::from("./options.json");
+    if default_path.exists() {
+        Some(default_path.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn run_config_cli(args: &[String]) -> ExitCode {
+    let sub = args.get(2).map(String::as_str).unwrap_or("help");
+    let mut options_path = String::new();
+    for (i, item) in args.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let prev = &args[i - 1];
+        if (prev == "-o" || prev == "--options") && !item.starts_with('-') {
+            options_path = item.clone();
+        }
+    }
+
+    match sub {
+        "example" => {
+            println!("{}", public_example_json());
+            ExitCode::SUCCESS
+        }
+        "check" => {
+            let Some(path) = resolve_options_path(&options_path) else {
+                eprintln!("config check: pass -o <path> or create ./options.json");
+                return ExitCode::from(2);
+            };
+            match check_file(&path) {
+                Ok(report) => {
+                    println!("{}", report.exit_message());
+                    if report.validation.is_strict_ok() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("config check failed: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "migrate" => {
+            let Some(path) = resolve_options_path(&options_path) else {
+                eprintln!("config migrate: pass -o <path> or create ./options.json");
+                return ExitCode::from(2);
+            };
+            match migrate_file(&path) {
+                Ok(_) => {
+                    println!("migrated {path} to schema_version=2");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("config migrate failed: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        "help" | "-h" | "--help" => {
+            eprintln!(
+                "Usage:\n  lp2lnd config example\n  lp2lnd config check [-o path]\n  lp2lnd config migrate [-o path]"
+            );
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unknown config subcommand '{other}'");
+            eprintln!(
+                "Usage:\n  lp2lnd config example\n  lp2lnd config check [-o path]\n  lp2lnd config migrate [-o path]"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn developer_options() -> NodeOptions {
     NodeOptions::empty()
         .with_listen("udp", "0.0.0.0:8080".parse().unwrap())
@@ -61,8 +146,27 @@ fn developer_options() -> NodeOptions {
         })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    let argv: Vec<String> = env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("config") {
+        return run_config_cli(&argv);
+    }
+
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run_daemon())
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("lp2lnd error: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_daemon() -> anyhow::Result<()> {
     lp2ln_core_v2::info!("[Main] Starting LP2LN-Demon");
     #[cfg(feature = "tokio-console")]
     {
@@ -75,16 +179,7 @@ async fn main() -> anyhow::Result<()> {
     let args = parse_args();
 
     lp2ln_core_v2::info!("[Main] Loaded args: {}", args);
-    let options_path = if args.options_path.is_empty() {
-        let default_path = PathBuf::from("./options.json");
-        if default_path.exists() {
-            Some(default_path.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    } else {
-        Some(args.options_path.clone())
-    };
+    let options_path = resolve_options_path(&args.options_path);
 
     let config_engine = ConfigAutonomy::new(options_path.as_ref().map(PathBuf::from));
     let startup = config_engine.load_startup(developer_options)?;
@@ -103,6 +198,11 @@ async fn main() -> anyhow::Result<()> {
             lp2ln_core_v2::warn!("[Main] Running with developer defaults");
         }
     }
+    lp2ln_core_v2::info!(
+        "[Main] config schema_version={} topology_profile={:?}",
+        options.schema_version,
+        options.topology_profile
+    );
 
     if options.database_dir.is_none() {
         let default_db_dir = PathBuf::from("./db");
@@ -184,16 +284,45 @@ async fn main() -> anyhow::Result<()> {
     );
     if options.experimental.any_enabled() {
         lp2ln_core_v2::warn!(
-            "[Main] experimental.* enabled — DHT/content/repair/App Plane are skeletons until P4; \
-             default daemon does not promise a production content lifecycle"
+            "[Main] experimental.* enabled — DHT/content/repair are skeletons until P4; \
+             App Plane local IPC starts when experimental.app_plane=true"
         );
     }
-    if options.experimental.dht || options.experimental.repair || options.experimental.app_plane {
+    if options.experimental.dht || options.experimental.repair {
         lp2ln_core_v2::warn!(
-            "[Main] experimental.dht/repair/app_plane are opt-in flags only; \
+            "[Main] experimental.dht/repair are opt-in flags only; \
              lp2lnd does not start those background services yet"
         );
     }
+
+    let _app_plane_task = if options.experimental.app_plane {
+        match node.router() {
+            Some(router) => {
+                let cfg = app_plane_server::AppPlaneServerConfig::from_options(
+                    true,
+                    &options.app_plane_ipc,
+                );
+                lp2ln_core_v2::info!(
+                    "[Main] App Plane IPC enabled: path={} dev_tcp={:?}",
+                    cfg.path,
+                    cfg.dev_tcp_bind
+                );
+                Some(app_plane_server::spawn_app_plane_server(
+                    cfg,
+                    node.clone(),
+                    router,
+                ))
+            }
+            None => {
+                lp2ln_core_v2::error!(
+                    "[Main] experimental.app_plane set but router missing; IPC not started"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

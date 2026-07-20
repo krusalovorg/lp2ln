@@ -6,6 +6,7 @@ rust-version = "1.85"
 build = "build.rs"
 
 [dependencies]
+lp2ln-app-protocol = { path = "../lp2ln-app-protocol" }
 tokio = { version = "1.28", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1.0", features = ["derive"] }

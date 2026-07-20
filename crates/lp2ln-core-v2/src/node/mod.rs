@@ -1,6 +1,7 @@
 pub mod addressing;
 pub mod autonomy;
 pub mod builder;
+pub mod config_v2;
 pub mod direct_upgrade;
 pub mod distribution;
 pub mod flow_trace;
@@ -22,7 +23,14 @@ pub mod connection_strategy {
 
 pub use autonomy::{ConfigAutonomy, StartupConfigResult, StartupConfigSource, ValidationReport};
 pub use builder::NodeBuilder;
-pub use options::{DirectUpgradeConfig, ExperimentalOptions, IpcTcpOptions, NodeOptions, NodeRole};
+pub use config_v2::{
+    CONFIG_SCHEMA_VERSION, ConfigCheckResult, ConfigLoadReport, check_file, load_json_with_report,
+    migrate_file, migrate_json_to_v2, public_example_json,
+};
+pub use options::{
+    AdaptiveTopologyProfile, AppPlaneIpcOptions, DirectUpgradeConfig, ExperimentalOptions,
+    IpcTcpOptions, NodeOptions, NodeRole,
+};
 pub use runtime::{
     NodeLifecycleError, NodeLifecycleState, NodeRuntime, RuntimeHealthSnapshot, RuntimeMode,
 };

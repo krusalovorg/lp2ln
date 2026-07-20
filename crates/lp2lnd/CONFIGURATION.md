@@ -4,6 +4,35 @@ This guide explains `NodeOptions` for `lp2lnd`: what each setting does, why it m
 
 > Architecture context: [Core Node Architecture (DeepWiki)](https://deepwiki.com/krusalovorg/lp2ln/2-core-node-architecture)
 
+## Config schema v2 (P3-07)
+
+Public operator surface prefers **intentions**, not dozens of topology coefficients.
+
+| Field | Role |
+|---|---|
+| `schema_version` | `2` = current public schema; missing ⇒ treated as v1 |
+| `topology_profile` | `conservative` \| `balanced` \| `aggressive` (sets adaptive profile) |
+| `listens` / `advertise_addrs` | bind / announce |
+| `seed_nodes` / `bootstrap_nodes` | cold-start address book |
+| `node_role` | `regular` (`bootstrap_join` deprecated) |
+| `peer_connection_policy` | min/target/max peers |
+| `lan_discovery` | LAN hello enable |
+| `app_plane_ipc` | local App Plane path / token |
+| `logger_options` / `database_dir` | logging + DB |
+| `experimental` | opt-in skeletons |
+
+Advanced keys (`topology_tuning`, router caps, dial_policy, …) still load, but `lp2lnd config check` reports them as advanced when migrating to v2.
+
+### CLI
+
+```bash
+lp2lnd config example              # print minimal public JSON
+lp2lnd config check -o options.json
+lp2lnd config migrate -o options.json   # add schema_version=2 + topology_profile
+```
+
+LKG: on parse/validation failure, `ConfigAutonomy` rolls back to `*.last-known-good.json`.
+
 ## How config loading works
 
 `lp2lnd` resolves configuration in this order:
@@ -16,18 +45,20 @@ Additional behavior:
 
 - If `database_dir` is not set, default is `./db`.
 - When started with `-o/--options`, the daemon writes normalized options back to that file path.
+- Unknown JSON keys produce soft diagnostics (do not fail boot); strict validation still requires at least one listen.
 
-## Minimal full example
+## Minimal public example (schema v2)
 
 ```json
 {
+  "schema_version": 2,
   "listens": {
     "tcp": "0.0.0.0:18090",
     "udp": "0.0.0.0:18190"
   },
-  "default_nodes": [],
-  "bootstrap_nodes": [],
+  "seed_nodes": [],
   "allow_unsigned_packets": true,
+  "topology_profile": "balanced",
   "logger_options": {
     "log_dir": "./logs/node",
     "file_enabled": true,
@@ -42,11 +73,23 @@ Additional behavior:
     "max_active_peers": 14
   },
   "database_dir": "./db/node",
-  "node_role": "regular"
+  "node_role": "regular",
+  "lan_discovery": { "enabled": true },
+  "experimental": { "app_plane": false }
 }
 ```
 
 ## Field-by-field reference
+
+### 0) Schema / topology profile
+
+#### `schema_version` (optional, default implied `1`)
+
+Set to `2` for Config v2 files. Use `lp2lnd config migrate` to upgrade in place.
+
+#### `topology_profile` (optional)
+
+`conservative` | `balanced` | `aggressive`. Synced into `topology_tuning.adaptive_profile`. Prefer this over editing fine-grained `topology_tuning` coefficients.
 
 ### 1) Network I/O
 
@@ -137,9 +180,31 @@ Opt-in flags for unfinished DHT / content / repair / App Plane skeletons. **All 
 | `dht` | Reserved for DHT background lifecycle (not started by `lp2lnd` yet) |
 | `content` | Enables debug `block_put` / `block_get` on debug WS / IPC TCP |
 | `repair` | Reserved for RepairWorker (not started by `lp2lnd` yet) |
-| `app_plane` | Reserved for binary App Plane TCP server (module exists; not started by default) |
+| `app_plane` | Starts local App Plane IPC (UDS / named pipe; see `app_plane_ipc`) |
 
-These are **not** a production distributed storage stack. Library APIs under `dht` / `storage` / `app_plane` remain available for tests and sidecars; the default daemon does not promise their lifecycle until the P4 content-runtime gate.
+These are **not** a production distributed storage stack. Library APIs under `dht` / `storage` / `app_plane` remain available for tests and sidecars; DHT/content/repair lifecycle waits for the P4 content-runtime gate.
+
+#### `app_plane_ipc` (P3-02)
+
+Local App Plane endpoint. Used only when `experimental.app_plane = true`.
+
+```json
+{
+  "app_plane_ipc": {
+    "path": "\\\\.\\pipe\\lp2ln-app",
+    "dev_tcp_bind": null
+  }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `path` | Windows: `\\.\pipe\lp2ln-app`; Unix: `/tmp/lp2ln-app.sock` | Named pipe or UDS path (AD-07) |
+| `dev_tcp_bind` | `null` | Optional loopback TCP (e.g. `127.0.0.1:17999`) for debug only; non-loopback rejected |
+| `app_token` | `null` | If set, `Hello.token` must match (P3-04) |
+| `allowed_protocol_ids` | `[]` | Empty = allow any `protocol_id`; otherwise Subscribe/Send restricted to this list |
+
+Unix socket is created with mode `0600`. First command on a connection must be `Hello` (version + capabilities). Bulk streams (`OpenStream` / `StreamChunk` / `StreamWindow` / `StreamCancel`) use credit-window backpressure (P3-05). Sidecars should use crate `lp2ln-app-sdk`. JSON debug IPC (`ipc_tcp`) is unrelated.
 
 ### 3) Connectivity policy
 

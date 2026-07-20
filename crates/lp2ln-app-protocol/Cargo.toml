@@ -1,0 +1,15 @@
+[package]
+name = "lp2ln-app-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "LP2LN App Plane wire protocol (sidecar <-> daemon IPC)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+
+[lib]
+name = "lp2ln_app_protocol"
+path = "src/lib.rs"

@@ -3,12 +3,15 @@ members = [
   "crates/lp2ln-core-v2",
   "crates/lp2lnd",
   "crates/lp2ln-db-export",
-  "crates/lp2lnd-vpn",
-  "crates/lp2ln-magic-folder"
+  "crates/lp2ln-app-protocol",
+  "crates/lp2ln-app-sdk",
 ]
 exclude = [
   "archive/lp2ln-core",
   "archive/lp2ln-gateway",
+  # P5/P7 stubs without Cargo.toml — restore when those phases start.
+  "crates/lp2lnd-vpn",
+  "crates/lp2ln-magic-folder",
 ]
 resolver = "2"
 
