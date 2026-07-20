@@ -159,7 +159,11 @@ fn resolve_endpoint(ep: &str, source_ip: IpAddr) -> Option<(String, SocketAddr)>
         return None;
     };
     let addr: SocketAddr = rest.parse().ok()?;
-    let final_ip = if addr.ip().is_unspecified() { source_ip } else { addr.ip() };
+    let final_ip = if addr.ip().is_unspecified() {
+        source_ip
+    } else {
+        addr.ip()
+    };
     if final_ip.is_loopback() || final_ip.is_unspecified() || addr.port() == 0 {
         return None;
     }
@@ -205,7 +209,10 @@ pub async fn run_lan_discovery(
     let socket_v4 = match bind_multicast_v4(opts.port) {
         Ok(s) => s,
         Err(e) => {
-            crate::warn!("[LanDiscovery] IPv4 multicast bind failed (port {}): {e}", opts.port);
+            crate::warn!(
+                "[LanDiscovery] IPv4 multicast bind failed (port {}): {e}",
+                opts.port
+            );
             return;
         }
     };
@@ -300,7 +307,10 @@ async fn send_hello(
     sign_hello(&mut hello, key).map_err(|e| anyhow::anyhow!(e))?;
     let bytes = serde_json::to_vec(&LanMessage::Hello(hello))?;
     if bytes.len() > MAX_HELLO_BYTES {
-        crate::warn!("[LanDiscovery] hello слишком большой ({} б), не отправлен", bytes.len());
+        crate::warn!(
+            "[LanDiscovery] hello слишком большой ({} б), не отправлен",
+            bytes.len()
+        );
         return Ok(());
     }
     v4.send_to(&bytes, target_v4).await?;
@@ -328,7 +338,14 @@ fn handle_recv(
     };
     match msg {
         LanMessage::Hello(h) => handle_hello(
-            h, src, our_peer_id, peer_dir, opts, nonce_cache, peer_rate, peer_boot,
+            h,
+            src,
+            our_peer_id,
+            peer_dir,
+            opts,
+            nonce_cache,
+            peer_rate,
+            peer_boot,
         ),
     }
 }
@@ -386,7 +403,9 @@ fn handle_hello(
         return;
     }
     // Резолвим endpoint'ы, подставляя source IP для unspecified.
-    let endpoints: Vec<(String, SocketAddr)> = hello.endpoints.iter()
+    let endpoints: Vec<(String, SocketAddr)> = hello
+        .endpoints
+        .iter()
         .filter_map(|ep| resolve_endpoint(ep, src.ip()))
         .collect();
     if endpoints.is_empty() {
@@ -397,10 +416,13 @@ fn handle_hello(
 
     let pid = PeerId::from(hello.peer_id.as_str());
     peer_dir.replace_lan_addresses(&pid, &endpoints, hello.expires_at_ms, now);
-    peer_boot.insert(hello.peer_id.clone(), BootState {
-        boot_id: hello.boot_id,
-        last_seq: hello.seq,
-    });
+    peer_boot.insert(
+        hello.peer_id.clone(),
+        BootState {
+            boot_id: hello.boot_id,
+            last_seq: hello.seq,
+        },
+    );
     crate::debug!(
         "[LanDiscovery] peer {}… → {} endpoint(s) via {}",
         &hello.peer_id[..8.min(hello.peer_id.len())],
@@ -413,9 +435,9 @@ fn handle_hello(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::topology::peer_directory::PeerDirectory;
+    use std::sync::Arc;
 
     pub fn make_key() -> SigningKey {
         let mut b = [0u8; 32];
@@ -534,7 +556,10 @@ pub(crate) mod tests {
         call_handle(h, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
 
         let book = dir.dial_book(now);
-        assert!(book.contains_key(&PeerId::from(pid.as_str())), "peer должен появиться в dial_book");
+        assert!(
+            book.contains_key(&PeerId::from(pid.as_str())),
+            "peer должен появиться в dial_book"
+        );
     }
 
     #[test]
@@ -569,20 +594,43 @@ pub(crate) mod tests {
         let mut boots = HashMap::new();
 
         // Первый вызов — принят, nonce попадает в кэш.
-        call_handle(h.clone(), &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h.clone(),
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
         assert!(nonces.contains_key(&nonce), "nonce должен быть в кэше");
         assert_eq!(boots.len(), 1, "первый hello принят");
 
         // Второй вызов с тем же nonce — отклоняется на replay-проверке.
         // Строим новый hello с тем же нonce, но другим seq, чтобы seq-проверка
         // не маскировала replay-отклонение.
-        let mut h_replay = LanHello { seq: 99, nonce: nonce.clone(), ..h };
+        let mut h_replay = LanHello {
+            seq: 99,
+            nonce: nonce.clone(),
+            ..h
+        };
         sign_hello(&mut h_replay, &key).unwrap();
-        call_handle(h_replay, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h_replay,
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
 
         // boot state должен содержать seq=1 (от первого вызова), а не seq=99.
         let pid = peer_id_of(&key);
-        assert_eq!(boots[&pid].last_seq, 1, "replay не должен обновлять boot state");
+        assert_eq!(
+            boots[&pid].last_seq, 1,
+            "replay не должен обновлять boot state"
+        );
     }
 
     #[test]
@@ -668,7 +716,15 @@ pub(crate) mod tests {
             signature: String::new(),
         };
         sign_hello(&mut h5, &key).unwrap();
-        call_handle(h5, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h5,
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
         assert_eq!(boots[&pid].last_seq, 5);
 
         // seq=3 — старый, должен быть отброшен
@@ -684,7 +740,15 @@ pub(crate) mod tests {
             signature: String::new(),
         };
         sign_hello(&mut h3, &key).unwrap();
-        call_handle(h3, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h3,
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
 
         // last_seq не изменился
         assert_eq!(boots[&pid].last_seq, 5);
@@ -705,7 +769,15 @@ pub(crate) mod tests {
 
         // Первый boot
         let h1 = make_hello(&key, 1, now);
-        call_handle(h1, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h1,
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
         let addrs_before = dir.dial_book(now).get(&pid).cloned().unwrap_or_default();
         assert_eq!(addrs_before.len(), 1);
         assert_eq!(addrs_before[0].1.port(), 8080);
@@ -723,10 +795,22 @@ pub(crate) mod tests {
             signature: String::new(),
         };
         sign_hello(&mut h2, &key).unwrap();
-        call_handle(h2, &our_id, &dir, &opts, &mut nonces, &mut rates, &mut boots);
+        call_handle(
+            h2,
+            &our_id,
+            &dir,
+            &opts,
+            &mut nonces,
+            &mut rates,
+            &mut boots,
+        );
 
         let addrs_after = dir.dial_book(now).get(&pid).cloned().unwrap_or_default();
         assert_eq!(addrs_after.len(), 1);
-        assert_eq!(addrs_after[0].1.port(), 9090, "старый адрес должен быть заменён");
+        assert_eq!(
+            addrs_after[0].1.port(),
+            9090,
+            "старый адрес должен быть заменён"
+        );
     }
 }

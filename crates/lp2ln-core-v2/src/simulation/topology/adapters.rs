@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use super::types::{SimNodeId, SimNodeState, TopologySnapshot};
 use crate::node::options::{NodeRole, TopologyTuning};
 use crate::peer_score::{PeerConnectionPolicy, PeerScoreWeights};
-use crate::topology::{CapacityBudget, SmartMeshPlanner, TopologyPlanner};
 use crate::topology::snapshot::TopologySnapshot as RealSnapshot;
+use crate::topology::{CapacityBudget, SmartMeshPlanner, TopologyPlanner};
 use crate::types::PeerId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +138,11 @@ impl Default for PlannerAdapter {
 }
 
 impl TopologyDecisionAdapter for PlannerAdapter {
-    fn plan_actions(&self, observation: &SimNodeObservation, snapshot: &TopologySnapshot) -> NodeActionPlan {
+    fn plan_actions(
+        &self,
+        observation: &SimNodeObservation,
+        snapshot: &TopologySnapshot,
+    ) -> NodeActionPlan {
         let to_pid = |id: SimNodeId| PeerId::from(id.to_string().as_str());
 
         let connected_set: HashSet<SimNodeId> = observation
@@ -149,8 +153,7 @@ impl TopologyDecisionAdapter for PlannerAdapter {
             .map(|p| p.peer_id)
             .collect();
 
-        let connected_peers: Vec<PeerId> =
-            connected_set.iter().map(|id| to_pid(*id)).collect();
+        let connected_peers: Vec<PeerId> = connected_set.iter().map(|id| to_pid(*id)).collect();
 
         // ponytail: fake loopback ports — simulator ignores addresses, only uses PeerId key
         let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> = snapshot
@@ -161,7 +164,10 @@ impl TopologyDecisionAdapter for PlannerAdapter {
             })
             .map(|(id, _)| {
                 let port = (id % 60000 + 1024) as u16;
-                (to_pid(*id), vec![("tcp".to_string(), ([127u8, 0, 0, 1], port).into())])
+                (
+                    to_pid(*id),
+                    vec![("tcp".to_string(), ([127u8, 0, 0, 1], port).into())],
+                )
             })
             .collect();
 

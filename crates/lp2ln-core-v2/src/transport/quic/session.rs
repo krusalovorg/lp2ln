@@ -73,6 +73,10 @@ impl Session for QuicSession {
         self.kind
     }
 
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(self.connection.remote_address())
+    }
+
     async fn send(&self, packet: Packet) -> Result<u64> {
         let bytes = encode_packet(packet)?;
         self.send_wire(bytes).await

@@ -1,5 +1,4 @@
 use crate::node::options::{NodeRole, TopologyTuning};
-use crate::topology::NodeDescriptor;
 
 pub const REGULAR_BOOTSTRAP_DIAL_QUOTA: usize = 2;
 pub const BOOTSTRAP_INCOMING_HEADROOM: usize = 3;
@@ -75,7 +74,7 @@ pub fn dial_endpoint_attempt_budget(
 }
 
 pub fn should_skip_for_bootstrap_quota(
-    desc: &NodeDescriptor,
+    is_seed: bool,
     node_role: NodeRole,
     connected_bootstrap: usize,
     bootstrap_quota: usize,
@@ -83,27 +82,19 @@ pub fn should_skip_for_bootstrap_quota(
     min_active_peers: usize,
 ) -> bool {
     matches!(node_role, NodeRole::Regular)
-        && desc.capabilities.bootstrap_entry
+        && is_seed
         && ((connected_bootstrap >= bootstrap_quota && current_peers >= min_active_peers)
-                // Even before reaching full target connectivity, keep only one bootstrap edge
-                // once we already have at least a couple of peers.
-                || (connected_bootstrap >= 1 && current_peers >= 2))
+            // Keep at most one seed edge once we already have a couple of peers.
+            || (connected_bootstrap >= 1 && current_peers >= 2))
 }
 
-pub fn bootstrap_dial_quota(node_role: NodeRole) -> usize {
-    if matches!(node_role, NodeRole::Regular) {
-        REGULAR_BOOTSTRAP_DIAL_QUOTA
-    } else {
-        usize::MAX
-    }
+pub fn bootstrap_dial_quota(_node_role: NodeRole) -> usize {
+    // Same quota for every role: seeds are address-book entries, not a cast.
+    REGULAR_BOOTSTRAP_DIAL_QUOTA
 }
 
-pub fn dial_reserve_slots(node_role: NodeRole) -> usize {
-    if matches!(node_role, NodeRole::BootstrapJoin) {
-        BOOTSTRAP_INCOMING_RESERVE_SLOTS
-    } else {
-        REGULAR_INCOMING_RESERVE_SLOTS
-    }
+pub fn dial_reserve_slots(_node_role: NodeRole) -> usize {
+    REGULAR_INCOMING_RESERVE_SLOTS
 }
 
 pub fn should_reseed_bootstrap(

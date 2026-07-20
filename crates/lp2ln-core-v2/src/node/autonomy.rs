@@ -344,8 +344,9 @@ pub fn validate_options(options: &NodeOptions) -> ValidationReport {
         && options.bootstrap_nodes.is_empty()
         && options.default_nodes.is_empty()
     {
-        strict_errors.push(
-            "critical.bootstrap: bootstrap node requires bootstrap_nodes/default_nodes".to_string(),
+        soft_warnings.push(
+            "soft.node_role: bootstrap_join is deprecated (treated as regular); seed_nodes/bootstrap_nodes still recommended for cold start"
+                .to_string(),
         );
     }
     let p = options.peer_connection_policy.normalized();

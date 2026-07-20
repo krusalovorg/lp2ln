@@ -1,26 +1,21 @@
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-
-use dashmap::DashMap;
-
+use super::packet_helpers::handshake_packet;
 use crate::node::distribution::{
     DIAL_HUB_SOFT_CAP_EXTRA, REGULAR_SELF_HEAL_FLOOR, bootstrap_dial_quota, connectivity_selective,
     dial_endpoint_attempt_budget, should_skip_for_bootstrap_quota,
 };
-use crate::node::options::{NodeRole, TopologyTuning};
+use crate::node::options::{BootstrapNode, NodeRole, TopologyTuning};
+use crate::node::seed_book::is_local_seed_peer;
 use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{NodeDescriptor, PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 use crate::types::{PeerId, SessionId};
-
-use super::packet_helpers::handshake_packet;
-
+use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = super::REGULAR_DIAL_ATTEMPT_BUDGET_MAX;
-const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = super::BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX;
-
 pub(super) struct DialPlan {
     pub(super) candidates: Vec<PeerId>,
     pub(super) desc_by_peer: HashMap<PeerId, NodeDescriptor>,
@@ -28,11 +23,9 @@ pub(super) struct DialPlan {
     pub(super) dial_limit: usize,
     pub(super) force_non_bootstrap: bool,
 }
-
 pub(super) struct DialExecutionResult {
     pub(super) dialed_any: bool,
 }
-
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_dial_plan(
     plan: &mut DialPlan,
@@ -51,14 +44,11 @@ pub(super) async fn execute_dial_plan(
     peer_dir: &Arc<PeerDirectory>,
     topology_tuning: &TopologyTuning,
     transport_order: &[String],
+    seed_targets: &[BootstrapNode],
     now: u64,
 ) -> DialExecutionResult {
     let dial_deficit = plan.dial_limit.saturating_sub(n).max(1);
-    let mut dial_attempts_left = if matches!(node_role, NodeRole::Regular) {
-        dial_deficit.min(REGULAR_DIAL_ATTEMPT_BUDGET_MAX)
-    } else {
-        dial_deficit.min(BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX)
-    };
+    let mut dial_attempts_left = dial_deficit.min(REGULAR_DIAL_ATTEMPT_BUDGET_MAX);
     let mut active_peers = n;
     let mut dialed_any = false;
     for pid in plan.candidates.clone() {
@@ -68,62 +58,54 @@ pub(super) async fn execute_dial_plan(
         if pid.as_str() == our_peer_maint || sm.is_connected_to_peer(&pid) {
             continue;
         }
-        if matches!(node_role, NodeRole::Regular) {
-            let mesh_peer = plan
-                .desc_by_peer
-                .get(&pid)
-                .map(|d| !d.capabilities.bootstrap_entry)
-                .unwrap_or(!catalog.peer_is_bootstrap_entry(&pid));
-            if mesh_peer && our_peer_maint >= pid.as_str() {
-                continue;
-            }
+        let is_seed = is_local_seed_peer(&pid, catalog.as_ref(), dial_book.as_ref(), seed_targets);
+        // Lexical half-connect among mesh (non-seed) peers to reduce duplicate dials.
+        if !is_seed && our_peer_maint >= pid.as_str() {
+            continue;
         }
         if peer_dir.in_backoff(&pid, now) {
             continue;
         }
+        if plan.force_non_bootstrap && is_seed {
+            continue;
+        }
+        if should_skip_for_bootstrap_quota(
+            is_seed,
+            node_role,
+            plan.connected_bootstrap,
+            bootstrap_dial_quota(node_role),
+            active_peers,
+            adaptive_min_active_peers,
+        ) {
+            continue;
+        }
         if let Some(desc) = plan.desc_by_peer.get(&pid) {
-            if plan.force_non_bootstrap && desc.capabilities.bootstrap_entry {
+            // Soft-cap applies to everyone including seeds (no cast exemption).
+            let selective =
+                connectivity_selective(active_peers, dial_target, adaptive_min_active_peers);
+            if selective && !desc.dynamic_status.accepts_new_sessions {
                 continue;
             }
-            if should_skip_for_bootstrap_quota(
-                desc,
-                node_role,
-                plan.connected_bootstrap,
-                bootstrap_dial_quota(node_role),
-                active_peers,
-                adaptive_min_active_peers,
-            ) {
+            let cap = desc.capabilities.base_session_limit.max(1) as usize;
+            if selective
+                && active_peers >= REGULAR_SELF_HEAL_FLOOR
+                && desc.dynamic_status.active_connections as usize >= cap
+            {
                 continue;
             }
-            if !desc.capabilities.bootstrap_entry {
-                let selective =
-                    connectivity_selective(active_peers, dial_target, adaptive_min_active_peers);
-                if selective && !desc.dynamic_status.accepts_new_sessions {
-                    continue;
-                }
-                let cap = desc.capabilities.base_session_limit.max(1) as usize;
-                if selective
-                    && active_peers >= REGULAR_SELF_HEAL_FLOOR
-                    && desc.dynamic_status.active_connections as usize >= cap
-                {
-                    continue;
-                }
-                let soft_cap = dial_target.saturating_add(DIAL_HUB_SOFT_CAP_EXTRA);
-                if selective
-                    && active_peers >= REGULAR_SELF_HEAL_FLOOR
-                    && desc.dynamic_status.active_connections as usize > soft_cap
-                {
-                    continue;
-                }
+            let soft_cap = dial_target.saturating_add(DIAL_HUB_SOFT_CAP_EXTRA);
+            if selective
+                && active_peers >= REGULAR_SELF_HEAL_FLOOR
+                && desc.dynamic_status.active_connections as usize > soft_cap
+            {
+                continue;
             }
         }
-
         let Some(entry) = dial_book.get(&pid) else {
             continue;
         };
         let mut endpoints = entry.value().to_vec();
         drop(entry);
-        // Sort by preferred transport order (quic > udp > tcp by default).
         endpoints.sort_by_key(|(proto, _)| {
             transport_order
                 .iter()
@@ -171,11 +153,7 @@ pub(super) async fn execute_dial_plan(
                         let _ = router_maint.send_to_session(session_id, handshake).await;
                         catalog.observe_success(&pid, 80);
                         peer_dir.record_dial_success(&pid, now);
-                        if plan
-                            .desc_by_peer
-                            .get(&pid)
-                            .is_some_and(|d| d.capabilities.bootstrap_entry)
-                        {
+                        if is_seed {
                             plan.connected_bootstrap = plan.connected_bootstrap.saturating_add(1);
                         }
                         dialed_any = true;
@@ -196,7 +174,6 @@ pub(super) async fn execute_dial_plan(
     }
     DialExecutionResult { dialed_any }
 }
-
 pub(crate) async fn dial_bootstrap_address(
     transports: &[Arc<dyn Transport>],
     router: &Arc<Router>,

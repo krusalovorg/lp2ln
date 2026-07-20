@@ -6,9 +6,7 @@ use rand::seq::SliceRandom;
 use super::NodeDescriptor;
 
 pub fn descriptor_ok_for_discovery_redirect(desc: &NodeDescriptor) -> bool {
-    if desc.capabilities.bootstrap_entry {
-        return true;
-    }
+    // Prefer peers that still accept sessions; otherwise allow if under soft capacity.
     if desc.dynamic_status.accepts_new_sessions {
         return true;
     }
@@ -44,10 +42,8 @@ pub fn select_peers_for_discovery_response(
             .then_with(|| b.timestamp_ms.cmp(&a.timestamp_ms))
     });
 
-    let max_bootstrap_in_sorted = (n_sorted / 3).clamp(1, 3);
     let mut out: Vec<NodeDescriptor> = Vec::with_capacity(lim);
     let mut picked: HashSet<String> = HashSet::new();
-    let mut bootstrap_picked = 0usize;
 
     for d in descriptors.iter().cloned() {
         if out.len() >= n_sorted {
@@ -55,12 +51,6 @@ pub fn select_peers_for_discovery_response(
         }
         if picked.contains(&d.peer_id) {
             continue;
-        }
-        if d.capabilities.bootstrap_entry {
-            if bootstrap_picked >= max_bootstrap_in_sorted {
-                continue;
-            }
-            bootstrap_picked += 1;
         }
         picked.insert(d.peer_id.clone());
         out.push(d);
@@ -103,17 +93,9 @@ fn discovery_descriptor_score(desc: &NodeDescriptor, requester_peer_id: &str) ->
         score += 1.0;
     }
     score += (1.0 - util.min(1.0)) * 1.55;
-    if !desc.capabilities.bootstrap_entry {
-        score += 0.5;
-    }
-    if desc.capabilities.bootstrap_entry {
-        score += 0.08;
-    }
+    // Hub penalty by load only — bootstrap_entry is ignored (local seed book, not a cast).
     let hub_excess = (desc.dynamic_status.active_connections as f32 - 6.0).max(0.0);
     score -= hub_excess * 0.11;
-    if desc.capabilities.bootstrap_entry && desc.dynamic_status.active_connections >= 14 {
-        score -= 0.35;
-    }
     score + discovery_jitter(requester_peer_id, &desc.peer_id, 0.28)
 }
 

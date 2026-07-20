@@ -53,7 +53,9 @@ pub struct TopologySnapshot {
 
 impl TopologySnapshot {
     pub fn connected_non_bootstrap_count(&self) -> usize {
-        self.connected_peers.len().saturating_sub(self.connected_bootstrap_count)
+        self.connected_peers
+            .len()
+            .saturating_sub(self.connected_bootstrap_count)
     }
 
     pub fn total_score_of(&self, peer_id: &PeerId) -> f32 {
@@ -65,7 +67,10 @@ impl TopologySnapshot {
     }
 
     pub fn active_conns_of(&self, peer_id: &PeerId) -> u16 {
-        self.descriptor_active_conns.get(peer_id).copied().unwrap_or(0)
+        self.descriptor_active_conns
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn in_cooldown(&self, peer_id: &PeerId) -> bool {

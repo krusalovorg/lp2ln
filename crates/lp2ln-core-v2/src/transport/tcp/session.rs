@@ -67,6 +67,7 @@ pub struct TcpSession {
     id: String,
     peer_id: Option<String>,
     kind: LinkKind,
+    remote_addr: Option<std::net::SocketAddr>,
 
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 
@@ -92,6 +93,10 @@ impl Session for TcpSession {
 
     fn kind(&self) -> LinkKind {
         self.kind
+    }
+
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        self.remote_addr
     }
 
     async fn send(&self, packet: Packet) -> Result<u64> {
@@ -180,6 +185,7 @@ impl TcpSession {
         obfuscator: Arc<Obfuscator>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
+        let remote_addr = stream.peer_addr().ok();
         let (read_half, write_half) = stream.into_split();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
@@ -190,6 +196,7 @@ impl TcpSession {
             id,
             peer_id,
             kind,
+            remote_addr,
             tx,
             read: tokio::sync::Mutex::new(read_half),
             obfuscator: obfuscator.clone(),

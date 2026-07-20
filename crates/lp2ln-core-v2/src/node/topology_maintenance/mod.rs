@@ -16,8 +16,6 @@ mod session_reactions;
 mod state;
 mod tick;
 
-pub(crate) use args::TopologyMaintenanceArgs;
-pub(crate) use dialing::dial_bootstrap_address;
 use self::state::MaintenanceState;
 use self::tick::{TickState, prepare_tick};
 use crate::db::P2PDatabase;
@@ -30,14 +28,15 @@ use crate::protocol::control::NetworkControlPayload;
 use crate::router::Router;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{
-    CapacityBudget, NodeDescriptor, PeerCatalog, PeerDirectory,
-    SmartMeshPlanner, TopologyPlanner, TopologyReconciler, TopologySnapshot, now_ms,
-    parse_observed_addr_line,
+    CapacityBudget, NodeDescriptor, PeerCatalog, PeerDirectory, SmartMeshPlanner, TopologyPlanner,
+    TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
 };
 use crate::transport::{Transport, TunnelPunchParams};
 use crate::types::{PeerId, SessionId};
+pub(crate) use args::TopologyMaintenanceArgs;
 use bootstrap::{handle_bootstrap_reseed, run_bootstrap_shepherd};
 use descriptor::publish_descriptor_if_due;
+pub(crate) use dialing::dial_bootstrap_address;
 use dialing::{DialPlan, execute_dial_plan};
 use packet_helpers::control_packet;
 pub use session_reactions::{
@@ -53,7 +52,6 @@ pub(crate) struct BootstrapDialDedupe {
 const MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const MAINTENANCE_START_JITTER_MS: u64 = 3_000;
 pub(super) const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
-pub(super) const BOOTSTRAP_DIAL_ATTEMPT_BUDGET_MAX: usize = 8;
 pub(super) const SHEPHERD_SWEEP_INTERVAL_MS: u64 = 10_000;
 pub(super) const SHEPHERD_MIN_MESH: u16 = 3;
 pub(super) const SHEPHERD_GRACE_MS: u64 = 15_000;
@@ -72,7 +70,7 @@ fn build_topology_snapshot(
     connected_peers: Vec<PeerId>,
     connected_bootstrap_count: usize,
     known_peer_count: usize,
-    bootstrap_targets_count: usize,
+    bootstrap_targets: &[crate::node::options::BootstrapNode],
     last_bootstrap_reseed_ms: u64,
     now: u64,
 ) -> TopologySnapshot {
@@ -83,17 +81,22 @@ fn build_topology_snapshot(
         .collect();
 
     let descriptors = ctx.catalog.descriptors();
-    let bootstrap_peer_ids: HashSet<PeerId> = descriptors
-        .iter()
-        .filter(|d| d.capabilities.bootstrap_entry)
-        .map(|d| PeerId::from(d.peer_id.as_str()))
-        .collect();
+    let bootstrap_peer_ids =
+        crate::node::seed_book::seed_peer_ids_from_catalog(ctx.catalog, bootstrap_targets);
     let descriptor_active_conns: HashMap<PeerId, u16> = descriptors
         .iter()
-        .map(|d| (PeerId::from(d.peer_id.as_str()), d.dynamic_status.active_connections))
+        .map(|d| {
+            (
+                PeerId::from(d.peer_id.as_str()),
+                d.dynamic_status.active_connections,
+            )
+        })
         .collect();
-    let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> =
-        ctx.dial_book.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+    let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> = ctx
+        .dial_book
+        .iter()
+        .map(|r| (r.key().clone(), r.value().clone()))
+        .collect();
     let peer_age_ms = ctx.router.peer_connection_ages();
 
     TopologySnapshot {
@@ -113,7 +116,7 @@ fn build_topology_snapshot(
         dial_book,
         dial_cooldowns: ctx.peer_dir.cooldowns(),
         peer_age_ms,
-        bootstrap_targets_count,
+        bootstrap_targets_count: bootstrap_targets.len(),
         last_bootstrap_reseed_ms,
         now_ms: now,
     }
@@ -264,7 +267,8 @@ fn sync_dial_book(ctx: &TopologyMaintenanceCtx<'_>) {
         if desc.peer_id == ctx.our_peer_id {
             continue;
         }
-        ctx.peer_dir.upsert_from_descriptor(&desc, &our_listen_addrs);
+        ctx.peer_dir
+            .upsert_from_descriptor(&desc, &our_listen_addrs);
         for addr_s in &desc.observed_addrs {
             let Some((proto, addr)) = parse_observed_addr_line(addr_s) else {
                 continue;
@@ -417,7 +421,7 @@ pub(crate) async fn run_topology_maintenance_loop(
             connected_snapshot.clone(),
             connected_bootstrap_now,
             known_peers,
-            bootstrap_targets_maint.len(),
+            &bootstrap_targets_maint,
             state.last_bootstrap_reseed_ms,
             now,
         );
@@ -431,7 +435,9 @@ pub(crate) async fn run_topology_maintenance_loop(
                 topology_plan.discovery.len(),
             );
         }
-        reconciler.execute_drops(&topology_plan.drop, &catalog, &sm, &peer_dir).await;
+        reconciler
+            .execute_drops(&topology_plan.drop, &catalog, &sm, &peer_dir)
+            .await;
         let mut n = sm.distinct_peer_count();
 
         if handle_bootstrap_reseed(
@@ -502,9 +508,17 @@ pub(crate) async fn run_topology_maintenance_loop(
                 .into_iter()
                 .map(|d| (PeerId::from(d.peer_id.as_str()), d))
                 .collect();
-            let dial_limit = if should_explore { dial_target_high } else { dial_target };
+            let dial_limit = if should_explore {
+                dial_target_high
+            } else {
+                dial_target
+            };
             let mut plan = DialPlan {
-                candidates: topology_plan.dial.iter().map(|i| i.peer_id.clone()).collect(),
+                candidates: topology_plan
+                    .dial
+                    .iter()
+                    .map(|i| i.peer_id.clone())
+                    .collect(),
                 desc_by_peer,
                 connected_bootstrap: connected_bootstrap_now,
                 dial_limit,
@@ -527,6 +541,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &peer_dir,
                 &topology_tuning,
                 loop_ctx.dial_policy.transport_order.as_slice(),
+                &bootstrap_targets_maint,
                 now,
             )
             .await;

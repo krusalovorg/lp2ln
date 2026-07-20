@@ -5,11 +5,10 @@ use rand::seq::SliceRandom;
 
 use crate::dht::records::{leading_zeros, node_id_of, xor_distance};
 use crate::node::incoming_sessions::REGULAR_INCOMING_HEADROOM;
-use crate::node::options::NodeRole;
 use crate::topology::parse_observed_addr_line;
 use crate::topology::planner::{
-    adaptive_bootstrap_hard_limit, AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent,
-    DropReason, PeerCandidate, TopologyPlan, TopologyPlanner,
+    AdmissionDecision, DialIntent, DiscoveryNeed, DropIntent, DropReason, PeerCandidate,
+    TopologyPlan, TopologyPlanner,
 };
 use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::{descriptor_ok_for_discovery_redirect, select_peers_for_discovery_response};
@@ -25,7 +24,7 @@ const EXPLORATION_FRAC: f32 = 0.10;
 // Small bonus for already-connected peers to reduce unnecessary rotation churn.
 const CONNECTED_SCORE_BONUS: f32 = 0.05;
 
-// Maximum peers from the same /16 subnet in the diversity slot.
+// Maximum peers from the same /24 subnet in the diversity slot.
 const DIVERSITY_SUBNET_CAP: usize = 2;
 
 /// SmartMesh v1 topology planner.
@@ -41,36 +40,38 @@ const DIVERSITY_SUBNET_CAP: usize = 2;
 pub struct SmartMeshPlanner;
 
 impl SmartMeshPlanner {
-    /// Extract /16 prefix from a SocketAddr.
-    fn subnet16(addr: &std::net::SocketAddr) -> Option<[u8; 2]> {
+    /// Extract /24 prefix from a SocketAddr (IPv4). IPv6 uses /48.
+    fn subnet_prefix(addr: &std::net::SocketAddr) -> Option<[u8; 3]> {
         match addr.ip() {
             IpAddr::V4(v4) => {
                 let o = v4.octets();
-                Some([o[0], o[1]])
+                Some([o[0], o[1], o[2]])
             }
-            // ponytail: IPv6 /48 diversity — step 8
-            IpAddr::V6(_) => None,
+            IpAddr::V6(v6) => {
+                let o = v6.octets();
+                Some([o[0], o[1], o[2]])
+            }
         }
     }
 
-    /// Build peer → known /16 subnets from dial_book + catalog observed addresses.
-    fn peer_subnets(snapshot: &TopologySnapshot) -> HashMap<PeerId, HashSet<[u8; 2]>> {
-        let mut map: HashMap<PeerId, HashSet<[u8; 2]>> = HashMap::new();
+    /// Build peer → known /24 subnets from dial_book + catalog observed addresses.
+    fn peer_subnets(snapshot: &TopologySnapshot) -> HashMap<PeerId, HashSet<[u8; 3]>> {
+        let mut map: HashMap<PeerId, HashSet<[u8; 3]>> = HashMap::new();
 
-        for (peer, addrs) in &snapshot.dial_book {
-            let entry = map.entry(peer.clone()).or_default();
-            for (_, addr) in addrs {
-                if let Some(s) = Self::subnet16(addr) {
+        for (pid, addrs) in &snapshot.dial_book {
+            let entry = map.entry(pid.clone()).or_default();
+            for (_proto, addr) in addrs {
+                if let Some(s) = Self::subnet_prefix(addr) {
                     entry.insert(s);
                 }
             }
         }
-        for desc in &snapshot.catalog_descriptors {
-            let peer = PeerId::from(desc.peer_id.as_str());
-            let entry = map.entry(peer).or_default();
-            for addr_str in &desc.observed_addrs {
+        for d in &snapshot.catalog_descriptors {
+            let pid = PeerId::from(d.peer_id.as_str());
+            let entry = map.entry(pid).or_default();
+            for addr_str in &d.observed_addrs {
                 if let Some((_, addr)) = parse_observed_addr_line(addr_str) {
-                    if let Some(s) = Self::subnet16(&addr) {
+                    if let Some(s) = Self::subnet_prefix(&addr) {
                         entry.insert(s);
                     }
                 }
@@ -93,7 +94,7 @@ impl SmartMeshPlanner {
         &self,
         snapshot: &TopologySnapshot,
         our_node_id: &NodeId,
-        subnets: &HashMap<PeerId, HashSet<[u8; 2]>>,
+        subnets: &HashMap<PeerId, HashSet<[u8; 3]>>,
     ) -> (HashSet<PeerId>, HashSet<PeerId>) {
         let policy = snapshot.policy.normalized();
         let target = policy.target_active_peers.max(1);
@@ -118,7 +119,11 @@ impl SmartMeshPlanner {
 
         let score_of = |p: &PeerId| -> f32 {
             let base = snapshot.total_score_of(p);
-            if connected_set.contains(p) { base + CONNECTED_SCORE_BONUS } else { base }
+            if connected_set.contains(p) {
+                base + CONNECTED_SCORE_BONUS
+            } else {
+                base
+            }
         };
 
         let mut selected: HashSet<PeerId> = HashSet::new();
@@ -140,8 +145,10 @@ impl SmartMeshPlanner {
                 .iter()
                 .filter_map(|(&b, v)| v.first().map(|(p, s)| (b, p.clone(), *s)))
                 .collect();
-            best_per_bucket
-                .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
+            best_per_bucket.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
             for (_, peer, _) in best_per_bucket.into_iter().take(structured_n) {
                 structured_peers.insert(peer.clone());
                 selected.insert(peer);
@@ -163,7 +170,7 @@ impl SmartMeshPlanner {
 
         // ── Phase 3: diversity — /16-subnet spread ───────────────────────────
         {
-            let mut subnet_counts: HashMap<[u8; 2], usize> = HashMap::new();
+            let mut subnet_counts: HashMap<[u8; 3], usize> = HashMap::new();
             for p in &selected {
                 for s in subnets.get(p).into_iter().flatten() {
                     *subnet_counts.entry(*s).or_default() += 1;
@@ -362,7 +369,10 @@ impl TopologyPlanner for SmartMeshPlanner {
 
         // Dial: desired peers not yet connected and not in cooldown.
         let connected_set: HashSet<&PeerId> = snapshot.connected_peers.iter().collect();
-        let dial_budget = policy.target_active_peers.saturating_sub(effective_n).min(8);
+        let dial_budget = policy
+            .target_active_peers
+            .saturating_sub(effective_n)
+            .min(8);
         let mut dial_intents: Vec<DialIntent> = Vec::new();
 
         if effective_n < policy.target_active_peers {
@@ -380,7 +390,10 @@ impl TopologyPlanner for SmartMeshPlanner {
                 .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (peer, _) in dial_candidates.into_iter().take(dial_budget) {
                 if let Some(addrs) = snapshot.dial_book.get(peer) {
-                    dial_intents.push(DialIntent { peer_id: peer.clone(), addrs: addrs.clone() });
+                    dial_intents.push(DialIntent {
+                        peer_id: peer.clone(),
+                        addrs: addrs.clone(),
+                    });
                 }
             }
         }
@@ -406,7 +419,12 @@ impl TopologyPlanner for SmartMeshPlanner {
             .cloned()
             .collect();
 
-        TopologyPlan { keep, dial: dial_intents, drop: drop_intents, discovery }
+        TopologyPlan {
+            keep,
+            dial: dial_intents,
+            drop: drop_intents,
+            discovery,
+        }
     }
 
     fn evaluate_incoming(
@@ -416,16 +434,11 @@ impl TopologyPlanner for SmartMeshPlanner {
     ) -> AdmissionDecision {
         let connected_now = snapshot.connected_peers.len();
         let policy = snapshot.policy.normalized();
-        let known_peers = snapshot.known_peer_count.max(1);
 
-        let hard_limit = if matches!(snapshot.node_role, NodeRole::BootstrapJoin) {
-            adaptive_bootstrap_hard_limit(&snapshot.topology_tuning, &policy, known_peers)
-        } else {
-            policy
-                .target_active_peers
-                .saturating_add(REGULAR_INCOMING_HEADROOM)
-                .min(policy.max_active_peers)
-        };
+        let hard_limit = policy
+            .target_active_peers
+            .saturating_add(REGULAR_INCOMING_HEADROOM)
+            .min(policy.max_active_peers);
 
         let redirect_descriptors = || {
             select_peers_for_discovery_response(
@@ -443,11 +456,13 @@ impl TopologyPlanner for SmartMeshPlanner {
         };
 
         if connected_now >= hard_limit {
-            return AdmissionDecision::Redirect { descriptors: redirect_descriptors() };
+            return AdmissionDecision::Redirect {
+                descriptors: redirect_descriptors(),
+            };
         }
 
-        // Under target or bootstrap entry: always accept.
-        if connected_now < policy.target_active_peers || candidate.is_bootstrap_entry {
+        // Under target: always accept. Seeds are not a privileged cast.
+        if connected_now < policy.target_active_peers {
             return AdmissionDecision::Accept;
         }
 
@@ -468,7 +483,9 @@ impl TopologyPlanner for SmartMeshPlanner {
         if desired.contains(&candidate.peer_id) {
             AdmissionDecision::Accept
         } else {
-            AdmissionDecision::Redirect { descriptors: redirect_descriptors() }
+            AdmissionDecision::Redirect {
+                descriptors: redirect_descriptors(),
+            }
         }
     }
 }

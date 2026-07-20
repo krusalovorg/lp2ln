@@ -249,7 +249,9 @@ impl SessionManager {
                     .value()
                     .iter()
                     .filter_map(|sid| {
-                        self.metrics.get(sid).map(|m| m.created_at.elapsed().as_millis() as u64)
+                        self.metrics
+                            .get(sid)
+                            .map(|m| m.created_at.elapsed().as_millis() as u64)
                     })
                     .max();
                 age.map(|a| (r.key().clone(), a))

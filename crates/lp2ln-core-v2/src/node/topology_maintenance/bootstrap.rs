@@ -143,11 +143,11 @@ pub(super) async fn run_bootstrap_shepherd(
     peer_admission_ms: &mut HashMap<PeerId, u64>,
     our_peer_maint: &str,
 ) -> (bool, usize) {
-    if !matches!(node_role, NodeRole::BootstrapJoin)
-        || now.saturating_sub(last_shepherd_sweep_ms) < SHEPHERD_SWEEP_INTERVAL_MS
-    {
+    // Shepherd mesh peers that have already grown past the seed; any role.
+    if now.saturating_sub(last_shepherd_sweep_ms) < SHEPHERD_SWEEP_INTERVAL_MS {
         return (false, 0);
     }
+    let _ = node_role;
     let connected = router_maint.connected_peers();
     for pid in connected.iter() {
         peer_admission_ms.entry(pid.clone()).or_insert(now);
@@ -163,9 +163,6 @@ pub(super) async fn run_bootstrap_shepherd(
     }
     let mut shepherded = 0usize;
     for pid in connected.iter() {
-        if catalog.peer_is_bootstrap_entry(pid) {
-            continue;
-        }
         let Some(admitted_at) = peer_admission_ms.get(pid).copied() else {
             continue;
         };

@@ -72,12 +72,14 @@ struct NodeOptionsFile {
     /// `"addr" -> peer_id` strings for JSON maps.
     #[serde(default)]
     bootstrap_peer_hints: Option<HashMap<String, String>>,
-    #[serde(default)]
+    /// Known seed endpoints (legacy name `bootstrap_nodes`). Prefer `seed_nodes`.
+    #[serde(default, alias = "seed_nodes")]
     bootstrap_nodes: Option<Vec<BootstrapNodeFile>>,
     #[serde(default)]
     database_dir: Option<String>,
     #[serde(default)]
     log_peer_score_snapshot: bool,
+    /// Deprecated: `bootstrap_join` is treated as `regular` (seed = address book).
     #[serde(default)]
     node_role: NodeRole,
     #[serde(default)]

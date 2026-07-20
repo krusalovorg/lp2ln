@@ -29,6 +29,10 @@ struct Args {
     from: usize,
     debug_base: u32,
     debug_enabled: bool,
+    /// Delay between starting each virtual peer (0 = burst stress default).
+    join_stagger_ms: u64,
+    /// Extra random delay 0..=jitter after each stagger sleep.
+    join_jitter_ms: u64,
 }
 
 impl Default for Args {
@@ -39,6 +43,8 @@ impl Default for Args {
             from: 0,
             debug_base: DEFAULT_SCALE_DEBUG_BASE,
             debug_enabled: true,
+            join_stagger_ms: 0,
+            join_jitter_ms: 0,
         }
     }
 }
@@ -97,6 +103,22 @@ fn parse_args() -> Args {
             result.debug_enabled = true;
             i += 1;
             continue;
+        } else if item == "--join-stagger-ms" {
+            if i + 1 < args.len() {
+                if let Ok(n) = args[i + 1].parse::<u64>() {
+                    result.join_stagger_ms = n;
+                }
+                i += 2;
+                continue;
+            }
+        } else if item == "--join-jitter-ms" {
+            if i + 1 < args.len() {
+                if let Ok(n) = args[i + 1].parse::<u64>() {
+                    result.join_jitter_ms = n;
+                }
+                i += 2;
+                continue;
+            }
         }
         i += 1;
     }
@@ -519,6 +541,18 @@ async fn main() -> anyhow::Result<()> {
             debug_ws_note
         );
         nodes.push(node);
+        if peer_idx + 1 < peer_end {
+            let mut delay = args.join_stagger_ms;
+            if args.join_jitter_ms > 0 {
+                // Deterministic jitter from peer index (no extra rng dep).
+                let j = (peer_idx as u64).wrapping_mul(2654435761)
+                    % (args.join_jitter_ms.saturating_add(1));
+                delay = delay.saturating_add(j);
+            }
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
     }
 
     lp2ln_core_v2::info!(

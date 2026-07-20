@@ -160,6 +160,8 @@ impl KnownPeerRecord {
 pub struct PeerCatalog {
     peers: DashMap<PeerId, KnownPeerRecord>,
     max_peers: usize,
+    /// Anti-flood: descriptor upserts per peer_id per 1s window.
+    upsert_rate: DashMap<PeerId, (u64, u32)>,
 }
 
 impl Default for PeerCatalog {
@@ -177,6 +179,7 @@ impl PeerCatalog {
         Self {
             peers: DashMap::new(),
             max_peers: max_peers.max(128),
+            upsert_rate: DashMap::new(),
         }
     }
 
@@ -240,6 +243,19 @@ impl PeerCatalog {
             return Ok(false);
         }
         let pid = PeerId::from(descriptor.peer_id.as_str());
+        const MAX_UPSERTS_PER_PEER_PER_SEC: u32 = 8;
+        let now = now_ms();
+        {
+            let mut slot = self.upsert_rate.entry(pid.clone()).or_insert((now, 0));
+            if now.saturating_sub(slot.0) >= 1_000 {
+                slot.0 = now;
+                slot.1 = 0;
+            }
+            slot.1 = slot.1.saturating_add(1);
+            if slot.1 > MAX_UPSERTS_PER_PEER_PER_SEC {
+                return Ok(false);
+            }
+        }
         let mut rec = self
             .peers
             .entry(pid.clone())
@@ -253,7 +269,7 @@ impl PeerCatalog {
             }
         }
         rec.descriptor = Some(descriptor);
-        rec.view.last_updated_ms = now_ms();
+        rec.view.last_updated_ms = now;
         drop(rec);
         self.enforce_max_peers();
         Ok(true)
@@ -348,16 +364,30 @@ impl PeerCatalog {
         for mut rec in self.peers.iter_mut() {
             let (relay, storage, routing, load_penalty, nat, up): (f32, f32, f32, f32, f32, f32) =
                 if let Some(desc) = rec.descriptor.as_ref() {
-                    let relay = if desc.capabilities.can_relay { 1.0 } else { 0.2 };
-                    let storage =
-                        if desc.capabilities.can_store_data { 1.0 } else { 0.2 };
-                    let routing =
-                        if desc.capabilities.public_reachable { 0.9 } else { 0.4 };
+                    let relay = if desc.capabilities.can_relay {
+                        1.0
+                    } else {
+                        0.2
+                    };
+                    let storage = if desc.capabilities.can_store_data {
+                        1.0
+                    } else {
+                        0.2
+                    };
+                    let routing = if desc.capabilities.public_reachable {
+                        0.9
+                    } else {
+                        0.4
+                    };
                     let load = ((desc.dynamic_status.cpu_load
                         + desc.dynamic_status.memory_pressure)
                         / 2.0)
                         .clamp(0.0, 1.0);
-                    let nat = if desc.capabilities.public_reachable { 0.9 } else { 0.6 };
+                    let nat = if desc.capabilities.public_reachable {
+                        0.9
+                    } else {
+                        0.6
+                    };
                     let up = 1.0 - load * 0.5;
                     (relay, storage, routing, load, nat, up)
                 } else {

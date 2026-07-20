@@ -309,8 +309,7 @@ impl Router {
         let (progress_neighbors, fallback_neighbors): (Vec<_>, Vec<_>) = peers
             .into_iter()
             .filter(|n| {
-                exclude_from.as_ref() != Some(n)
-                    && !packet.nodes.iter().any(|h| h == n.as_str())
+                exclude_from.as_ref() != Some(n) && !packet.nodes.iter().any(|h| h == n.as_str())
             })
             .partition(|n| xor_distance(&node_id_of(n.as_str()), &target_nid) < our_dist);
 
@@ -321,8 +320,10 @@ impl Router {
             );
         }
 
-        let candidates: Vec<PeerId> =
-            progress_neighbors.into_iter().chain(fallback_neighbors).collect();
+        let candidates: Vec<PeerId> = progress_neighbors
+            .into_iter()
+            .chain(fallback_neighbors)
+            .collect();
 
         let wire = encode_packet(packet)?;
         let mut any_ok = false;

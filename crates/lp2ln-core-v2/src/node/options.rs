@@ -486,22 +486,10 @@ impl NodeOptions {
 
     pub fn effective_peer_connection_policy_for(
         peer_connection_policy: PeerConnectionPolicy,
-        role: NodeRole,
+        _role: NodeRole,
     ) -> PeerConnectionPolicy {
-        let p = peer_connection_policy.normalized();
-        match role {
-            NodeRole::Regular => p,
-            NodeRole::BootstrapJoin => {
-                let target = p.target_active_peers.clamp(1, 8);
-                let max = p.max_active_peers.min(24).max(target);
-                PeerConnectionPolicy {
-                    min_active_peers: p.min_active_peers.clamp(1, 2),
-                    target_active_peers: target,
-                    max_active_peers: max,
-                }
-                .normalized()
-            }
-        }
+        // BootstrapJoin is deprecated and treated identically to Regular.
+        peer_connection_policy.normalized()
     }
 
     pub fn effective_peer_connection_policy(&self) -> PeerConnectionPolicy {

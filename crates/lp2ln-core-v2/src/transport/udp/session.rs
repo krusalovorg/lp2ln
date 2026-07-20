@@ -46,6 +46,10 @@ impl Session for UdpSession {
         self.kind
     }
 
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(self.peer_addr)
+    }
+
     async fn send(&self, packet: Packet) -> Result<u64> {
         let bytes = encode_packet(packet)?;
         self.send_wire(bytes).await

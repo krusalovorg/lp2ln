@@ -41,6 +41,11 @@ pub trait Session: Send + Sync {
 
     fn kind(&self) -> LinkKind;
 
+    /// Remote socket address when known (for inbound rate-limiting). Default: unknown.
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     async fn send(&self, packet: Packet) -> Result<u64>;
 
     /// Send pre-encoded wire bytes (postcard frame payload). Default encodes via [`send`].

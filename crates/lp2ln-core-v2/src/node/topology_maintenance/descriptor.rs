@@ -31,7 +31,7 @@ pub(super) async fn publish_descriptor_if_due(
     listens: &DashMap<String, SocketAddr>,
     advertise_addrs: &HashMap<String, SocketAddr>,
     advertise_fallback_ip: Option<IpAddr>,
-    node_role: NodeRole,
+    _node_role: NodeRole,
     adaptive: &PeerConnectionPolicy,
     metrics: &AggregatedMetricsSnapshot,
     n: usize,
@@ -94,9 +94,7 @@ pub(super) async fn publish_descriptor_if_due(
     observed_addrs.sort();
     observed_addrs.dedup();
     let mut caps = NodeCapabilities::default();
-    if matches!(node_role, NodeRole::BootstrapJoin) {
-        caps.bootstrap_entry = true;
-    }
+    // bootstrap_entry is deprecated: seeds are local address-book entries, not a role.
     let base_cap = adaptive
         .max_active_peers
         .max(caps.base_session_limit as usize)

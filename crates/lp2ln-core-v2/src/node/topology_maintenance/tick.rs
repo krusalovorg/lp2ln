@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
-
 use crate::metrics::MetricsAggregator;
 use crate::metrics::contract::AggregatedMetricsSnapshot;
 use crate::node::distribution::{
@@ -12,11 +10,11 @@ use crate::node::distribution::{
 use crate::node::options::{BootstrapNode, NodeRole, TopologyTuning};
 use crate::peer_score::PeerConnectionPolicy;
 use crate::sessions::manager::SessionManager;
-use crate::topology::{CapacityBudget, NodeDescriptor, PeerCatalog, now_ms, parse_observed_addr_line};
+use crate::topology::{CapacityBudget, now_ms};
 use crate::types::PeerId;
 
 use super::policy::{AdaptiveTickPolicy, PolicySnapshot, TopologyPhase, compute_policy_snapshot};
-use super::{TopologyMaintenanceCtx, BOOTSTRAP_DIAL_OK_TTL_MS};
+use super::{BOOTSTRAP_DIAL_OK_TTL_MS, TopologyMaintenanceCtx};
 
 pub(super) struct TickState {
     pub(super) metrics: AggregatedMetricsSnapshot,
@@ -70,9 +68,8 @@ pub(super) fn prepare_tick(
         .target_active_peers
         .max(adaptive.min_active_peers)
         .min(adaptive.max_active_peers);
-    if matches!(node_role, NodeRole::Regular) {
-        desired = desired.min(auto_target_regular);
-    }
+    // All roles use the same auto dial target (BootstrapJoin ≡ Regular).
+    desired = desired.min(auto_target_regular);
     let reserve_slots = dial_reserve_slots(node_role);
     let dial_target_base = desired
         .saturating_sub(reserve_slots)
@@ -83,16 +80,18 @@ pub(super) fn prepare_tick(
         g.retain(|_, ts| now.saturating_sub(*ts) < BOOTSTRAP_DIAL_OK_TTL_MS);
     }
     let dial_ok_snap = bootstrap_dial_ok_ms.lock().unwrap().clone();
-    let connected_bootstrap_now = effective_bootstrap_connected_count(
+    let connected_bootstrap_now = crate::node::seed_book::connected_seed_count_with_recent(
         &connected_snapshot,
         ctx.catalog,
         bootstrap_targets,
         ctx.dial_book,
         &dial_ok_snap,
         now,
+        BOOTSTRAP_DIAL_OK_TTL_MS,
     );
-    let connected_non_bootstrap_now =
-        connected_snapshot.len().saturating_sub(connected_bootstrap_now);
+    let connected_non_bootstrap_now = connected_snapshot
+        .len()
+        .saturating_sub(connected_bootstrap_now);
     let PolicySnapshot {
         phase,
         adaptive_tick,
@@ -132,67 +131,4 @@ pub(super) fn prepare_tick(
         reseed_for_bridge,
         now,
     }
-}
-
-fn effective_bootstrap_connected_count(
-    connected: &[PeerId],
-    catalog: &PeerCatalog,
-    bootstrap_targets: &[BootstrapNode],
-    dial_book: &DashMap<PeerId, Vec<(String, SocketAddr)>>,
-    bootstrap_dial_ok_ms: &HashMap<SocketAddr, u64>,
-    now: u64,
-) -> usize {
-    use std::collections::HashSet;
-    let mut seen: HashSet<PeerId> = HashSet::new();
-    for p in connected {
-        if catalog.peer_is_bootstrap_entry(p) {
-            seen.insert(p.clone());
-            continue;
-        }
-        if let Some(desc) = catalog.descriptor_of(p) {
-            if bootstrap_targets
-                .iter()
-                .any(|t| descriptor_announces_bootstrap_target(&desc, t))
-            {
-                seen.insert(p.clone());
-                continue;
-            }
-        }
-        if let Some(entry) = dial_book.get(p) {
-            let hinted = bootstrap_targets
-                .iter()
-                .any(|t| t.peer_id_hint.as_ref() == Some(p));
-            let addr_match = bootstrap_targets.iter().any(|t| {
-                entry.value().iter().any(|(proto, addr)| {
-                    *addr == t.addr
-                        && (t.protocols.is_empty()
-                            || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(proto)))
-                })
-            });
-            if hinted || addr_match {
-                seen.insert(p.clone());
-            }
-        }
-    }
-    if !seen.is_empty() {
-        return seen.len();
-    }
-    let any_recent_dial = bootstrap_targets.iter().any(|t| {
-        bootstrap_dial_ok_ms
-            .get(&t.addr)
-            .copied()
-            .map(|ts| now.saturating_sub(ts) < BOOTSTRAP_DIAL_OK_TTL_MS)
-            .unwrap_or(false)
-    });
-    if any_recent_dial { 1 } else { 0 }
-}
-
-fn descriptor_announces_bootstrap_target(desc: &NodeDescriptor, t: &BootstrapNode) -> bool {
-    desc.observed_addrs.iter().any(|line| {
-        parse_observed_addr_line(line).is_some_and(|(proto, addr)| {
-            addr == t.addr
-                && (t.protocols.is_empty()
-                    || t.protocols.iter().any(|tp| tp.eq_ignore_ascii_case(&proto)))
-        })
-    })
 }

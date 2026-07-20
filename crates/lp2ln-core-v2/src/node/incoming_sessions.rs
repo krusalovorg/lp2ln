@@ -1,24 +1,22 @@
-﻿use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::node::distribution::OVERLOAD_REDIRECT_DESCRIPTOR_LIMIT;
 
-/// Сколько regular-дескрипторов слать newcomer'у proactive-сразу после handshake
+/// Сколько дескрипторов слать newcomer'у proactive сразу после handshake
 /// (чтобы не ждать RequestPeers → быстрое переключение на mesh).
 pub const BOOTSTRAP_PROACTIVE_PEERS_LIMIT: usize = 20;
-/// Максимальный admission jitter на bootstrap при всплеске входящих.
+/// Максимальный admission jitter при всплеске входящих.
 pub const BOOTSTRAP_ADMISSION_JITTER_MAX_MS: u64 = 3_000;
-/// Сколько менее загруженных bootstrap-соседей вкладывать в preamble
-/// при overload-редиректе, чтобы newcomer шёл сначала к ним.
+/// Сколько менее загруженных соседей вкладывать в preamble при overload-редиректе.
 pub const BOOTSTRAP_PEER_REDIRECT_PREAMBLE: usize = 3;
-/// Для regular ограничиваем входящие возле target (а не max), чтобы
+/// Для всех ролей ограничиваем входящие возле target (а не max), чтобы
 /// не раздувать degree из-за лавины входящих дозвонов.
 pub const REGULAR_INCOMING_HEADROOM: usize = 2;
+/// Per-subnet inbound accepts/redirects per second before temporary refuse.
+pub const INBOUND_SUBNET_RATE_PER_SEC: u32 = 32;
 
-
-/// Собирает до `limit` дескрипторов других bootstrap-нод, у которых
-/// `active_connections` меньше `our_ac`, отсортированных по возрастанию
-/// нагрузки. Пустой, если все другие bootstrap'ы более загружены.
+/// Least-loaded accepting peers for redirect preamble (role-agnostic).
 pub fn less_loaded_bootstrap_descriptors(
     catalog: &PeerCatalog,
     our_peer_id: &str,
@@ -27,22 +25,14 @@ pub fn less_loaded_bootstrap_descriptors(
     recent_bootstrap_hints: &std::collections::HashMap<String, u32>,
     limit: usize,
 ) -> Vec<crate::topology::NodeDescriptor> {
-    let mut candidates: Vec<_> = catalog
-        .descriptors()
-        .into_iter()
-        .filter(|d| d.peer_id != our_peer_id && d.peer_id != exclude_peer_id)
-        .filter(|d| d.capabilities.bootstrap_entry)
-        .filter(|d| d.dynamic_status.active_connections < our_active_connections)
-        .filter(descriptor_ok_for_discovery_redirect)
-        .collect();
-    candidates.sort_by_key(|d| {
-        (
-            *recent_bootstrap_hints.get(&d.peer_id).unwrap_or(&0),
-            d.dynamic_status.active_connections,
-        )
-    });
-    candidates.truncate(limit);
-    candidates
+    crate::node::seed_book::less_loaded_peer_descriptors(
+        catalog,
+        our_peer_id,
+        our_active_connections,
+        exclude_peer_id,
+        recent_bootstrap_hints,
+        limit,
+    )
 }
 use crate::node::options::{NodeOptions, NodeRole, TopologyTuning};
 use crate::packet::Packet;
@@ -158,6 +148,13 @@ pub(crate) async fn run_incoming_session_handler(
     let mut recent_bootstrap_hints: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut fairness_window_started_ms = now_ms();
+    let mut inbound_subnet_rates: std::collections::HashMap<
+        (std::net::IpAddr, u8),
+        crate::node::seed_book::InboundRateSlot,
+    > = std::collections::HashMap::new();
+    let mut global_accept_window_start_ms = now_ms();
+    let mut global_accepts_in_window: u32 = 0;
+    const GLOBAL_ACCEPTS_PER_SEC: u32 = 64;
     loop {
         let session = tokio::select! {
             _ = cancel.cancelled() => {
@@ -206,18 +203,52 @@ pub(crate) async fn run_incoming_session_handler(
                     incoming_discovery_random_fraction,
                 )
                 .await;
-                if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                    let now = now_ms();
+                let now = now_ms();
+                recent_redirect_until.insert(
+                    pid.clone(),
+                    now.saturating_add(incoming_topology_tuning.adaptive_redirect_memory_ms),
+                );
+                continue;
+            }
+
+            // Subnet + global accept budgets (DoS / flood softening).
+            let now = now_ms();
+            if let Some(remote) = session.remote_addr() {
+                let key = crate::node::seed_book::inbound_subnet_key(remote);
+                let slot = inbound_subnet_rates.entry(key).or_insert_with(|| {
+                    crate::node::seed_book::InboundRateSlot {
+                        window_start_ms: now,
+                        count: 0,
+                    }
+                });
+                if !slot.allow(now, INBOUND_SUBNET_RATE_PER_SEC) {
+                    crate::debug!(
+                        "[NodeRuntime] Reject inbound from {} (subnet rate limit)",
+                        pid
+                    );
+                    send_discovery_redirect_and_close(
+                        &router_for_incoming,
+                        session.clone(),
+                        &session_id,
+                        &pid,
+                        &our_peer_id_for_incoming,
+                        incoming_catalog.as_ref(),
+                        incoming_discovery_random_fraction,
+                    )
+                    .await;
                     recent_redirect_until.insert(
                         pid.clone(),
                         now.saturating_add(incoming_topology_tuning.adaptive_redirect_memory_ms),
                     );
+                    continue;
                 }
-                continue;
+            }
+            if now.saturating_sub(global_accept_window_start_ms) >= 1_000 {
+                global_accept_window_start_ms = now;
+                global_accepts_in_window = 0;
             }
 
             let connected_now = session_manager.distinct_peer_count();
-            let now = now_ms();
             if now.saturating_sub(fairness_window_started_ms)
                 >= incoming_topology_tuning.adaptive_redirect_memory_ms
             {
@@ -265,21 +296,23 @@ pub(crate) async fn run_incoming_session_handler(
             };
             if let AdmissionDecision::Redirect { .. } = SmartMeshPlanner.evaluate_incoming(
                 &admission_snapshot,
-                &PeerCandidate { peer_id: pid.clone(), is_bootstrap_entry: false },
+                &PeerCandidate {
+                    peer_id: pid.clone(),
+                    is_bootstrap_entry: false,
+                },
             ) {
-                let preamble = if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                    less_loaded_bootstrap_descriptors(
-                        incoming_catalog.as_ref(),
-                        &our_peer_id_for_incoming,
-                        connected_now.min(u16::MAX as usize) as u16,
-                        pid.as_str(),
-                        &recent_bootstrap_hints,
-                        BOOTSTRAP_PEER_REDIRECT_PREAMBLE,
-                    )
-                } else {
-                    Vec::new()
-                };
-                crate::debug!("[NodeRuntime] Redirect incoming session from {}: planner limit", pid);
+                let preamble = less_loaded_bootstrap_descriptors(
+                    incoming_catalog.as_ref(),
+                    &our_peer_id_for_incoming,
+                    connected_now.min(u16::MAX as usize) as u16,
+                    pid.as_str(),
+                    &recent_bootstrap_hints,
+                    BOOTSTRAP_PEER_REDIRECT_PREAMBLE,
+                );
+                crate::debug!(
+                    "[NodeRuntime] Redirect incoming session from {}: planner limit",
+                    pid
+                );
                 send_discovery_redirect_and_close_with_preamble(
                     &router_for_incoming,
                     session.clone(),
@@ -294,14 +327,30 @@ pub(crate) async fn run_incoming_session_handler(
                 for d in preamble {
                     *recent_bootstrap_hints.entry(d.peer_id).or_insert(0) += 1;
                 }
-                if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
-                    recent_redirect_until.insert(
-                        pid.clone(),
-                        now.saturating_add(incoming_topology_tuning.adaptive_redirect_memory_ms),
-                    );
-                }
+                recent_redirect_until.insert(
+                    pid.clone(),
+                    now.saturating_add(incoming_topology_tuning.adaptive_redirect_memory_ms),
+                );
                 continue;
             }
+            if global_accepts_in_window >= GLOBAL_ACCEPTS_PER_SEC {
+                crate::debug!(
+                    "[NodeRuntime] Redirect incoming session from {}: global accept budget",
+                    pid
+                );
+                send_discovery_redirect_and_close(
+                    &router_for_incoming,
+                    session.clone(),
+                    &session_id,
+                    &pid,
+                    &our_peer_id_for_incoming,
+                    incoming_catalog.as_ref(),
+                    incoming_discovery_random_fraction,
+                )
+                .await;
+                continue;
+            }
+            global_accepts_in_window = global_accepts_in_window.saturating_add(1);
             session_manager.register(pid, session_id.clone(), session.clone());
         } else {
             session_manager.register_session(session_id.clone(), session.clone());
@@ -315,9 +364,9 @@ pub(crate) async fn run_incoming_session_handler(
             let peer_id_str = session.peer_id().unwrap().to_string();
             let pid = PeerId::from(peer_id_str.as_str());
 
-            // Admission jitter на bootstrap при всплеске входящих: размазывает
-            // ack во времени, чтобы 100 newcomer'ов не стартовали синхронно.
-            if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
+            // Admission jitter при всплеске входящих: размазывает
+            // ack во времени, чтобы newcomers не стартовали синхронно.
+            {
                 let connected_now_after = session_manager.distinct_peer_count();
                 if connected_now_after >= incoming_policy.target_active_peers {
                     let jitter_ms = rand::random::<u64>() % BOOTSTRAP_ADMISSION_JITTER_MAX_MS;
@@ -358,16 +407,14 @@ pub(crate) async fn run_incoming_session_handler(
                 }
             }
 
-            // Proactive PeersResponse: bootstrap сразу отдаёт newcomer'у
-            // top-N достижимых regular-дескрипторов. Это выключает hub-фазу
-            // быстрее: peer начинает формировать mesh до следующего RequestPeers.
-            if matches!(incoming_node_role, NodeRole::BootstrapJoin) {
+            // Proactive PeersResponse: сразу отдаём newcomer'у top-N достижимых
+            // дескрипторов, чтобы mesh формировался до следующего RequestPeers.
+            {
                 let descriptors = select_peers_for_discovery_response(
                     incoming_catalog
                         .descriptors()
                         .into_iter()
                         .filter(|d| d.peer_id != peer_id_str)
-                        .filter(|d| !d.capabilities.bootstrap_entry)
                         .filter(descriptor_ok_for_discovery_redirect)
                         .collect(),
                     Some(&peer_id_str),

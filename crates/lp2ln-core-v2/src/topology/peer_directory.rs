@@ -284,26 +284,20 @@ mod tests {
         let now = 100_000u64;
 
         // Первый набор LAN-адресов.
-        dir.replace_lan_addresses(
-            &pid,
-            &[("tcp".into(), make_addr(1111))],
-            now + 60_000,
-            now,
-        );
+        dir.replace_lan_addresses(&pid, &[("tcp".into(), make_addr(1111))], now + 60_000, now);
         let book = dir.dial_book(now);
         assert_eq!(book[&pid].len(), 1);
         assert_eq!(book[&pid][0].1.port(), 1111);
 
         // Замена (новый boot_id).
-        dir.replace_lan_addresses(
-            &pid,
-            &[("tcp".into(), make_addr(2222))],
-            now + 60_000,
-            now,
-        );
+        dir.replace_lan_addresses(&pid, &[("tcp".into(), make_addr(2222))], now + 60_000, now);
         let book = dir.dial_book(now);
         assert_eq!(book[&pid].len(), 1);
-        assert_eq!(book[&pid][0].1.port(), 2222, "старый LAN-адрес должен быть заменён");
+        assert_eq!(
+            book[&pid][0].1.port(),
+            2222,
+            "старый LAN-адрес должен быть заменён"
+        );
     }
 
     #[test]
@@ -325,12 +319,7 @@ mod tests {
         }
 
         // LAN replace не должен его трогать.
-        dir.replace_lan_addresses(
-            &pid,
-            &[("tcp".into(), make_addr(9090))],
-            now + 60_000,
-            now,
-        );
+        dir.replace_lan_addresses(&pid, &[("tcp".into(), make_addr(9090))], now + 60_000, now);
 
         let book = dir.dial_book(now);
         let ports: Vec<u16> = book[&pid].iter().map(|(_, a)| a.port()).collect();

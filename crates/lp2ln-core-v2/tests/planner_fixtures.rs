@@ -48,8 +48,14 @@ fn dial_when_under_target() {
 
     // 2 connected, target 8 → should want to dial
     snap.connected_peers = vec![peer("p1"), peer("p2")];
-    snap.dial_book.insert(peer("p3"), vec![("tcp".into(), "127.0.0.1:9003".parse().unwrap())]);
-    snap.dial_book.insert(peer("p4"), vec![("tcp".into(), "127.0.0.1:9004".parse().unwrap())]);
+    snap.dial_book.insert(
+        peer("p3"),
+        vec![("tcp".into(), "127.0.0.1:9003".parse().unwrap())],
+    );
+    snap.dial_book.insert(
+        peer("p4"),
+        vec![("tcp".into(), "127.0.0.1:9004".parse().unwrap())],
+    );
 
     let plan = planner.plan(&snap);
 
@@ -67,7 +73,10 @@ fn no_dial_when_at_target() {
     for (i, p) in snap.connected_peers.iter().enumerate() {
         snap.dial_book.insert(
             p.clone(),
-            vec![("tcp".into(), format!("127.0.0.1:{}", 9000 + i).parse().unwrap())],
+            vec![(
+                "tcp".into(),
+                format!("127.0.0.1:{}", 9000 + i).parse().unwrap(),
+            )],
         );
     }
 
@@ -91,7 +100,10 @@ fn drop_when_over_max() {
     let plan = planner.plan(&snap);
 
     assert!(!plan.drop.is_empty(), "should drop when over max");
-    assert!(plan.drop.len() <= 20, "should not drop more than connected count");
+    assert!(
+        plan.drop.len() <= 20,
+        "should not drop more than connected count"
+    );
 }
 
 #[test]
@@ -104,7 +116,10 @@ fn discovery_when_under_target() {
 
     let plan = planner.plan(&snap);
 
-    assert!(!plan.discovery.is_empty(), "should request peers when under target");
+    assert!(
+        !plan.discovery.is_empty(),
+        "should request peers when under target"
+    );
     let req_from = &plan.discovery[0].request_from;
     assert!(req_from.contains(&peer("p1")) && req_from.contains(&peer("p2")));
 }
@@ -134,8 +149,10 @@ fn cooldown_peers_not_dialed() {
     let mut snap = base_snapshot();
 
     let p = peer("coolpeer");
-    snap.dial_book
-        .insert(p.clone(), vec![("tcp".into(), "127.0.0.1:9001".parse().unwrap())]);
+    snap.dial_book.insert(
+        p.clone(),
+        vec![("tcp".into(), "127.0.0.1:9001".parse().unwrap())],
+    );
     // cooldown expires in the future
     snap.dial_cooldowns.insert(p.clone(), snap.now_ms + 60_000);
 
@@ -153,7 +170,10 @@ fn admission_accept_when_under_hard_limit() {
     let mut snap = base_snapshot();
     snap.connected_peers = (0..4).map(|i| peer(&format!("c{i}"))).collect(); // target=8, hard limit > 4
 
-    let candidate = PeerCandidate { peer_id: peer("newcomer"), is_bootstrap_entry: false };
+    let candidate = PeerCandidate {
+        peer_id: peer("newcomer"),
+        is_bootstrap_entry: false,
+    };
     let decision = planner.evaluate_incoming(&snap, &candidate);
 
     assert!(
@@ -169,11 +189,17 @@ fn admission_redirect_when_over_hard_limit() {
     // target=8, headroom=2 → hard limit=10 for Regular; connect 12
     snap.connected_peers = (0..12).map(|i| peer(&format!("c{i:02}"))).collect();
 
-    let candidate = PeerCandidate { peer_id: peer("newcomer"), is_bootstrap_entry: false };
+    let candidate = PeerCandidate {
+        peer_id: peer("newcomer"),
+        is_bootstrap_entry: false,
+    };
     let decision = planner.evaluate_incoming(&snap, &candidate);
 
     assert!(
-        matches!(decision, lp2ln_core_v2::topology::AdmissionDecision::Redirect { .. }),
+        matches!(
+            decision,
+            lp2ln_core_v2::topology::AdmissionDecision::Redirect { .. }
+        ),
         "should redirect when over hard limit"
     );
 }

@@ -177,6 +177,11 @@ impl NodeRuntime {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        if matches!(self.options.node_role, crate::node::NodeRole::BootstrapJoin) {
+            crate::warn!(
+                "[NodeRuntime] node_role=bootstrap_join is deprecated; treating as regular (seed = address book)"
+            );
+        }
         super::startup::run_startup(self).await
     }
 

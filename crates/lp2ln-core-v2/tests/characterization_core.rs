@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -423,8 +423,6 @@ fn descriptor(peer_id: &str, bootstrap_entry: bool, active_connections: u16) -> 
     )
 }
 
-
-
 #[tokio::test]
 async fn router_drains_buffered_packets_on_cancel() {
     // Regression for the shutdown packet-loss bug: when the router is
@@ -478,7 +476,6 @@ async fn router_drains_buffered_packets_on_cancel() {
 
 #[test]
 fn distribution_bootstrap_quota_skips_extra_bootstrap_after_regular_has_mesh_peers() {
-    let desc = descriptor("bootstrap", true, 1);
     let regular_policy = PeerConnectionPolicy {
         min_active_peers: 2,
         target_active_peers: 4,
@@ -486,7 +483,7 @@ fn distribution_bootstrap_quota_skips_extra_bootstrap_after_regular_has_mesh_pee
     };
 
     assert!(should_skip_for_bootstrap_quota(
-        &desc,
+        true,
         NodeRole::Regular,
         1,
         2,
@@ -494,7 +491,7 @@ fn distribution_bootstrap_quota_skips_extra_bootstrap_after_regular_has_mesh_pee
         regular_policy.min_active_peers,
     ));
     assert!(!should_skip_for_bootstrap_quota(
-        &desc,
+        true,
         NodeRole::BootstrapJoin,
         100,
         1,

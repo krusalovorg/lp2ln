@@ -2,15 +2,16 @@ pub mod addressing;
 pub mod autonomy;
 pub mod builder;
 pub mod direct_upgrade;
-pub mod lan_discovery;
 pub mod distribution;
 pub mod flow_trace;
 pub mod health_server;
 pub mod incoming_sessions;
+pub mod lan_discovery;
 pub mod nat_traversal;
 pub mod options;
 mod options_file;
 pub mod runtime;
+pub mod seed_book;
 mod supervisor;
 pub mod topology_maintenance;
 

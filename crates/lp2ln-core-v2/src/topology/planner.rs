@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 
-use crate::node::distribution::BOOTSTRAP_INCOMING_HEADROOM;
-use crate::node::options::TopologyTuning;
-use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::NodeDescriptor;
+use crate::topology::snapshot::TopologySnapshot;
 use crate::types::PeerId;
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -57,7 +55,9 @@ pub struct PeerCandidate {
 pub enum AdmissionDecision {
     Accept,
     /// Redirect newcomer to alternative peers; caller closes the session.
-    Redirect { descriptors: Vec<NodeDescriptor> },
+    Redirect {
+        descriptors: Vec<NodeDescriptor>,
+    },
     Reject,
 }
 
@@ -74,30 +74,3 @@ pub trait TopologyPlanner: Send + Sync {
         candidate: &PeerCandidate,
     ) -> AdmissionDecision;
 }
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
-/// Mirrors `incoming_sessions::adaptive_bootstrap_hard_limit`.
-pub(crate) fn adaptive_bootstrap_hard_limit(
-    tuning: &TopologyTuning,
-    policy: &crate::peer_score::PeerConnectionPolicy,
-    known_peers: usize,
-) -> usize {
-    if !tuning.adaptive_topology_enabled {
-        return policy
-            .target_active_peers
-            .saturating_add(BOOTSTRAP_INCOMING_HEADROOM)
-            .min(policy.max_active_peers);
-    }
-    let base = policy.target_active_peers.max(1);
-    let cap = tuning.adaptive_bootstrap_hard_max.max(4);
-    let candidate = if known_peers <= 24 {
-        base.saturating_add(3)
-    } else if known_peers <= 96 {
-        base.saturating_add(2)
-    } else {
-        base.saturating_add(1)
-    };
-    candidate.min(cap).min(policy.max_active_peers.max(base))
-}
-
