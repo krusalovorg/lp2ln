@@ -59,11 +59,13 @@ def _parse_tcp_addrs(observed: Iterable[str]) -> List[Tuple[str, int]]:
 @dataclass
 class TopologyGraph:
     """nodes[peer_id] — последний дескриптор.
-    edges (a,b) — у ноды a активная сессия к peer b (ответ RequestAdjacency).
-    catalog_edges — опционально «a упомянула b в PeersResponse» (каталог, не TCP)."""
+    edges (a,b) — активная сессия между peer'ами (debug-ws / RequestAdjacency).
+    edge_protocols[(a,b)] — набор протоколов на ненаправленном ребре (tcp/udp/quic/…).
+    catalog_edges — опционально «a упомянула b в PeersResponse» (каталог, не сессия)."""
 
     nodes: Dict[str, dict] = field(default_factory=dict)
     edges: Set[Tuple[str, str]] = field(default_factory=set)
+    edge_protocols: Dict[Tuple[str, str], Set[str]] = field(default_factory=dict)
     catalog_edges: Set[Tuple[str, str]] = field(default_factory=set)
     seeds: List[str] = field(default_factory=list)
     unreachable: Dict[str, str] = field(default_factory=dict)
@@ -71,6 +73,12 @@ class TopologyGraph:
     seed_tcp: Optional[Tuple[str, int]] = None
     # Последний набор ws://… для debug-ws (после скана или из fixed_urls) — для повторных опросов без скана
     debug_ws_urls: Optional[List[str]] = None
+    # Короткий статус для HUD во время длинного скана/загрузки (1000 пиров)
+    progress_note: str = ""
+    # Счётчики активных сессий по протоколу (сумма по всем snapshot; каждая сторона считает свою).
+    session_hits: Dict[str, int] = field(default_factory=dict)
+    # Уникальные (self, peer, proto) — без двойного учёта одной стороны дважды в одном snapshot.
+    _session_seen: Set[Tuple[str, str, str]] = field(default_factory=set, repr=False)
 
     def merge_descriptor(self, desc: dict[str, Any]) -> str:
         pid = str(desc.get("peer_id", ""))
@@ -84,6 +92,219 @@ class TopologyGraph:
         if pid:
             self.catalog_edges.add((source_peer, pid))
         return pid
+
+    def add_session_edge(self, a: str, b: str, protocol: Optional[str] = None) -> None:
+        """Ребро сессии + опциональный протокол (tcp/udp/quic/…)."""
+        if not a or not b or a == b:
+            return
+        self.edges.add((a, b))
+        key = (a, b) if a <= b else (b, a)
+        if protocol is not None and str(protocol).strip():
+            self.edge_protocols.setdefault(key, set()).add(normalize_link_protocol(protocol))
+        else:
+            self.edge_protocols.setdefault(key, set())
+
+
+def normalize_link_protocol(raw: Optional[str]) -> str:
+    """Сводит LinkKind/строку debug snapshot к семейству: tcp|udp|quic|tunnel_tcp|tunnel_udp|relay|unknown."""
+    s = (raw or "").strip().lower().replace("-", "_")
+    if s in ("tcp", "directtcp", "direct_tcp"):
+        return "tcp"
+    if s in ("udp", "directudp", "direct_udp"):
+        return "udp"
+    if s in ("quic", "directquic", "direct_quic"):
+        return "quic"
+    if s in ("tunnel_tcp", "tunneltcp"):
+        return "tunnel_tcp"
+    if s in ("tunnel_udp", "tunneludp"):
+        return "tunnel_udp"
+    if s == "relay":
+        return "relay"
+    if "quic" in s:
+        return "quic"
+    if "udp" in s and "tunnel" in s:
+        return "tunnel_udp"
+    if "tcp" in s and "tunnel" in s:
+        return "tunnel_tcp"
+    if "udp" in s:
+        return "udp"
+    if "tcp" in s:
+        return "tcp"
+    if "relay" in s:
+        return "relay"
+    return s or "unknown"
+
+
+def protocol_counts_from_graph(g: "TopologyGraph") -> Dict[str, int]:
+    """Сколько ненаправленных рёбер несут каждый протокол (ребро с tcp+udp считается в обоих)."""
+    counts: Dict[str, int] = {}
+    seen_keys: Set[Tuple[str, str]] = set()
+    for a, b in g.edges:
+        if not a or not b or a == b:
+            continue
+        key = (a, b) if a <= b else (b, a)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        protos = g.edge_protocols.get(key) or set()
+        # Убрать пустые; если протоколов нет — unknown
+        clean = {p for p in protos if p}
+        if not clean:
+            counts["unknown"] = counts.get("unknown", 0) + 1
+            continue
+        for p in clean:
+            counts[p] = counts.get(p, 0) + 1
+    return counts
+
+
+def protocol_stats_report(g: "TopologyGraph") -> Dict[str, Any]:
+    """Сводка по протоколам для HUD / topo.json."""
+    edges = protocol_counts_from_graph(g)
+    sessions = {
+        k: int(v)
+        for k, v in sorted((getattr(g, "session_hits", None) or {}).items())
+        if not str(k).endswith("_reported")
+    }
+    sessions_reported = {
+        k.replace("_reported", ""): int(v)
+        for k, v in (getattr(g, "session_hits", None) or {}).items()
+        if str(k).endswith("_reported")
+    }
+    total_e = sum(edges.values())
+    total_s = sum(sessions.values())
+    share_e = (
+        {k: round(v / total_e, 4) for k, v in edges.items()} if total_e else {}
+    )
+    share_s = (
+        {k: round(v / total_s, 4) for k, v in sessions.items()} if total_s else {}
+    )
+    dominant_e = max(edges.items(), key=lambda kv: kv[1])[0] if edges else None
+    return {
+        "edges_by_protocol": edges,
+        "sessions_by_protocol": sessions,
+        "sessions_by_protocol_reported": sessions_reported,
+        "edge_share": share_e,
+        "session_share": share_s,
+        "dominant_edge_protocol": dominant_e,
+        "edges_total_proto_marks": total_e,
+        "sessions_unique_undirected": total_s,
+    }
+
+
+def _undirected_key(a: str, b: str) -> Tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def filter_topology(
+    g: "TopologyGraph",
+    *,
+    age: str = "all",
+    protocol: str = "all",
+    scope: str = "all",
+    new_node_ids: Optional[Set[str]] = None,
+    new_edge_set: Optional[Set[Tuple[str, str]]] = None,
+) -> "TopologyGraph":
+    """Фильтр графа для UI.
+
+    age: all|new|old — по сравнению с предыдущим кадром (new_*/old).
+    protocol: all|tcp|udp|quic|tunnel_tcp|tunnel_udp|relay|unknown
+    scope: all|core|iso — вся сеть / только с сессиями / только изоляты.
+    """
+    age_s = (age or "all").strip().lower()
+    proto_s = (protocol or "all").strip().lower()
+    scope_s = (scope or "all").strip().lower()
+    nn = set(new_node_ids or ())
+    ne = {_undirected_key(a, b) for a, b in (new_edge_set or set()) if a and b and a != b}
+
+    # Полное покрытие рёбрами (для scope=iso/core относительно исходного графа).
+    full_touch: Set[str] = set()
+    for a, b in g.edges:
+        if a and b and a != b:
+            full_touch.add(a)
+            full_touch.add(b)
+
+    keep_edges: Set[Tuple[str, str]] = set()
+    keep_proto: Dict[Tuple[str, str], Set[str]] = {}
+    for a, b in g.edges:
+        if not a or not b or a == b:
+            continue
+        key = _undirected_key(a, b)
+        if age_s == "new" and key not in ne:
+            continue
+        if age_s == "old" and key in ne:
+            continue
+        protos = {p for p in (g.edge_protocols.get(key) or set()) if p}
+        if not protos:
+            protos = {"unknown"}
+        if proto_s != "all" and proto_s not in protos:
+            continue
+        keep_edges.add((a, b))
+        keep_proto[key] = {proto_s} if proto_s != "all" else set(g.edge_protocols.get(key) or set())
+
+    if scope_s == "iso":
+        keep_nodes = {pid for pid in g.nodes if pid not in full_touch}
+        if age_s == "new":
+            keep_nodes &= nn
+        elif age_s == "old":
+            keep_nodes -= nn
+        keep_edges = set()
+        keep_proto = {}
+    else:
+        ends: Set[str] = set()
+        for a, b in keep_edges:
+            ends.add(a)
+            ends.add(b)
+        if scope_s == "core":
+            keep_nodes = set(ends)
+        else:
+            keep_nodes = set(g.nodes.keys())
+            if age_s == "new":
+                keep_nodes = set(nn) | ends
+            elif age_s == "old":
+                keep_nodes = {pid for pid in g.nodes if pid not in nn} | ends
+            else:
+                # all age: при protocol-фильтре показываем концы рёбер + остальные узлы
+                # (чтобы изоляты оставались видны, если scope=all)
+                pass
+            if proto_s != "all" and age_s == "all":
+                # протокол-фильтр: только участники этих рёбер (+ пустой граф если нет)
+                keep_nodes = set(ends) if ends else set()
+
+    final_edges: Set[Tuple[str, str]] = set()
+    final_proto: Dict[Tuple[str, str], Set[str]] = {}
+    for a, b in keep_edges:
+        if a in keep_nodes and b in keep_nodes:
+            final_edges.add((a, b))
+            key = _undirected_key(a, b)
+            if key in keep_proto:
+                final_proto[key] = set(keep_proto[key])
+
+    nodes = {pid: dict(g.nodes[pid]) for pid in keep_nodes if pid in g.nodes}
+    seeds = [s for s in g.seeds if s in keep_nodes]
+    return TopologyGraph(
+        nodes=nodes,
+        edges=final_edges,
+        edge_protocols=final_proto,
+        catalog_edges=set(),
+        seeds=seeds,
+        unreachable={},
+        seed_tcp=g.seed_tcp,
+        debug_ws_urls=list(g.debug_ws_urls) if g.debug_ws_urls else None,
+        progress_note=str(getattr(g, "progress_note", "") or ""),
+        session_hits=dict(getattr(g, "session_hits", None) or {}),
+        _session_seen=set(getattr(g, "_session_seen", None) or set()),
+    )
+
+
+def filter_label(*, age: str, protocol: str, scope: str) -> str:
+    parts = []
+    if (age or "all") != "all":
+        parts.append(f"age={age}")
+    if (protocol or "all") != "all":
+        parts.append(f"proto={protocol}")
+    if (scope or "all") != "all":
+        parts.append(f"scope={scope}")
+    return " · ".join(parts) if parts else "all"
 
 
 def _ensure_node_stub(g: TopologyGraph, peer_id: str) -> None:
@@ -101,11 +322,15 @@ def snapshot_topology_graph(g: TopologyGraph) -> TopologyGraph:
     return TopologyGraph(
         nodes={pid: dict(desc) for pid, desc in g.nodes.items()},
         edges=set(g.edges),
+        edge_protocols={k: set(v) for k, v in g.edge_protocols.items()},
         catalog_edges=set(g.catalog_edges),
         seeds=list(g.seeds),
         unreachable=dict(g.unreachable),
         seed_tcp=g.seed_tcp,
         debug_ws_urls=list(g.debug_ws_urls) if g.debug_ws_urls else None,
+        progress_note=str(getattr(g, "progress_note", "") or ""),
+        session_hits=dict(getattr(g, "session_hits", None) or {}),
+        _session_seen=set(getattr(g, "_session_seen", None) or set()),
     )
 
 
@@ -122,14 +347,23 @@ def ego_session_topology(g: TopologyGraph, focus: str) -> TopologyGraph:
             inc_edges.add((a, b))
     nodes = {pid: dict(g.nodes[pid]) for pid in inc_nodes if pid in g.nodes}
     seeds = [s for s in g.seeds if s in inc_nodes]
+    inc_proto: Dict[Tuple[str, str], Set[str]] = {}
+    for a, b in inc_edges:
+        key = (a, b) if a <= b else (b, a)
+        if key in g.edge_protocols:
+            inc_proto[key] = set(g.edge_protocols[key])
     return TopologyGraph(
         nodes=nodes,
         edges=inc_edges,
+        edge_protocols=inc_proto,
         catalog_edges=set(),
         seeds=seeds,
         unreachable={},
         seed_tcp=g.seed_tcp,
         debug_ws_urls=list(g.debug_ws_urls) if g.debug_ws_urls else None,
+        progress_note=str(getattr(g, "progress_note", "") or ""),
+        session_hits=dict(getattr(g, "session_hits", None) or {}),
+        _session_seen=set(getattr(g, "_session_seen", None) or set()),
     )
 
 
@@ -455,6 +689,8 @@ async def _scan_debug_ws_urls(
     *,
     timeout_s: float,
     workers: int,
+    on_url_found: Optional[Callable[[str], Any]] = None,
+    on_scan_progress: Optional[Callable[[int, int, int], Any]] = None,
 ) -> List[str]:
     lo = max(1, min(int(port_lo), 65535))
     hi = max(1, min(int(port_hi), 65535))
@@ -478,6 +714,13 @@ async def _scan_debug_ws_urls(
         w_eff,
         max(0.25, float(timeout_s)),
     )
+
+    async def _maybe_call(cb: Optional[Callable[..., Any]], *args: Any) -> None:
+        if cb is None:
+            return
+        res = cb(*args)
+        if asyncio.iscoroutine(res):
+            await res
 
     async def run_one(p: int) -> None:
         url = f"ws://{host}:{p}"
@@ -508,6 +751,13 @@ async def _scan_debug_ws_urls(
                         "(peer_N → 9100+N); диапазон 9090–9099 часто пуст. Сверьте --host с bind_ip "
                         "в логах scale (127.0.0.1 vs LAN), файрвол; узко: --port 9100 --port-end 9149."
                     )
+            hits = state["hits"]
+        if ok:
+            await _maybe_call(on_url_found, url)
+        if d == total or (d % step == 0) or (
+            ok and (hits in (1, 5, 10, 25, 50) or hits % 50 == 0)
+        ):
+            await _maybe_call(on_scan_progress, d, total, hits)
 
     await asyncio.gather(*(run_one(p) for p in ports))
     found.sort(key=lambda u: int(u.rsplit(":", 1)[1]))
@@ -537,6 +787,7 @@ async def _scan_debug_ws_urls(
             logger.warning(
                 "debug-ws: в диапазон включены порты <9100; у scale по умолчанию база 9100 — задайте --port 9100."
             )
+    await _maybe_call(on_scan_progress, total, total, len(found))
     return found
 
 
@@ -656,7 +907,45 @@ def _merge_debug_snapshot_to_graph(
                 continue
             _ensure_node_stub(g, a)
             _ensure_node_stub(g, b)
-            g.edges.add((a, b))
+            # Протокол уточним из sessions ниже; пока unknown если ещё нет записи.
+            g.add_session_edge(a, b, protocol=None)
+
+    # sessions[] — источник протокола (tcp/udp/quic/…) для рёбер + статистика.
+    sessions = snapshot.get("sessions") or []
+    if isinstance(sessions, list) and self_peer:
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            if s.get("is_active", True) is False:
+                continue
+            peer = str(s.get("peer_id") or "").strip()
+            if not peer or peer == self_peer:
+                continue
+            _ensure_node_stub(g, peer)
+            proto_raw = str(s.get("protocol") or "")
+            g.add_session_edge(self_peer, peer, protocol=proto_raw)
+            fam = normalize_link_protocol(proto_raw)
+            # уникально на стороне self→peer (повторный snapshot того же пира не раздувает)
+            a, b = (self_peer, peer) if self_peer <= peer else (peer, self_peer)
+            key = (a, b, fam)
+            if key not in g._session_seen:
+                g._session_seen.add(key)
+                g.session_hits[fam] = int(g.session_hits.get(fam, 0)) + 1
+
+    # sessions_by_protocol — если детального sessions нет.
+    by_proto = snapshot.get("sessions_by_protocol") or []
+    if isinstance(by_proto, list) and self_peer:
+        detailed = any(isinstance(s, dict) and s.get("peer_id") for s in (sessions or []))
+        if not detailed:
+            for row in by_proto:
+                if not isinstance(row, dict):
+                    continue
+                fam = normalize_link_protocol(str(row.get("kind") or row.get("protocol") or ""))
+                n_s = int(row.get("sessions") or 0)
+                if n_s > 0 and fam:
+                    # грубая оценка без peer_id — помечаем отдельным ключом
+                    k = f"{fam}_reported"
+                    g.session_hits[k] = int(g.session_hits.get(k, 0)) + n_s
 
 
 def _endpoint_from_ws_url(url: str) -> str:
@@ -815,6 +1104,7 @@ def crawl_network_debug_ws(
     crawl_workers: int = 8,
     request_refresh: bool = True,
     on_progress: Optional[Callable[[TopologyGraph], None]] = None,
+    progress_min_interval_s: float = 0.4,
 ) -> TopologyGraph:
     logger.info(
         "Обход debug-ws: host=%s, port=%s%s, timeout=%ss, scan_workers=%s, crawl_workers=%s",
@@ -827,17 +1117,81 @@ def crawl_network_debug_ws(
     )
     g = TopologyGraph()
     g.seed_tcp = (seed_host, seed_port)
+    emit_interval = max(0.15, float(progress_min_interval_s))
 
-    async def run_collect() -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, str]]:
+    async def run_pipeline() -> Tuple[List[str], int, int]:
+        """Скан + загрузка snapshot конвейером: UI получает узлы ещё до конца скана."""
         fixed = [u.strip() for u in (fixed_debug_ws_urls or []) if u and str(u).strip()]
+        w_snap = max(1, min(int(crawl_workers), 32))
+        if sys.platform == "win32":
+            w_snap = min(w_snap, 12)
+        fetch_sem = asyncio.Semaphore(w_snap)
+        lock = asyncio.Lock()
+        fetch_tasks: Set[asyncio.Task] = set()
+        state = {"ok": 0, "fail": 0, "emit_t": 0.0, "urls": 0}
+
+        def emit_progress(*, force: bool = False, note: str = "") -> None:
+            if on_progress is None:
+                return
+            now = time.monotonic()
+            if not force and (now - float(state["emit_t"])) < emit_interval:
+                return
+            state["emit_t"] = now
+            if note:
+                g.progress_note = note
+            on_progress(snapshot_topology_graph(g))
+
+        async def fetch_and_merge(url: str) -> None:
+            endpoint = url.removeprefix("ws://")
+            try:
+                async with fetch_sem:
+                    snap = await _fetch_debug_snapshot(
+                        url,
+                        timeout_s=max(0.25, float(timeout)),
+                        request_refresh=request_refresh,
+                    )
+                async with lock:
+                    _merge_debug_snapshot_to_graph(
+                        g, snap, endpoint, include_catalog_edges=include_catalog_edges
+                    )
+                    state["ok"] += 1
+                    note = (
+                        f"snapshot {state['ok']}+{state['fail']}/{state['urls']} "
+                        f"· узлов {len(g.nodes)} · рёбер {len(g.edges)}"
+                    )
+                    emit_progress(note=note)
+            except Exception as e:
+                logger.debug("debug-ws snapshot: ошибка %s → %s: %s", url, type(e).__name__, e)
+                async with lock:
+                    g.unreachable[url] = f"{type(e).__name__}: {e}"
+                    state["fail"] += 1
+                    emit_progress(
+                        note=f"snapshot {state['ok']}+{state['fail']}/{state['urls']} · err++"
+                    )
+
+        def schedule_fetch(url: str) -> None:
+            state["urls"] += 1
+            t = asyncio.create_task(fetch_and_merge(url))
+            fetch_tasks.add(t)
+
+            def _done(task: asyncio.Task) -> None:
+                fetch_tasks.discard(task)
+
+            t.add_done_callback(_done)
+
         if fixed:
             urls = fixed
             logger.info(
                 "debug-ws: скан порта пропущен, используем %s заданных endpoint(s)",
                 len(urls),
             )
+            g.progress_note = f"загрузка {len(urls)} snapshot…"
+            emit_progress(force=True, note=g.progress_note)
+            for u in urls:
+                schedule_fetch(u)
         elif seed_port_end is None:
             urls = [f"ws://{seed_host}:{seed_port}"]
+            schedule_fetch(urls[0])
         else:
             urls = await _scan_debug_ws_urls(
                 seed_host,
@@ -845,49 +1199,29 @@ def crawl_network_debug_ws(
                 int(seed_port_end),
                 timeout_s=max(0.25, float(timeout)),
                 workers=max(1, int(scan_workers)),
+                on_url_found=schedule_fetch,
+                on_scan_progress=lambda done, total, hits: emit_progress(
+                    note=f"скан портов {done}/{total}, ws={hits}, узлов уже {len(g.nodes)}"
+                ),
             )
-        snapshots: Dict[str, Dict[str, Any]] = {}
-        errors: Dict[str, str] = {}
-        if not urls:
-            return urls, snapshots, errors
 
-        w_snap = max(1, min(int(crawl_workers), len(urls), 64))
-        logger.info(
-            "debug-ws: загрузка snapshot с %s endpoint(s), parallel=%s, refresh_cmd=%s",
-            len(urls),
-            w_snap,
-            request_refresh,
+        if fetch_tasks:
+            logger.info(
+                "debug-ws: ожидание %s snapshot-задач (parallel≤%s)",
+                len(fetch_tasks),
+                w_snap,
+            )
+            await asyncio.gather(*list(fetch_tasks), return_exceptions=True)
+
+        g.debug_ws_urls = list(urls)
+        g.progress_note = (
+            f"готово: ws={len(urls)} ok={state['ok']} fail={state['fail']} "
+            f"узлов={len(g.nodes)} рёбер={len(g.edges)}"
         )
-        sem = asyncio.Semaphore(w_snap)
-        lock = asyncio.Lock()
+        emit_progress(force=True, note=g.progress_note)
+        return urls, int(state["ok"]), int(state["fail"])
 
-        async def one(url: str) -> None:
-            try:
-                async with sem:
-                    snap = await _fetch_debug_snapshot(
-                        url,
-                        timeout_s=max(0.25, float(timeout)),
-                        request_refresh=request_refresh,
-                    )
-                async with lock:
-                    snapshots[url] = snap
-            except Exception as e:
-                logger.debug("debug-ws snapshot: ошибка %s → %s: %s", url, type(e).__name__, e)
-                async with lock:
-                    errors[url] = f"{type(e).__name__}: {e}"
-
-        await asyncio.gather(*(one(u) for u in urls))
-        if errors:
-            sample = list(errors.items())[:8]
-            logger.warning(
-                "debug-ws: не удалось получить snapshot с %s/%s endpoint(s); примеры: %s",
-                len(errors),
-                len(urls),
-                sample,
-            )
-        return urls, snapshots, errors
-
-    urls, snapshots, errors = _asyncio_run_on_thread_loop(run_collect())
+    urls, n_ok, n_fail = _asyncio_run_on_thread_loop(run_pipeline())
     if not urls:
         logger.warning(
             "debug-ws: в диапазоне %s:%s..%s ни один порт не ответил WebSocket. "
@@ -899,32 +1233,24 @@ def crawl_network_debug_ws(
             seed_port_end,
         )
         g.unreachable[f"ws://{seed_host}:{seed_port}..{seed_port_end}"] = "no debug websocket in range"
+        g.progress_note = "нет WebSocket в диапазоне"
         if on_progress is not None:
             on_progress(snapshot_topology_graph(g))
         return g
 
-    for u, reason in sorted(errors.items()):
-        g.unreachable[u] = reason
-
-    for u, snap in snapshots.items():
-        endpoint = u.removeprefix("ws://")
-        try:
-            _merge_debug_snapshot_to_graph(g, snap, endpoint, include_catalog_edges=include_catalog_edges)
-        except Exception as e:
-            g.unreachable[u] = f"BadSnapshot: {e}"
-
-    if on_progress is not None:
-        on_progress(snapshot_topology_graph(g))
-
+    pstats = protocol_stats_report(g)
+    share = pstats.get("session_share") or pstats.get("edge_share") or {}
+    share_s = " ".join(f"{k}={v:.0%}" for k, v in sorted(share.items(), key=lambda kv: -kv[1]))
     logger.info(
-        "debug-ws готово: endpoints=%s ok=%s fail=%s узлов=%s рёбер=%s",
+        "debug-ws готово: endpoints=%s ok=%s fail=%s узлов=%s рёбер=%s протокол[%s] sessions=%s",
         len(urls),
-        len(snapshots),
-        len(errors),
+        n_ok,
+        n_fail,
         len(g.nodes),
         len(g.edges),
+        share_s or "n/a",
+        pstats.get("sessions_by_protocol") or {},
     )
-    g.debug_ws_urls = list(urls)
     return g
 
 
@@ -966,6 +1292,7 @@ def crawl_network(
             crawl_workers=crawl_workers,
             request_refresh=debug_request_refresh,
             on_progress=on_progress,
+            progress_min_interval_s=progress_min_interval_s,
         )
 
     # Сильный параллелизм + десятки узлов на одной машине → исчерпание ephemeral-портов / WSAENOBUFS.
@@ -1075,7 +1402,7 @@ def crawl_network(
                 for nb in neighbors:
                     if nb and nb != peer_id:
                         _ensure_node_stub(g, nb)
-                        g.edges.add((peer_id, nb))
+                        g.add_session_edge(peer_id, nb, protocol="tcp")
                 for d in descs:
                     if include_catalog_edges:
                         g.add_catalog_edge(peer_id, d)
@@ -1097,7 +1424,7 @@ def crawl_network(
         for nb in neighbors:
             if nb and nb != peer_id:
                 _ensure_node_stub(g, nb)
-                g.edges.add((peer_id, nb))
+                g.add_session_edge(peer_id, nb, protocol="tcp")
 
         for d in descs:
             if include_catalog_edges:

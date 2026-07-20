@@ -53,11 +53,11 @@ def main() -> int:
         epilog=(
             "Live-окно: нет --out, кроме «только JSON»: --json путь --once (один снимок, без окна). "
             "Иначе без --out — live; с --json без --once файл обновляется в фоне после каждого кадра.\n"
-            "Пробел — пауза/продолжить, r — сразу обновить (debug-ws: стоп потока ws + полный скан порта), [ / ] — интервал, q или Esc — выход.\n"
+            "Пробел — пауза, r — обновить, [ / ] — интервал, q/Esc — выход, e — рёбра, l — layout, c — снять фокус.\n"
+            "Фильтры (комбинируются): n — new/old/all, p — протокол, m — ядро/изоляты/all, 0 — сбросить всё.\n"
             "По умолчанию debug-ws live держит постоянные WebSocket (push snapshot); отключить: --poll-debug-ws.\n"
-            "ЛКМ по узлу — показать только его рёбра сессий (соседей); повторный клик по тому же узлу или c — весь граф.\n"
-            "Цвета: фиолетовый — узел в фокусе; красный — bootstrap; оранжевый — seed; зелёный — новый с прошлого кадра; "
-            "синий — остальные; оранжевые рёбра — новые TCP-сессии."
+            "ЛКМ по узлу — фокус на его сессии.\n"
+            "Цвета узлов/рёбер — в легенде справа на графике."
         ),
     )
     p.add_argument("--host", default="127.0.0.1", help="Адрес ноды (bootstrap / тот же bind_ip, что у scale)")
@@ -121,14 +121,20 @@ def main() -> int:
     p.add_argument(
         "--crawl-workers",
         type=int,
-        default=3 if sys.platform == "win32" else 6,
-        help="Параллельные TCP-опросы узлов при обходе; на Windows 2–3, иначе часто WinError 10055.",
+        default=8 if sys.platform == "win32" else 12,
+        help="Параллельные TCP-опросы / debug-ws snapshot; для 1000 пиров 8–12 на Windows.",
     )
     p.add_argument(
         "--progress-min-interval",
         type=float,
-        default=0.12,
-        help="Мин. интервал снимка on_progress/live, сек (реже — быстрее обход за счёт копирования графа)",
+        default=0.25,
+        help="Мин. интервал снимка on_progress/live, сек (больше — меньше нагрузка UI на 100 узлах)",
+    )
+    p.add_argument(
+        "--ui-min-interval",
+        type=float,
+        default=0.2,
+        help="Мин. интервал перерисовки live-окна, сек (throttle push-кадров)",
     )
     p.add_argument("--depth", type=int, default=1, help="Глубина обхода (1 = только соседи seed)")
     p.add_argument("--limit", type=int, default=64, help="Лимит дескрипторов в одном RequestPeers (сервер ≤64)")
@@ -165,8 +171,8 @@ def main() -> int:
     p.add_argument(
         "--layout-iterations",
         type=int,
-        default=50,
-        help="Итераций spring_layout за кадр (больше — стабильнее, медленнее)",
+        default=28,
+        help="Макс. итераций spring на холодном старте (live-кадры с теми же узлами — 0 итераций)",
     )
     p.add_argument(
         "--once",
@@ -202,6 +208,10 @@ def main() -> int:
         from lp2ln_topology.crawl import (
             crawl_network,
             ego_session_topology,
+            filter_label,
+            filter_topology,
+            protocol_counts_from_graph,
+            protocol_stats_report,
             run_debug_ws_live_streams_blocking,
         )
         from lp2ln_topology.logutil import setup_logging
@@ -276,6 +286,8 @@ def main() -> int:
                 "diameter": 0,
                 "avg_path_length": 0.0,
                 "largest_cc_size": 0,
+                "protocols": {},
+                "protocol_stats": {},
             }
         deg_vals = [deg.get(pid, 0) for pid in nodes]
 
@@ -381,17 +393,28 @@ def main() -> int:
             "bootstrap_skew": bootstrap_skew,
             "max_bootstrap_in_share": max_bootstrap_in_share,
             "bootstrap_in_share": bootstrap_in_share,
+            "protocols": protocol_counts_from_graph(topo),
+            "protocol_stats": protocol_stats_report(topo),
         }
 
     json_out_lock = threading.Lock()
 
     def build_json_snapshot(topo: Any) -> dict:
         und_edges = normalize_undirected_edges(topo.edges)
+        edge_protos = getattr(topo, "edge_protocols", None) or {}
+        edge_rows = []
+        for a, b in sorted(und_edges):
+            key = (a, b) if a <= b else (b, a)
+            protos = sorted(p for p in (edge_protos.get(key) or set()) if p)
+            row: Dict[str, Any] = {"from": a, "to": b}
+            if protos:
+                row["protocols"] = protos
+            edge_rows.append(row)
         snap = {
             "seeds": list(topo.seeds),
             "nodes": dict(topo.nodes),
-            "edges": [{"from": a, "to": b} for a, b in sorted(und_edges)],
-            "edges_note": "from-to: ненаправленное ребро сессии между двумя peer_id",
+            "edges": edge_rows,
+            "edges_note": "from-to: ненаправленное ребро сессии; protocols: tcp|udp|quic|…",
             "stats": compute_stats(topo),
             "unreachable": dict(sorted(getattr(topo, "unreachable", {}).items())),
         }
@@ -435,16 +458,17 @@ def main() -> int:
         return 0
 
     refresh_seconds = max(0.5, float(args.refresh_seconds))
-    layout_iterations = max(10, int(args.layout_iterations))
+    layout_iterations = max(1, int(args.layout_iterations))
+    ui_min_interval = max(0.05, float(args.ui_min_interval))
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(13, 9))
     fig.subplots_adjust(bottom=0.08)
     status_text = fig.text(
         0.02,
-        0.02,
+        0.015,
         "",
-        fontsize=9,
+        fontsize=8,
         family="monospace",
         va="bottom",
         ha="left",
@@ -453,10 +477,9 @@ def main() -> int:
     )
     fig.text(
         0.98,
-        0.02,
-        "■ фокус  ■ bootstrap  ■ seed  ■ новый  ■ узел\n"
-        "— новое ребро TCP   ·   ЛКМ — связи узла   ·   c — весь граф\n"
-        "Подписи узлов: номер из пути …/peer_N/… при однозначности, иначе уникальный номер.",
+        0.015,
+        "ЛКМ фокус · c снять · e рёбра · l layout\n"
+        "n age · p proto · m ядро/iso · 0 сброс фильтров",
         fontsize=8,
         family="sans-serif",
         va="bottom",
@@ -471,6 +494,18 @@ def main() -> int:
         "focus_peer_id": None,
         "debug_stream": False,
         "stream_started": 0.0,
+        # None = auto (edges on); True/False = forced by hotkey e
+        "show_edges": None,
+        "last_paint_at": 0.0,
+        "force_relayout": True,  # первый кадр — качественный layout
+        "prev_core_n": 0,
+        "prev_edge_n": 0,
+        # фильтры (ортогональные)
+        "filter_age": "all",  # all|new|old
+        "filter_proto": "all",  # all|tcp|udp|quic|...
+        "filter_scope": "all",  # all|core|iso
+        "mark_new_nodes": set(),
+        "mark_new_edges": set(),
     }
     NODE_PICK_RADIUS = 18.0
     live_topo: Optional[Any] = None
@@ -540,14 +575,16 @@ def main() -> int:
             lost_edges = prev_edges - edges_now
             prev_nodes = nodes_now
             prev_edges = edges_now
+            ui["mark_new_nodes"] = set(new_nodes)
+            ui["mark_new_edges"] = set(new_edges)
             frame_idx += 1
             dn = len(new_nodes) - len(lost_nodes)
             de = len(new_edges) - len(lost_edges)
             delta_n = f"{dn:+d}" if dn else "0"
             delta_e = f"{de:+d}" if de else "0"
         else:
-            new_nodes = set()
-            new_edges = set()
+            new_nodes = set(ui.get("mark_new_nodes") or ())
+            new_edges = set(ui.get("mark_new_edges") or ())
             delta_n = "0"
             delta_e = "0"
 
@@ -556,7 +593,19 @@ def main() -> int:
             ui["focus_peer_id"] = None
             fp = None
 
-        g_draw = ego_session_topology(topo, fp) if fp else topo
+        g_base = ego_session_topology(topo, fp) if fp else topo
+        filt_age = str(ui.get("filter_age") or "all")
+        filt_proto = str(ui.get("filter_proto") or "all")
+        filt_scope = str(ui.get("filter_scope") or "all")
+        g_draw = filter_topology(
+            g_base,
+            age=filt_age,
+            protocol=filt_proto,
+            scope=filt_scope,
+            new_node_ids=new_nodes,
+            new_edge_set=new_edges,
+        )
+        fl = filter_label(age=filt_age, protocol=filt_proto, scope=filt_scope)
         st = compute_stats(g_draw)
         st_full = compute_stats(topo)
         seed_h, seed_p = (topo.seed_tcp if topo.seed_tcp else (args.host, args.port))
@@ -565,17 +614,37 @@ def main() -> int:
 
         if fp:
             title = (
-                f"LP2LN live ({mode_label}) @ {seed_h}:{seed_p}  |  {now_s}  |  фокус: {st['nodes']} узл., "
-                f"{st['edges_sessions']} рёбер (только сессии к/от узла)  |  весь граф: {st_full['nodes']} узл."
+                f"LP2LN live ({mode_label}) @ {seed_h}:{seed_p}  |  {now_s}  |  фокус  |  "
+                f"фильтр [{fl}]  |  вид: {st['nodes']}N/{st['edges_sessions']}E  (всего {st_full['nodes']})"
             )
         else:
             title = (
                 f"LP2LN live ({mode_label}) @ {seed_h}:{seed_p}  |  {now_s}  |  "
-                f"узлов {st['nodes']} (Δ{delta_n})  рёбер {st['edges_sessions']} (Δ{delta_e})"
+                f"фильтр [{fl}]  |  {st['nodes']}N (Δ{delta_n}) {st['edges_sessions']}E (Δ{delta_e})"
             )
 
         seeds_draw = set(topo.seeds) & set(g_draw.nodes.keys())
+        edges_override = ui.get("show_edges")
 
+        # Ядро = узлы с хотя бы одним ребром сессии; рост ядра/рёбер → переlayout.
+        edges_now_n = len(normalize_undirected_edges(g_draw.edges))
+        nodes_with_edge: Set[str] = set()
+        for a, b in normalize_undirected_edges(g_draw.edges):
+            nodes_with_edge.add(a)
+            nodes_with_edge.add(b)
+        core_n = len(nodes_with_edge)
+        iso_n = max(0, len(g_draw.nodes) - core_n)
+        force_lay = bool(ui.pop("force_relayout", False))
+        if bump_frame and (
+            abs(core_n - int(ui.get("prev_core_n") or 0)) >= 3
+            or abs(edges_now_n - int(ui.get("prev_edge_n") or 0)) >= 8
+        ):
+            force_lay = True
+        if bump_frame:
+            ui["prev_core_n"] = core_n
+            ui["prev_edge_n"] = edges_now_n
+
+        show_e = True if edges_override is None else bool(edges_override)
         if fp:
             draw_topology_on_axes(
                 ax,
@@ -589,6 +658,8 @@ def main() -> int:
                 layout_iterations=layout_iterations,
                 node_picker_radius=NODE_PICK_RADIUS,
                 focus_peer_id=fp,
+                show_edges=show_e,
+                force_relayout=force_lay,
             )
         else:
             prev_pos_full = draw_topology_on_axes(
@@ -603,6 +674,8 @@ def main() -> int:
                 layout_iterations=layout_iterations,
                 node_picker_radius=NODE_PICK_RADIUS,
                 focus_peer_id=None,
+                show_edges=show_e,
+                force_relayout=force_lay,
             )
 
         unreachable_n = st_full.get("unreachable", 0)
@@ -610,32 +683,70 @@ def main() -> int:
         avg_pl = st_full.get("avg_path_length", 0.0)
         largest_cc = st_full.get("largest_cc_size", 0)
         boot_skew = st_full.get("bootstrap_skew", 0.0)
-        boot_max_share = st_full.get("max_bootstrap_in_share", 0.0)
-        focus_hint = "  |  ЛКМ узел — фокус  c — весь граф" if not fp else "  |  c — весь граф"
+        proto_counts = st_full.get("protocols") or protocol_counts_from_graph(topo)
+        pstats = st_full.get("protocol_stats") or protocol_stats_report(topo)
+        sess_counts = pstats.get("sessions_by_protocol") or {}
+        proto_bits = []
+        for name in ("tcp", "udp", "quic", "tunnel_tcp", "tunnel_udp", "relay", "unknown"):
+            e_c = int(proto_counts.get(name, 0) or 0)
+            s_c = int(sess_counts.get(name, 0) or 0)
+            if e_c or s_c:
+                # E=рёбра графа, S=уникальные undirected session hits
+                if s_c and s_c != e_c:
+                    proto_bits.append(f"{name}:E{e_c}/S{s_c}")
+                elif e_c:
+                    proto_bits.append(f"{name}:{e_c}")
+                else:
+                    proto_bits.append(f"{name}:S{s_c}")
+        share = pstats.get("session_share") or pstats.get("edge_share") or {}
+        if share:
+            top = sorted(share.items(), key=lambda kv: -kv[1])[:3]
+            share_hud = " ".join(f"{k}={v:.0%}" for k, v in top)
+            proto_hud = (" ".join(proto_bits) if proto_bits else "links:0") + f"  [{share_hud}]"
+        else:
+            proto_hud = " ".join(proto_bits) if proto_bits else "links:0"
+        focus_hint = "  |  n/p/m фильтры  0 сброс" if not fp else "  |  c снять фокус"
+        filt_hud = filter_label(
+            age=str(ui.get("filter_age") or "all"),
+            protocol=str(ui.get("filter_proto") or "all"),
+            scope=str(ui.get("filter_scope") or "all"),
+        )
         if scan_phase:
+            note = str(getattr(topo, "progress_note", "") or "")
             status_text.set_text(
-                f"сканирование… {crawl_s:.1f}с (промежуточный кадр)  |  "
-                f"узлов {st_full['nodes']}  рёбер {st_full['edges_sessions']}  |  недоступно: {unreachable_n}  |  "
-                f"[{frame_idx}]  пробел пауза  r  [ ] интервал  q выход{focus_hint}"
+                f"загрузка… {crawl_s:.1f}с  |  вид {st['nodes']}N/{st['edges_sessions']}E  "
+                f"(всего ядро={core_n} iso={iso_n})  |  {proto_hud}  |  "
+                + (f"{note}  |  " if note else "")
+                + f"filter[{filt_hud}]  |  [{frame_idx}]{focus_hint}"
             )
         else:
             if ui.get("debug_stream"):
-                interval_hint = "постоянные ws (push)"
+                interval_hint = "ws-push"
             else:
-                interval_hint = f"след. кадр через {ui['refresh']:.1f}с"
+                interval_hint = f"refresh {ui['refresh']:.1f}s"
             status_text.set_text(
-                f"опрос {crawl_s:.1f}с  |  недоступно: {unreachable_n}  |  "
-                f"диаметр {diameter}  ср. путь {avg_pl}  макс.CC {largest_cc}  |  "
-                f"boot_skew {boot_skew}  boot_max_share {boot_max_share}  |  "
-                f"max_out {st_full.get('max_out', 0)}  max_in {st_full.get('max_in', 0)}  |  "
-                f"{interval_hint}  |  "
-                f"[{frame_idx}]  пробел пауза  r сразу  [ ] интервал  q выход{focus_hint}"
+                f"вид {st['nodes']}N/{st['edges_sessions']}E  |  всего ядро={core_n} iso={iso_n}  |  "
+                f"{proto_hud}  |  filter[{filt_hud}]  |  diam={diameter} CC={largest_cc}  |  "
+                f"{interval_hint} [{frame_idx}]{focus_hint}"
             )
-        fig.tight_layout()
         fig.subplots_adjust(bottom=0.08)
         fig.canvas.draw_idle()
+        ui["last_paint_at"] = time.monotonic()
 
-    def apply_topology(topo: Any, crawl_s: float, *, scan_phase: bool = False) -> None:
+    def apply_topology(
+        topo: Any,
+        crawl_s: float,
+        *,
+        scan_phase: bool = False,
+        force: bool = False,
+    ) -> None:
+        now_m = time.monotonic()
+        if (
+            not force
+            and not scan_phase
+            and (now_m - float(ui.get("last_paint_at") or 0.0)) < ui_min_interval
+        ):
+            return
         paint_graph(topo, crawl_s, scan_phase=scan_phase, bump_frame=True)
 
     def on_pick(event: Any) -> None:
@@ -680,6 +791,56 @@ def main() -> int:
         elif k == "r":
             ui["force_refresh"] = True
             logging.info("Запрошено обновление (r); для debug-ws при старте обхода сбросится кэш ws-портов")
+        elif k == "e":
+            cur = ui.get("show_edges")
+            # cycle: None(auto/on) → False → True → None
+            if cur is None:
+                ui["show_edges"] = False
+            elif cur is False:
+                ui["show_edges"] = True
+            else:
+                ui["show_edges"] = None
+            logging.info("Рёбра: %s", {None: "auto (вкл)", True: "всегда", False: "скрыты"}[ui["show_edges"]])
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
+        elif k == "l":
+            ui["force_relayout"] = True
+            logging.info("Пересчёт layout (l)")
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
+        elif k == "n":
+            order = ("all", "new", "old")
+            cur = str(ui.get("filter_age") or "all")
+            ui["filter_age"] = order[(order.index(cur) + 1) % len(order)] if cur in order else "all"
+            logging.info("Фильтр age: %s", ui["filter_age"])
+            ui["force_relayout"] = True
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
+        elif k == "p":
+            # цикл протоколов; unknown в конце
+            order = ("all", "tcp", "udp", "quic", "tunnel_tcp", "tunnel_udp", "relay", "unknown")
+            cur = str(ui.get("filter_proto") or "all")
+            ui["filter_proto"] = order[(order.index(cur) + 1) % len(order)] if cur in order else "all"
+            logging.info("Фильтр proto: %s", ui["filter_proto"])
+            ui["force_relayout"] = True
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
+        elif k == "m":
+            order = ("all", "core", "iso")
+            cur = str(ui.get("filter_scope") or "all")
+            ui["filter_scope"] = order[(order.index(cur) + 1) % len(order)] if cur in order else "all"
+            logging.info("Фильтр scope: %s", ui["filter_scope"])
+            ui["force_relayout"] = True
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
+        elif k in ("0", "a"):
+            ui["filter_age"] = "all"
+            ui["filter_proto"] = "all"
+            ui["filter_scope"] = "all"
+            logging.info("Фильтры сброшены (всё вместе)")
+            ui["force_relayout"] = True
+            if live_topo is not None:
+                paint_graph(live_topo, last_crawl_s, scan_phase=False, bump_frame=False)
         elif k == "c":
             if ui.get("focus_peer_id"):
                 ui["focus_peer_id"] = None
@@ -713,7 +874,7 @@ def main() -> int:
                     topo = pending.result()
                     drain_progress_queue()
                     crawl_s = time.perf_counter() - crawl_t0
-                    apply_topology(topo, crawl_s)
+                    apply_topology(topo, crawl_s, force=True)
                     if (
                         use_debug_stream
                         and topo.debug_ws_urls
@@ -816,10 +977,14 @@ def main() -> int:
                     )
                 else:
                     elapsed = time.perf_counter() - crawl_t0
+                    note = ""
+                    if live_topo is not None:
+                        note = str(getattr(live_topo, "progress_note", "") or "")
                     extra = f"  |  {last_error}" if last_error else ""
                     status_text.set_text(
-                        f"сканирование сети… {elapsed:.1f}с (ожидание первого узла…)  |  "
-                        f"кадр {frame_idx}  интервал {ui['refresh']:.1f}с{extra}"
+                        f"скан/загрузка… {elapsed:.1f}с"
+                        + (f"  |  {note}" if note else "  |  ожидание первого snapshot…")
+                        + f"  |  кадр {frame_idx}{extra}"
                     )
                     fig.canvas.draw_idle()
             elif ui.get("debug_stream") and pending is None:

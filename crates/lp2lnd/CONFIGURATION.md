@@ -73,19 +73,20 @@ Static known peers list.
 - Why: simple seed list without extra metadata.
 - Best for: small environments and local testing.
 
-#### `bootstrap_nodes: [{ addr, protocols, peer_id_hint? }, ...]`
+#### `bootstrap_nodes` / `seed_nodes`: `[{ addr, protocols, peer_id_hint? }, ...]`
 
-Extended bootstrap list.
+Local **seed address book** (known endpoints to dial on cold start). Alias: `seed_nodes`.
 
-- Why: better startup connectivity control in production.
+- Why: join the mesh without a special node cast — seeds are ordinary peers with known IPs.
 - `protocols` should match what those nodes actually listen on.
-- `peer_id_hint` improves early identity association and can reduce bootstrap noise.
+- `peer_id_hint` improves early identity association.
+- After join, the node prefers non-seed mesh peers (`min`/`target`/`max` apply equally to everyone).
 
 #### `bootstrap_peer_hints: { "ip:port": "peer_id" }` (optional)
 
-Peer ID hints map for bootstrap addresses.
+Peer ID hints map for seed addresses.
 
-- Why: helps map bootstrap address -> expected peer identity faster.
+- Why: helps map seed address -> expected peer identity faster.
 
 ### 2) Identity and signatures
 
@@ -169,10 +170,11 @@ Recommended starting points:
 
 ### 4) Topology and discovery tuning
 
-#### `node_role: "regular" | "bootstrap_join"`
+#### `node_role: "regular" | "bootstrap_join"` (deprecated distinction)
 
-- `regular`: normal node behavior.
-- `bootstrap_join`: constrained effective peer-policy for bootstrap-oriented role.
+- Prefer `"regular"` always.
+- `"bootstrap_join"` is **deprecated** and treated as `"regular"`: seed endpoints come from `bootstrap_nodes` / `seed_nodes`, not from a network role.
+- Wire field `capabilities.bootstrap_entry` is kept for compatibility but is no longer set or used for policy.
 
 #### `peer_discovery_random_fraction` (`0.0..0.9`)
 
@@ -338,12 +340,12 @@ Recommended:
 - `logger.show_debug=false` with file logging enabled
 - `debug_server` limited to loopback/private segment
 
-### C. Bootstrap-like entry node
+### C. Public seed / entry node (ordinary peer with known IP)
 
-- `node_role=bootstrap_join`
-- explicit, high-quality `bootstrap_nodes`
-- conservative `max_active_peers` to avoid overload
-- `topology_tuning.avoid_reseed_when_stable_bootstrap=true`
+- `node_role=regular` (preferred; `bootstrap_join` is deprecated and equivalent)
+- list this node's address in newcomers' `bootstrap_nodes` / `seed_nodes`
+- same `peer_connection_policy` as everyone else — inbound cap + redirect when full
+- `topology_tuning.avoid_reseed_when_stable_bootstrap=true` on clients is fine
 
 ## Common mistakes
 
