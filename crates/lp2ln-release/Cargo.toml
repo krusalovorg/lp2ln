@@ -1,0 +1,25 @@
+[package]
+name = "lp2ln-release"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "LP2LN release manifest types, signing, and packaging tool"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+k256 = { version = "0.13.4", features = ["ecdsa", "sha256"] }
+sha2 = "0.10.8"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+hex = "0.4.3"
+thiserror = "2"
+anyhow = "1.0"
+serde_json = "1.0"
+
+[lib]
+name = "lp2ln_release"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lp2ln-release-tool"
+path = "src/bin/release_tool.rs"

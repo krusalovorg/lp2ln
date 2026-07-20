@@ -2063,6 +2063,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "lp2ln-release"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "k256",
+ "postcard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lp2ln-updater"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lp2ln-release",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "lp2lnd"
 version = "0.0.1"
 dependencies = [
@@ -2072,9 +2098,11 @@ dependencies = [
  "futures-util",
  "lp2ln-app-sdk",
  "lp2ln-core-v2",
+ "lp2ln-release",
  "postcard",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",

@@ -1,0 +1,19 @@
+[package]
+name = "lp2ln-updater"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "LP2LN stable parent process: child supervision, health gating, and atomic rollback"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lp2ln-release = { path = "../lp2ln-release" }
+tokio = { version = "1.28", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+sha2 = "0.10.8"
+
+[[bin]]
+name = "lp2ln-updater"
+path = "src/main.rs"

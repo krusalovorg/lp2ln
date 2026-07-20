@@ -144,6 +144,7 @@ impl NodeRuntime {
                 lan_discovery: options.lan_discovery,
                 schema_version: options.schema_version,
                 topology_profile: options.topology_profile,
+                trusted_release_key: options.trusted_release_key,
             },
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,

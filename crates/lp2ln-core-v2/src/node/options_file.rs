@@ -132,6 +132,9 @@ struct NodeOptionsFile {
     dial_policy: DialPolicy,
     #[serde(default)]
     lan_discovery: LanDiscoveryOptions,
+    /// Compressed-point hex of the trusted release signing key (P5).
+    #[serde(default)]
+    trusted_release_key: Option<String>,
 }
 
 fn default_event_bus_broadcast_cap() -> usize {
@@ -266,6 +269,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             lan_discovery: file.lan_discovery,
             schema_version,
             topology_profile,
+            trusted_release_key: file.trusted_release_key,
         };
         for (protocol, addr_str) in file.listens {
             let addr: SocketAddr = addr_str
@@ -424,6 +428,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             topology_react_to_session_events: opts.topology_react_to_session_events,
             dial_policy: opts.dial_policy.clone(),
             lan_discovery: opts.lan_discovery.clone(),
+            trusted_release_key: opts.trusted_release_key.clone(),
         }
     }
 }

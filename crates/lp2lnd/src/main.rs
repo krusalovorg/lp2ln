@@ -3,6 +3,7 @@ mod app_plane_server;
 mod app_plane_streams;
 mod debug_server;
 mod ipc_tcp;
+mod update_handler;
 use lp2ln_core_v2::db::P2PDatabase;
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::logger::info;
@@ -323,6 +324,22 @@ async fn run_daemon() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Spawn update handler when running under lp2ln-updater or if a trusted
+    // release key is configured in options.
+    let _update_handler_task = node.router().and_then(|router| {
+        let trusted_key = options.trusted_release_key.clone();
+        let staging_base = options
+            .database_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./lp2ln"));
+        let node_id_str = node.peer_id().to_string();
+        update_handler::spawn(router, trusted_key, staging_base, node_id_str)
+    });
+
+    // Report healthy to parent updater (no-op if not running under one).
+    let build_id = env!("CARGO_PKG_VERSION");
+    update_handler::report_ready(build_id).await;
 
     tokio::signal::ctrl_c().await?;
     node.stop().await?;

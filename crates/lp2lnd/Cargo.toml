@@ -10,6 +10,8 @@ tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 lp2ln-core-v2 = { path = "../lp2ln-core-v2" }
+lp2ln-release = { path = "../lp2ln-release" }
+sha2 = "0.10.8"
 tokio = { version = "1.28", features = ["full"] }
 anyhow = "1.0.89"
 serde_json = "1.0"
