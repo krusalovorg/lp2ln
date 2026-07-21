@@ -33,10 +33,54 @@ pub use lp2ln_content::{
 pub use block_transfer::BlockTransferService;
 pub use dht::{DhtService, DhtStore, ProviderRecord, ValueRecord};
 
-pub type BlockStore = RedbBlockStore;
+pub type BlockStore = FsBlockStore;
 
+/// Node block store: one file per block under `{db.path}/blocks/`.
+/// redb never shrinks and serializes MiB-sized blobs through one lock,
+/// so chunks don't belong in it. Legacy in-db blocks are migrated once.
 pub fn block_store_from_db(db: Arc<P2PDatabase>) -> BlockStore {
-    RedbBlockStore::from_database(db.db.clone())
+    let root = std::path::Path::new(&db.path).join("blocks");
+    let store = FsBlockStore::new(&root).expect("create node block store dir");
+    migrate_legacy_blocks(&db, &store);
+    store
+}
+
+/// One-time migration of blocks stored in redb's BLOCK_TABLE by older versions.
+/// No-op (one cheap read txn) once the table is empty. Best-effort: on error the
+/// legacy blocks stay in redb and we retry on the next open.
+fn migrate_legacy_blocks(db: &P2PDatabase, store: &FsBlockStore) {
+    use lp2ln_content::BLOCK_TABLE;
+    use redb::ReadableTable;
+    let run = || -> anyhow::Result<usize> {
+        let lock = db.db.lock().expect("db lock");
+        {
+            let txn = lock.begin_read()?;
+            let table = txn.open_table(BLOCK_TABLE)?;
+            if table.iter()?.next().is_none() {
+                return Ok(0);
+            }
+        }
+        let txn = lock.begin_write()?;
+        let mut keys = Vec::new();
+        {
+            let mut table = txn.open_table(BLOCK_TABLE)?;
+            for item in table.iter()? {
+                let (k, v) = item?;
+                store.put(v.value())?;
+                keys.push(k.value().to_string());
+            }
+            for k in &keys {
+                table.remove(k.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(keys.len())
+    };
+    match run() {
+        Ok(0) => {}
+        Ok(n) => crate::info!("[storage] migrated {n} blocks from redb to {}/blocks", db.path),
+        Err(e) => crate::warn!("[storage] legacy block migration failed: {e}"),
+    }
 }
 
 pub fn lease_store_from_db(db: Arc<P2PDatabase>) -> LeaseStore {

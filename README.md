@@ -22,6 +22,9 @@ Decentralized P2P networking stack in Rust. The **current direction** is **`lp2l
 - [Using `lp2ln-core-v2` as a library](#using-lp2ln-core-v2-as-a-library)
 - [Run](#run)
   - [`lp2lnd` (v2 node)](#lp2lnd-v2-node)
+  - [`lp2ln-updater` (supervisor)](#lp2ln-updater-supervisor)
+  - [`lp2ln-magic-folder`](#lp2ln-magic-folder)
+  - [`lp2ln-release-tool`](#lp2ln-release-tool)
   - [`debug-ui` (web debug interface)](#debug-ui-web-debug-interface)
   - [`lp2ln-db-export`](#lp2ln-db-export)
 - [Configuration](#configuration)
@@ -62,6 +65,9 @@ Additional local docs:
 | **Crypto** | ECDH/ECDSA (k256), ChaCha20-Poly1305, SHA-256 |
 | **Storage** | Embedded [redb](https://github.com/cberner/redb) databases where enabled |
 | **Contracts** | WASM contract modules were moved to a dedicated repository; this workspace is focused on core/node crates |
+| **App Plane** | Sidecar IPC layer: `lp2lnd` exposes a Unix socket (or dev TCP) App Plane server; sidecars use `lp2ln-app-sdk` to open typed channels without speaking the raw P2P protocol |
+| **Content layer** | `lp2ln-content` — content-addressed, encrypted block storage (no networking). Used by `lp2ln-magic-folder` and future DHT/replication crates |
+| **Updater** | `lp2ln-updater` supervises `lp2lnd` as a child process and rolls back atomically when a new binary fails health checks |
 | **Debug tooling** | `debug-ui/` provides a React + Vite interface for packet/debug workflows; `lp2lnd` can expose a debug WebSocket stream |
 
 This repository is a **Cargo workspace**. There is no single root `src/main.rs`; binaries live under `crates/`.
@@ -76,22 +82,35 @@ P2P-Server/
 ├── rust-toolchain.toml     # pins stable (needed for lp2ln-core-v2 edition 2024)
 ├── LICENSE
 ├── crates/
-│   ├── lp2ln-core-v2/      # current core: equal peers, no signal server, node runtime, …
-│   ├── lp2lnd/             # binary: v2 node daemon (lp2ln-core-v2)
-│   └── lp2ln-db-export/    # binary: export redb / node DB to JSON
+│   ├── lp2ln-core-v2/          # core library: equal peers, node runtime, transports, …
+│   ├── lp2lnd/                 # binary: v2 node daemon
+│   ├── lp2ln-db-export/        # binary: export redb / node DB to JSON
+│   ├── lp2ln-app-protocol/     # library: App Plane wire protocol (sidecar ↔ daemon IPC)
+│   ├── lp2ln-app-sdk/          # library: App Plane client SDK for sidecars
+│   ├── lp2ln-content/          # library: content IDs, encryption, manifests, block store
+│   ├── lp2ln-release/          # library + tool: release manifests, signing, packaging
+│   ├── lp2ln-updater/          # binary: parent-process supervisor with atomic rollback
+│   └── lp2ln-magic-folder/     # binary: encrypted sync folder (chunk → encrypt → DHT)
 ├── debug-ui/               # React + Vite debug interface
 └── tools/                  # e.g. topology-viewer (Python)
 ```
+
 
 ---
 
 ## Crates
 
-| Crate | Role |
-|-------|------|
-| **lp2ln-core-v2** | **Current** library: flat topology—**all peers are equal**; **no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, topology maintenance, event core, metrics/health snapshots, peer scoring, `P2PDatabase` / storage tables. **MSRV:** Rust **1.85** (edition **2024**; see `crates/lp2ln-core-v2/Cargo.toml`). |
-| **lp2lnd** | Default entry point for the v2 stack. Loads config transactionally (`ConfigAutonomy`), can rollback to last-known-good config, can fallback to developer defaults, starts node + health/debug services, waits for Ctrl+C. Optional binary: `lp2lnd-scale` (`scale_daemon.rs`). Optional feature: `tokio-console` (needs `RUSTFLAGS="--cfg tokio_unstable"`). |
-| **lp2ln-db-export** | CLI to dump node `redb` data to JSON (`-h` for usage). Default build includes file-picker support via the `pick` feature. |
+| Crate | Kind | Role |
+|-------|------|------|
+| **lp2ln-core-v2** | lib | Core P2P library. Flat topology — **all peers equal, no signal server**. `NodeBuilder`, `NodeOptions`, TCP/UDP transports, topology maintenance, event core, metrics/health, peer scoring, `P2PDatabase`. **MSRV:** Rust 1.85 (edition 2024). |
+| **lp2lnd** | bin | Default node daemon. Transactional config load (`ConfigAutonomy`), last-known-good rollback, developer-defaults fallback, health endpoint, debug WebSocket. Extra binaries: `lp2lnd-scale` (multi-node scale runner). Feature: `tokio-console`. |
+| **lp2ln-db-export** | bin | CLI to dump node `redb` data to JSON (`-h` for usage). |
+| **lp2ln-app-protocol** | lib | App Plane wire protocol shared between daemon and sidecars: framing, commands, events, capabilities. Serialised with `postcard`. |
+| **lp2ln-app-sdk** | lib | Async client SDK for App Plane sidecars. Wraps the protocol framing so sidecar authors work with typed commands/events instead of raw bytes. |
+| **lp2ln-content** | lib | Pure content primitives: content-addressed IDs (`ContentId`), LZ4 per-chunk compression (before encryption), ChaCha20-Poly1305 chunk encryption, `FileManifest` / `DirectoryManifest`, `BlockStore` (redb-backed). No networking — composable building block. |
+| **lp2ln-release** | lib + bin | Release manifest types, ECDSA (k256) signing, and the `lp2ln-release-tool` packaging binary for cutting signed releases. |
+| **lp2ln-updater** | bin | Stable parent-process supervisor (`lp2ln-updater`). Watches a child binary, gates restarts on health checks, and performs atomic rollback if the new version fails to start healthy. |
+| **lp2ln-magic-folder** | bin | Encrypted sync folder daemon (`lp2ln-magic-folder`). Poll-watches a directory, chunks and encrypts changed files via `lp2ln-content`, builds `FileManifest`/`DirectoryManifest`, persists state to redb. DHT announce and block replication land in a future milestone. |
 
 ---
 
@@ -221,6 +240,32 @@ Scale mode docs:
 
 - crate README: [`crates/lp2lnd/README.md`](crates/lp2lnd/README.md)
 - supports `--virtual-peers`, `--from`, `--debug-base`, and related env vars for local large-node runs.
+
+### `lp2ln-updater` (supervisor)
+
+Wraps `lp2lnd` as a supervised child process. On update, the new binary must pass a health gate before the old one is retired; on failure it rolls back to the previous binary automatically.
+
+```bash
+cargo run -p lp2ln-updater --release -- --child target/release/lp2lnd
+```
+
+### `lp2ln-magic-folder`
+
+Watches a local directory, chunks and encrypts changed files, and builds a content-addressed `DirectoryManifest` in a local redb store.
+
+```bash
+cargo run -p lp2ln-magic-folder --release -- --folder /path/to/watch
+```
+
+State survives restarts (job journal in redb). DHT announce and remote sync land in a future milestone.
+
+### `lp2ln-release-tool`
+
+Signs and packages a release manifest:
+
+```bash
+cargo run -p lp2ln-release --bin lp2ln-release-tool --release -- --help
+```
 
 ### `debug-ui` (web debug interface)
 

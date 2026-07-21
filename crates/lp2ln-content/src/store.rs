@@ -172,10 +172,8 @@ impl FsBlockStore {
     fn path_for(&self, id: &ContentId) -> PathBuf {
         self.root.join(content_id_hex(id))
     }
-}
 
-impl BlockStore for FsBlockStore {
-    fn put(&self, data: &[u8]) -> Result<ContentId, ContentError> {
+    pub fn put(&self, data: &[u8]) -> Result<ContentId, ContentError> {
         let id = hash_bytes(data);
         let dest = self.path_for(&id);
         let tmp = dest.with_extension("tmp");
@@ -188,7 +186,7 @@ impl BlockStore for FsBlockStore {
         Ok(id)
     }
 
-    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, ContentError> {
+    pub fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, ContentError> {
         let path = self.path_for(id);
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -197,20 +195,38 @@ impl BlockStore for FsBlockStore {
         }
     }
 
-    fn verify(&self, id: &ContentId) -> Result<bool, ContentError> {
+    pub fn verify(&self, id: &ContentId) -> Result<bool, ContentError> {
         match self.get(id)? {
             Some(data) => Ok(hash_bytes(&data) == *id),
             None => Ok(false),
         }
     }
 
-    fn delete(&self, id: &ContentId) -> Result<(), ContentError> {
+    pub fn delete(&self, id: &ContentId) -> Result<(), ContentError> {
         let path = self.path_for(id);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+impl BlockStore for FsBlockStore {
+    fn put(&self, data: &[u8]) -> Result<ContentId, ContentError> {
+        FsBlockStore::put(self, data)
+    }
+
+    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, ContentError> {
+        FsBlockStore::get(self, id)
+    }
+
+    fn verify(&self, id: &ContentId) -> Result<bool, ContentError> {
+        FsBlockStore::verify(self, id)
+    }
+
+    fn delete(&self, id: &ContentId) -> Result<(), ContentError> {
+        FsBlockStore::delete(self, id)
     }
 }
 

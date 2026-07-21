@@ -75,6 +75,7 @@ fn file_manifest_store_load_roundtrip() {
         file_key: key,
         created_at: 1000,
         modified_at: 2000,
+        codec: lp2ln_content::manifest::CODEC_RAW,
     };
     let id = manifest.store(&store).unwrap();
     let loaded = FileManifest::load(&store, &id).unwrap();

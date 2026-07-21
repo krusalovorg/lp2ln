@@ -194,12 +194,16 @@ impl BlockTransferService {
         Ok(data)
     }
 
-    /// Try providers in order; skip corrupted or unresponsive ones.
+    /// Try the local store first (we may be a provider ourselves), then
+    /// providers in order; skip corrupted or unresponsive ones.
     pub async fn fetch_from_providers(
         &self,
         content_id: ContentId,
         providers: &[String],
     ) -> anyhow::Result<Vec<u8>> {
+        if let Ok(Some(data)) = self.store.get(&content_id) {
+            return Ok(data);
+        }
         for peer_id in providers {
             if let Ok(data) = self.fetch_from(peer_id, content_id).await {
                 return Ok(data);

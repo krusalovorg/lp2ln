@@ -586,18 +586,34 @@ async fn handle_connection<S>(
                             }
                         };
                         // Pick any connected peer; find_providers checks local store first.
-                        let query_peer = node2.connected_peers()
+                        let connected: Vec<String> = node2
+                            .connected_peers()
                             .into_iter()
-                            .next()
                             .map(|p| p.into_string())
-                            .unwrap_or_default();
-                        let providers = dht
+                            .collect();
+                        let query_peer = connected.first().cloned().unwrap_or_default();
+                        let mut providers: Vec<String> = dht
                             .find_providers(&query_peer, arr)
                             .await
                             .unwrap_or_default()
                             .into_iter()
                             .map(|p| p.peer_id)
                             .collect();
+                        // DHT provider records are in-memory and die on lp2lnd restart.
+                        // If the record is gone but a peer still holds the block, fall back
+                        // to connected peers (and self, if the local block store has it).
+                        if providers.is_empty() {
+                            if let Some(bt) = node2.block_transfer_service() {
+                                if bt.store.get(&arr).ok().flatten().is_some() {
+                                    providers.push(node2.peer_id().to_string());
+                                }
+                            }
+                            for p in connected {
+                                if !providers.iter().any(|x| x == &p) {
+                                    providers.push(p);
+                                }
+                            }
+                        }
                         let _ = tx.send(encode_event(&AppEvent::DhtProviders {
                             content_id: cid_bytes,
                             providers,
