@@ -23,10 +23,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use lp2ln_content::compress::{compress_frame, decompress_frame};
 use lp2ln_content::encrypt::{CHUNK_SIZE, ChunkKey, decrypt_chunk, encrypt_chunk, generate_key};
-use lp2ln_content::id::{ContentId, hash_bytes, unix_now};
-use lp2ln_content::manifest::{DirEntry, DirectoryManifest, FileManifest};
-use lp2ln_content::store::{BlockStore, RedbBlockStore};
+use lp2ln_content::id::{ContentId, content_id_hex, hash_bytes, unix_now};
+use lp2ln_content::manifest::{CODEC_FRAMED_LZ4, DirEntry, DirectoryManifest, FileManifest};
+use lp2ln_content::store::{BlockStore, FsBlockStore};
 
 use crate::db::{DIR_MANIFEST_KEY, JOB_TABLE, LAST_REMOTE_HEAD_KEY, META_TABLE};
 use crate::node_client::NodeClient;
@@ -100,13 +101,19 @@ pub struct MagicFolder {
     pub root: PathBuf,
     pub namespace_id: [u8; 32],
     pub namespace_key: [u8; 32],
-    store: RedbBlockStore,
+    store: FsBlockStore,
     raw_db: Arc<StdMutex<redb::Database>>,
     file_state: Mutex<HashMap<String, FileSnapshot>>,
     pending: Mutex<HashMap<String, PendingEntry>>,
     dir_manifest: Mutex<DirectoryManifest>,
     /// Optional connection to lp2lnd for DHT announce and remote block fetch.
     pub node_client: Option<Arc<NodeClient>>,
+    /// When true, the watcher replaces files with `.lp2ln` placeholders after
+    /// ingest once ≥1 remote replica per block is confirmed.
+    pub auto_dehydrate: bool,
+    /// Paths ingested but not yet dehydrated (replica not confirmed yet) —
+    /// retried every poll while auto_dehydrate is on.
+    dehydrate_queue: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MagicFolder {
@@ -114,7 +121,7 @@ impl MagicFolder {
         root: impl Into<PathBuf>,
         namespace_id: [u8; 32],
         namespace_key: [u8; 32],
-        store: RedbBlockStore,
+        store: FsBlockStore,
         raw_db: Arc<StdMutex<redb::Database>>,
     ) -> Self {
         Self {
@@ -127,11 +134,18 @@ impl MagicFolder {
             pending: Mutex::new(HashMap::new()),
             dir_manifest: Mutex::new(DirectoryManifest::new(namespace_id)),
             node_client: None,
+            auto_dehydrate: false,
+            dehydrate_queue: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     pub fn with_node_client(mut self, nc: NodeClient) -> Self {
         self.node_client = Some(Arc::new(nc));
+        self
+    }
+
+    pub fn with_auto_dehydrate(mut self, on: bool) -> Self {
+        self.auto_dehydrate = on;
         self
     }
 
@@ -242,6 +256,7 @@ impl MagicFolder {
             file_key,
             created_at: unix_now(),
             modified_at: mtime,
+            codec: CODEC_FRAMED_LZ4,
         };
         let manifest_id = manifest.store(&self.store)?;
 
@@ -294,6 +309,38 @@ impl MagicFolder {
                 nc.push_block(*cid, data, 0).await.ok();
             }
         }
+    }
+
+    /// Re-seed + re-announce every block referenced by the current DirectoryManifest.
+    /// Needed because lp2lnd's DHT provider table is in-memory and empty after restart.
+    pub async fn reannounce_local(&self) {
+        let Some(nc) = &self.node_client else { return };
+        let mut ids: Vec<ContentId> = Vec::new();
+        let dm_id = {
+            let dm = self.dir_manifest.lock().await;
+            for entry in &dm.entries {
+                if entry.tombstone {
+                    continue;
+                }
+                ids.push(entry.manifest_id);
+                if let Ok(fm) = FileManifest::load(&self.store, &entry.manifest_id) {
+                    ids.extend(fm.chunk_ids);
+                }
+            }
+            dm.store(&self.store).ok()
+        };
+        if let Some(id) = dm_id {
+            ids.push(id);
+        }
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return;
+        }
+        println!("[magic-folder] re-announce {} local blocks", ids.len());
+        self.seed_node_store(&ids).await;
+        nc.announce_blocks(&ids).await;
+        self.publish_head().await.ok();
     }
 
     /// Publish the current DirectoryManifest id as the signed namespace head.
@@ -409,6 +456,14 @@ impl MagicFolder {
                     lp2ln_content::id::content_id_hex(cid)
                 );
             }
+
+            // Local dedup: lp2lnd's store now holds the serving replica and ≥1
+            // remote peer acked, so the sidecar copy of chunk data is redundant —
+            // drop it. Manifests stay (tiny, needed for re-announce/merge).
+            // Hydrate falls back to the node, which serves from its local store.
+            for cid in &manifest.chunk_ids {
+                self.store.delete(cid).ok();
+            }
         }
 
         let meta = tokio::fs::metadata(&abs).await?;
@@ -460,7 +515,7 @@ impl MagicFolder {
 
         let fm_bytes = self.load_block(&manifest_id).await
             .map_err(|e| anyhow::anyhow!("manifest not available (was the cache cleared?): {e}"))?;
-        let manifest: FileManifest = postcard::from_bytes(&fm_bytes)
+        let manifest = FileManifest::decode(&fm_bytes)
             .map_err(|e| anyhow::anyhow!("manifest decode: {e}"))?;
 
         {
@@ -470,6 +525,8 @@ impl MagicFolder {
                     .map_err(|e| anyhow::anyhow!("chunk {} unavailable: {e}", i))?;
                 let plain = decrypt_chunk(&manifest.file_key, i as u32, &ct)
                     .map_err(|e| anyhow::anyhow!("chunk {} decrypt failed: {e}", i))?;
+                let plain = unframe(manifest.codec, plain)
+                    .map_err(|e| anyhow::anyhow!("chunk {} decompress failed: {e}", i))?;
                 file.write_all(&plain).await?;
             }
             file.flush().await?;
@@ -592,8 +649,13 @@ impl MagicFolder {
                 // Same path both edited: our entry is newer or equal → keep ours,
                 // remote becomes a conflict copy below.
             }
-            if self.merge_entry(rentry, local.as_ref()).await? {
-                changed = true;
+            match self.merge_entry(rentry, local.as_ref()).await {
+                Ok(true) => changed = true,
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "[magic-folder] merge skip '{}': {e}",
+                    rentry.path
+                ),
             }
         }
         if changed {
@@ -647,7 +709,7 @@ impl MagicFolder {
 
         let fm_bytes = self.load_block(&rentry.manifest_id).await
             .map_err(|e| anyhow::anyhow!("file manifest for '{}': {e}", rentry.path))?;
-        let fm: FileManifest = postcard::from_bytes(&fm_bytes)
+        let fm = FileManifest::decode(&fm_bytes)
             .map_err(|e| anyhow::anyhow!("file manifest decode for '{}': {e}", rentry.path))?;
 
         if adopt {
@@ -705,7 +767,7 @@ impl MagicFolder {
         for entry in dm.entries.iter().filter(|e| !e.tombstone) {
             let fm_bytes = self.load_block(&entry.manifest_id).await
                 .map_err(|e| anyhow::anyhow!("file manifest for '{}': {e}", entry.path))?;
-            let manifest: FileManifest = postcard::from_bytes(&fm_bytes)
+            let manifest = FileManifest::decode(&fm_bytes)
                 .map_err(|e| anyhow::anyhow!("file manifest decode for '{}': {e}", entry.path))?;
 
             let out = target.join(&entry.path);
@@ -718,6 +780,8 @@ impl MagicFolder {
                     .map_err(|e| anyhow::anyhow!("chunk {} of '{}': {e}", i, entry.path))?;
                 let plain = decrypt_chunk(&manifest.file_key, i as u32, &ct)
                     .map_err(|e| anyhow::anyhow!("chunk {} decrypt for '{}': {e}", i, entry.path))?;
+                let plain = unframe(manifest.codec, plain)
+                    .map_err(|e| anyhow::anyhow!("chunk {} decompress for '{}': {e}", i, entry.path))?;
                 file.write_all(&plain).await?;
             }
         }
@@ -784,8 +848,36 @@ impl MagicFolder {
         };
 
         for path in ready {
-            if self.add_file(&path).await.is_ok() {
-                self.pending.lock().await.remove(&path);
+            match self.add_file(&path).await {
+                Ok(cid) => {
+                    println!("[ingest] {path} → {}", content_id_hex(&cid));
+                    self.pending.lock().await.remove(&path);
+                    if self.auto_dehydrate {
+                        self.dehydrate_queue.lock().await.insert(path);
+                    }
+                }
+                Err(e) => eprintln!("[ingest] {path} FAILED: {e}"),
+            }
+        }
+
+        // Auto-dehydrate: replace ingested files with .lp2ln placeholders once
+        // ≥1 remote replica per block is confirmed. Retried every poll until
+        // peers ack — dehydrate() itself enforces the replication safety policy.
+        // ponytail: each retry re-pushes all blocks; batch-ack via lease status if this gets chatty.
+        if self.auto_dehydrate && self.node_client.is_some() {
+            let queued: Vec<String> = self.dehydrate_queue.lock().await.iter().cloned().collect();
+            for path in queued {
+                if !self.root.join(&path).exists() {
+                    self.dehydrate_queue.lock().await.remove(&path);
+                    continue; // deleted or already dehydrated meanwhile
+                }
+                match self.dehydrate(&path, true).await {
+                    Ok(ph) => {
+                        println!("[dehydrate] {path} → {}", ph.display());
+                        self.dehydrate_queue.lock().await.remove(&path);
+                    }
+                    Err(e) => eprintln!("[dehydrate] {path} deferred: {e}"),
+                }
             }
         }
 
@@ -824,6 +916,12 @@ impl MagicFolder {
                     svc.add_file(&job.relative_path).await.ok();
                 }
             }
+            // Files ingested before a restart but still hydrated on disk are
+            // dehydrate candidates again.
+            if svc.auto_dehydrate {
+                let files: Vec<String> = svc.file_state.lock().await.keys().cloned().collect();
+                svc.dehydrate_queue.lock().await.extend(files);
+            }
         });
 
         tokio::spawn(async move {
@@ -840,6 +938,16 @@ impl MagicFolder {
                 }
             }
         });
+    }
+}
+
+/// Undo per-chunk framing according to the manifest codec.
+/// Legacy manifests (CODEC_RAW) stored plaintext unframed.
+fn unframe(codec: u8, plain: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    if codec == CODEC_FRAMED_LZ4 {
+        Ok(decompress_frame(&plain)?)
+    } else {
+        Ok(plain)
     }
 }
 
@@ -862,7 +970,8 @@ async fn chunk_file_and_encrypt(
             read += n;
         }
         if read == 0 { break; }
-        let ct = encrypt_chunk(key, chunk_index, &buf[..read])
+        let framed = compress_frame(&buf[..read]);
+        let ct = encrypt_chunk(key, chunk_index, &framed)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let id = store.put(&ct)?;
         ids.push(id);
@@ -899,6 +1008,9 @@ fn is_ignored(rel: &str) -> bool {
         || name.starts_with("~$")
         || name == ".DS_Store"
         || name == "Thumbs.db"
+        || name == crate::folder_icon::DESKTOP_INI_NAME
+        || name == crate::folder_icon::DIRECTORY_FILE_NAME
+        || name == crate::folder_icon::ICON_FILE_NAME
         || name.starts_with("._")
 }
 

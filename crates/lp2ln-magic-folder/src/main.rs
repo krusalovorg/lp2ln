@@ -16,6 +16,8 @@
 //     "db_path":            "./magic-folder.db",
 //     "poll_interval_secs": 5,
 //     "stability_secs":     2,
+//     "auto_dehydrate":     false,               <- daemon auto-replaces files with .lp2ln after replica ack
+
 //     "namespace_id":       "<64 hex chars>",   <- auto-generated on first run
 //     "namespace_key":      "<64 hex chars>"    <- auto-generated on first run, keep secret
 //   }
@@ -24,7 +26,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lp2ln_content::id::content_id_hex;
-use lp2ln_magic_folder::{MagicFolder, NodeClient, open_db};
+use lp2ln_magic_folder::{
+    MagicFolder, NodeClient, ensure_folder_icon, ensure_lp2ln_association, open_db,
+    open_store_scratch,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -35,6 +40,11 @@ struct Options {
     poll_interval_secs: u64,
     #[serde(default = "default_stability")]
     stability_secs: u64,
+    /// When true, the daemon replaces ingested files with .lp2ln placeholders
+    /// automatically once ≥1 remote replica per block is confirmed.
+    /// Off by default: dehydrate deletes originals, so it's opt-in.
+    #[serde(default)]
+    auto_dehydrate: bool,
     namespace_id: Option<String>,
     namespace_key: Option<String>,
     /// TCP address of lp2lnd's App Plane dev endpoint (e.g. "127.0.0.1:7777").
@@ -61,6 +71,12 @@ fn parse_args() -> (String, Vec<String>, PathBuf) {
             positional.push(args[i].clone());
             i += 1;
         }
+    }
+    // Double-click support: invoked as `lp2ln-magic-folder <file.lp2ln>`
+    // (e.g. via OS file association for .lp2ln) → treat as hydrate.
+    // Association must pass the options file: `lp2ln-magic-folder.exe -o C:\...\magic-folder.json "%1"`.
+    if positional.first().is_some_and(|p| p.ends_with(".lp2ln")) {
+        return ("hydrate".to_string(), positional, opts_path);
     }
     let subcmd = positional.first().cloned().unwrap_or_else(|| "daemon".to_string());
     let rest = positional.into_iter().skip(1).collect();
@@ -105,7 +121,27 @@ async fn main() -> anyhow::Result<()> {
     let namespace_id = parse_hex32(opts.namespace_id.as_deref().unwrap())?;
     let namespace_key = parse_hex32(opts.namespace_key.as_deref().unwrap())?;
 
-    let (store, raw_db) = open_db(&opts.db_path)?;
+    // Double-click hydrate runs with Explorer's CWD, not ours — resolve relative
+    // root/db_path against the options file location, not the process CWD.
+    // (Done after the keygen write-back so the file keeps the original values.)
+    let opts_dir = std::fs::canonicalize(&opts_path)
+        .unwrap_or_else(|_| opts_path.clone())
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    opts.root = resolve_path(&opts_dir, &opts.root);
+    opts.db_path = resolve_path(&opts_dir, &opts.db_path);
+
+    let (store, raw_db) = match open_db(&opts.db_path) {
+        Ok(v) => v,
+        // redb is single-process: a running daemon holds the lock. Hydrate
+        // never touches the metadata db, so fall back to the block folder only.
+        Err(e) if subcmd == "hydrate" => {
+            eprintln!("note: metadata db busy ({e}) — hydrating via block store only");
+            open_store_scratch(&opts.db_path)?
+        }
+        Err(e) => return Err(e),
+    };
     let mut folder = MagicFolder::new(&opts.root, namespace_id, namespace_key, store, raw_db);
 
     if let Some(addr) = &opts.node_addr {
@@ -118,18 +154,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let folder = Arc::new(folder);
+    let folder = Arc::new(folder.with_auto_dehydrate(opts.auto_dehydrate));
     folder.load_state().await?;
 
     match subcmd.as_str() {
         "daemon" => {
             std::fs::create_dir_all(&opts.root)?;
+            // Windows: write embedded .ico + desktop.ini so Explorer shows the Magic Folder icon.
+            ensure_folder_icon(std::path::Path::new(&opts.root));
+            // Windows: register *.lp2ln icon + double-click → hydrate (HKCU, no admin).
+            ensure_lp2ln_association(&opts_path);
             println!("watching:    {}", opts.root);
             println!("db:          {}", opts.db_path);
             println!("poll:        {}s  stability: {}s", opts.poll_interval_secs, opts.stability_secs);
+            if opts.auto_dehydrate {
+                println!("auto-dehydrate: on (files replaced with .lp2ln after replica confirmation)");
+            }
 
             // Initial scan with no stability delay so already-present files are ingested immediately.
             folder.poll(0).await;
+            folder.reannounce_local().await;
             if let Err(e) = folder.sync_remote_head().await {
                 eprintln!("warning: initial head sync: {e}");
             }
@@ -191,8 +235,16 @@ async fn main() -> anyhow::Result<()> {
 
         "hydrate" => {
             let path = args.first().ok_or_else(|| anyhow::anyhow!("usage: hydrate <path.lp2ln>"))?;
-            let out = folder.hydrate(std::path::Path::new(path)).await?;
-            println!("hydrated → {}", out.display());
+            match folder.hydrate(std::path::Path::new(path)).await {
+                Ok(out) => println!("hydrated → {}", out.display()),
+                Err(e) => {
+                    // Double-click opens a console that closes instantly —
+                    // keep it up long enough to read the error.
+                    eprintln!("hydrate failed: {e:#}");
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    std::process::exit(1);
+                }
+            }
         }
 
         "status" => {
@@ -215,6 +267,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve a possibly-relative options path against the options file directory.
+fn resolve_path(base: &std::path::Path, p: &str) -> String {
+    let pb = PathBuf::from(p);
+    if pb.is_absolute() {
+        p.to_string()
+    } else {
+        base.join(pb).to_string_lossy().into_owned()
+    }
 }
 
 /// Convert a path argument (absolute or relative to CWD) to a path relative to the folder root.
