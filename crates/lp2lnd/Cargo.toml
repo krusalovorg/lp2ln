@@ -3,6 +3,7 @@ name = "lp2lnd"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
+build = "build.rs"
 
 [features]
 default = []
@@ -22,6 +23,9 @@ console-subscriber = { version = "0.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 lp2ln-app-sdk = { path = "../lp2ln-app-sdk" }

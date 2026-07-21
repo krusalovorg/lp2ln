@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "LP2LN release manifest types, signing, and packaging tool"
 license = "MIT OR Apache-2.0"
+build = "build.rs"
 
 [dependencies]
 k256 = { version = "0.13.4", features = ["ecdsa", "sha256"] }
@@ -15,6 +16,9 @@ hex = "0.4.3"
 thiserror = "2"
 anyhow = "1.0"
 serde_json = "1.0"
+
+[build-dependencies]
+winresource = "0.1"
 
 [lib]
 name = "lp2ln_release"

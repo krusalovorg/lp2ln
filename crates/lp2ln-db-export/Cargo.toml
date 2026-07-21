@@ -3,6 +3,7 @@ name = "lp2ln-db-export"
 version = "0.1.0"
 edition = "2021"
 description = "Export lp2ln redb node database to JSON"
+build = "build.rs"
 
 [[bin]]
 name = "lp2ln-db-export"
@@ -15,6 +16,9 @@ redb = "2.4.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
+
+[build-dependencies]
+winresource = "0.1"
 
 [features]
 default = ["pick"]
