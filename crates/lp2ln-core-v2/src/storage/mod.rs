@@ -31,7 +31,7 @@ pub use lp2ln_content::{
 };
 
 pub use block_transfer::BlockTransferService;
-pub use dht::{DhtService, DhtStore, ProviderRecord};
+pub use dht::{DhtService, DhtStore, ProviderRecord, ValueRecord};
 
 pub type BlockStore = RedbBlockStore;
 

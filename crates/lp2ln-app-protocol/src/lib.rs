@@ -98,6 +98,33 @@ pub enum AppCmd {
     StreamWindow { stream_id: u64, credits: u32 },
     /// Cancel a bulk stream (behavior in P3-05).
     StreamCancel { stream_id: u64 },
+    /// Announce to the DHT that this node holds the given content blocks (P7).
+    /// Requires capability Send. content_ids are raw 32-byte hashes.
+    DhtAnnounce { content_ids: Vec<Vec<u8>> },
+    /// Ask the node to find DHT providers for a content block (P7).
+    /// Requires capability QueryStatus. Responds with AppEvent::DhtProviders.
+    DhtFindProviders { content_id: Vec<u8> },
+    /// Ask the node to fetch a content block from specific peers (P7).
+    /// Requires capability Send. Responds with AppEvent::BlockData or Ack{ok:false}.
+    BlockFetch { content_id: Vec<u8>, peer_ids: Vec<String> },
+    /// Store a block in the node's local store and replicate it to up to
+    /// `min_replicas` connected peers with durable PushAck (P7).
+    /// Requires capability Send. Responds with AppEvent::BlockPushed.
+    BlockPush {
+        content_id: Vec<u8>,
+        data: Vec<u8>,
+        min_replicas: u32,
+    },
+    /// Publish a mutable signed value under `key` in the DHT (P7 namespace heads).
+    /// Higher seq wins. Requires capability Send.
+    DhtPutValue {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        seq: u64,
+    },
+    /// Fetch the freshest known value for `key` (P7). Requires capability QueryStatus.
+    /// Responds with AppEvent::DhtValue.
+    DhtGetValue { key: Vec<u8> },
 }
 
 /// Messages from node → sidecar.
@@ -138,6 +165,21 @@ pub enum AppEvent {
     },
     /// Cancel notification (behavior in P3-05).
     StreamCancel { stream_id: u64 },
+    /// DHT provider list in response to AppCmd::DhtFindProviders (P7).
+    DhtProviders { content_id: Vec<u8>, providers: Vec<String> },
+    /// Raw block data, in response to AppCmd::BlockFetch (P7).
+    BlockData { content_id: Vec<u8>, data: Vec<u8> },
+    /// Result of AppCmd::BlockPush: peers that durably acked the block (P7).
+    BlockPushed {
+        content_id: Vec<u8>,
+        stored_by: Vec<String>,
+    },
+    /// Result of AppCmd::DhtGetValue (P7). `value` is None when unknown.
+    DhtValue {
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+        seq: u64,
+    },
 }
 
 /// Encode a length-prefixed postcard frame.

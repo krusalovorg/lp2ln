@@ -145,6 +145,101 @@ impl AppClient {
         .await
     }
 
+    // ── P7 block / DHT commands ──────────────────────────────────────────────
+
+    /// Announce content blocks to the DHT (P7). Requires capability Send.
+    pub async fn dht_announce(&mut self, content_ids: Vec<Vec<u8>>) -> Result<()> {
+        self.write_cmd(&AppCmd::DhtAnnounce { content_ids }).await?;
+        self.expect_ack().await
+    }
+
+    /// Find DHT providers for a content block (P7). Requires capability QueryStatus.
+    /// Waits until the node returns a DhtProviders event for this content_id.
+    pub async fn dht_find_providers(&mut self, content_id: Vec<u8>) -> Result<Vec<String>> {
+        self.write_cmd(&AppCmd::DhtFindProviders { content_id: content_id.clone() }).await?;
+        loop {
+            match self.read_event().await? {
+                AppEvent::DhtProviders { content_id: cid, providers } if cid == content_id => {
+                    return Ok(providers);
+                }
+                AppEvent::Ack { ok: false, error } => {
+                    return Err(AppSdkError::AckFailed(
+                        error.unwrap_or_else(|| "DhtFindProviders failed".into()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask the node to fetch a content block from specific peers (P7). Requires capability Send.
+    /// Waits until the node returns a BlockData event for this content_id.
+    pub async fn block_fetch(&mut self, content_id: Vec<u8>, peer_ids: Vec<String>) -> Result<Vec<u8>> {
+        self.write_cmd(&AppCmd::BlockFetch { content_id: content_id.clone(), peer_ids }).await?;
+        loop {
+            match self.read_event().await? {
+                AppEvent::BlockData { content_id: cid, data } if cid == content_id => {
+                    return Ok(data);
+                }
+                AppEvent::Ack { ok: false, error } => {
+                    return Err(AppSdkError::AckFailed(
+                        error.unwrap_or_else(|| "BlockFetch failed".into()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Store a block on the node and replicate to up to `min_replicas` peers (P7).
+    /// Returns the peer_ids that durably acked the block. Requires capability Send.
+    pub async fn block_push(
+        &mut self,
+        content_id: Vec<u8>,
+        data: Vec<u8>,
+        min_replicas: u32,
+    ) -> Result<Vec<String>> {
+        self.write_cmd(&AppCmd::BlockPush { content_id: content_id.clone(), data, min_replicas })
+            .await?;
+        loop {
+            match self.read_event().await? {
+                AppEvent::BlockPushed { content_id: cid, stored_by } if cid == content_id => {
+                    return Ok(stored_by);
+                }
+                AppEvent::Ack { ok: false, error } => {
+                    return Err(AppSdkError::AckFailed(
+                        error.unwrap_or_else(|| "BlockPush failed".into()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Publish a mutable value under `key` (P7 namespace heads). Requires capability Send.
+    pub async fn dht_put_value(&mut self, key: Vec<u8>, value: Vec<u8>, seq: u64) -> Result<()> {
+        self.write_cmd(&AppCmd::DhtPutValue { key, value, seq }).await?;
+        self.expect_ack().await
+    }
+
+    /// Fetch the freshest known value for `key` (P7). Requires capability QueryStatus.
+    pub async fn dht_get_value(&mut self, key: Vec<u8>) -> Result<(Option<Vec<u8>>, u64)> {
+        self.write_cmd(&AppCmd::DhtGetValue { key: key.clone() }).await?;
+        loop {
+            match self.read_event().await? {
+                AppEvent::DhtValue { key: k, value, seq } if k == key => {
+                    return Ok((value, seq));
+                }
+                AppEvent::Ack { ok: false, error } => {
+                    return Err(AppSdkError::AckFailed(
+                        error.unwrap_or_else(|| "DhtGetValue failed".into()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub async fn stream_cancel(&mut self, stream_id: u64) -> Result<()> {
         self.write_cmd(&AppCmd::StreamCancel { stream_id }).await?;
         match self.read_event().await? {

@@ -1,0 +1,24 @@
+[package]
+name = "lp2ln-magic-folder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+lp2ln-content = { path = "../lp2ln-content" }
+lp2ln-app-sdk = { path = "../lp2ln-app-sdk" }
+tokio = { version = "1.28", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+postcard = { version = "1", features = ["alloc"] }
+redb = "2.4"
+sha2 = "0.10"
+rand = "0.9"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[[bin]]
+name = "lp2ln-magic-folder"
+path = "src/main.rs"

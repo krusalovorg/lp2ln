@@ -527,6 +527,284 @@ async fn handle_connection<S>(
                     break;
                 }
             }
+
+            AppCmd::DhtAnnounce { content_ids } => {
+                let reply = if !granted.contains(&AppCapability::Send) {
+                    encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability Send not granted".into()),
+                    })
+                } else if let Some(dht) = node.dht_service() {
+                    for id_bytes in &content_ids {
+                        if let Ok(arr) = id_bytes.as_slice().try_into() {
+                            let _ = dht.announce(arr).await;
+                        }
+                    }
+                    encode_event(&AppEvent::Ack { ok: true, error: None })
+                } else {
+                    encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("DHT not enabled (set experimental.dht=true)".into()),
+                    })
+                };
+                if out_tx.send(reply).await.is_err() {
+                    break;
+                }
+            }
+
+            AppCmd::DhtFindProviders { content_id } => {
+                let reply = if !granted.contains(&AppCapability::QueryStatus) {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability QueryStatus not granted".into()),
+                    }))
+                } else if node.dht_service().is_none() {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("DHT not enabled".into()),
+                    }))
+                } else {
+                    None // handled in spawned task below
+                };
+                if let Some(frame) = reply {
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                } else if let Some(dht) = node.dht_service() {
+                    let tx = out_tx.clone();
+                    let cid_bytes = content_id.clone();
+                    let node2 = Arc::clone(&node);
+                    tokio::spawn(async move {
+                        let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                let _ = tx.send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some("invalid content_id length".into()),
+                                })).await;
+                                return;
+                            }
+                        };
+                        // Pick any connected peer; find_providers checks local store first.
+                        let query_peer = node2.connected_peers()
+                            .into_iter()
+                            .next()
+                            .map(|p| p.into_string())
+                            .unwrap_or_default();
+                        let providers = dht
+                            .find_providers(&query_peer, arr)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|p| p.peer_id)
+                            .collect();
+                        let _ = tx.send(encode_event(&AppEvent::DhtProviders {
+                            content_id: cid_bytes,
+                            providers,
+                        })).await;
+                    });
+                }
+            }
+
+            AppCmd::BlockFetch { content_id, peer_ids } => {
+                let reply = if !granted.contains(&AppCapability::Send) {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability Send not granted".into()),
+                    }))
+                } else if node.block_transfer_service().is_none() {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("block_transfer not enabled (set experimental.block_transfer=true)".into()),
+                    }))
+                } else {
+                    None
+                };
+                if let Some(frame) = reply {
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                } else if let Some(bt) = node.block_transfer_service() {
+                    let tx = out_tx.clone();
+                    let cid_bytes = content_id.clone();
+                    tokio::spawn(async move {
+                        let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                let _ = tx.send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some("invalid content_id length".into()),
+                                })).await;
+                                return;
+                            }
+                        };
+                        match bt.fetch_from_providers(arr, &peer_ids).await {
+                            Ok(data) => {
+                                let _ = tx.send(encode_event(&AppEvent::BlockData {
+                                    content_id: cid_bytes,
+                                    data,
+                                })).await;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some(format!("block fetch failed: {e}")),
+                                })).await;
+                            }
+                        }
+                    });
+                }
+            }
+
+            AppCmd::BlockPush { content_id, data, min_replicas } => {
+                let reply = if !granted.contains(&AppCapability::Send) {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability Send not granted".into()),
+                    }))
+                } else if node.block_transfer_service().is_none() {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("block_transfer not enabled (set experimental.block_transfer=true)".into()),
+                    }))
+                } else {
+                    None
+                };
+                if let Some(frame) = reply {
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                } else if let Some(bt) = node.block_transfer_service() {
+                    let tx = out_tx.clone();
+                    let cid_bytes = content_id.clone();
+                    let node2 = Arc::clone(&node);
+                    tokio::spawn(async move {
+                        let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                let _ = tx.send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some("invalid content_id length".into()),
+                                })).await;
+                                return;
+                            }
+                        };
+                        if lp2ln_core_v2::storage::hash_bytes(&data) != arr {
+                            let _ = tx.send(encode_event(&AppEvent::Ack {
+                                ok: false,
+                                error: Some("data does not hash to content_id".into()),
+                            })).await;
+                            return;
+                        }
+                        // Always seed the node's local store so this node can serve the block.
+                        if let Err(e) = lp2ln_core_v2::storage::BlockStoreTrait::put(&bt.store, &data) {
+                            let _ = tx.send(encode_event(&AppEvent::Ack {
+                                ok: false,
+                                error: Some(format!("local store failed: {e}")),
+                            })).await;
+                            return;
+                        }
+                        // ponytail: naive replica selection = connected peers in order;
+                        // P8 replaces this with scored/diverse selection.
+                        let mut stored_by = Vec::new();
+                        if min_replicas > 0 {
+                            for peer in node2.connected_peers() {
+                                if stored_by.len() >= min_replicas as usize {
+                                    break;
+                                }
+                                let peer = peer.into_string();
+                                if bt.push_to(&peer, arr, data.clone()).await.is_ok() {
+                                    stored_by.push(peer);
+                                }
+                            }
+                        }
+                        let _ = tx.send(encode_event(&AppEvent::BlockPushed {
+                            content_id: cid_bytes,
+                            stored_by,
+                        })).await;
+                    });
+                }
+            }
+
+            AppCmd::DhtPutValue { key, value, seq } => {
+                let reply = if !granted.contains(&AppCapability::Send) {
+                    encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability Send not granted".into()),
+                    })
+                } else if let Some(dht) = node.dht_service() {
+                    match key.as_slice().try_into() {
+                        Ok(k) => {
+                            let _ = dht.put_value(k, value, seq).await;
+                            encode_event(&AppEvent::Ack { ok: true, error: None })
+                        }
+                        Err(_) => encode_event(&AppEvent::Ack {
+                            ok: false,
+                            error: Some("invalid key length".into()),
+                        }),
+                    }
+                } else {
+                    encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("DHT not enabled (set experimental.dht=true)".into()),
+                    })
+                };
+                if out_tx.send(reply).await.is_err() {
+                    break;
+                }
+            }
+
+            AppCmd::DhtGetValue { key } => {
+                let reply = if !granted.contains(&AppCapability::QueryStatus) {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("capability QueryStatus not granted".into()),
+                    }))
+                } else if node.dht_service().is_none() {
+                    Some(encode_event(&AppEvent::Ack {
+                        ok: false,
+                        error: Some("DHT not enabled".into()),
+                    }))
+                } else {
+                    None
+                };
+                if let Some(frame) = reply {
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                } else if let Some(dht) = node.dht_service() {
+                    let tx = out_tx.clone();
+                    let key_bytes = key.clone();
+                    let node2 = Arc::clone(&node);
+                    tokio::spawn(async move {
+                        let k: [u8; 32] = match key_bytes.as_slice().try_into() {
+                            Ok(a) => a,
+                            Err(_) => {
+                                let _ = tx.send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some("invalid key length".into()),
+                                })).await;
+                                return;
+                            }
+                        };
+                        let query_peer = node2.connected_peers()
+                            .into_iter()
+                            .next()
+                            .map(|p| p.into_string())
+                            .unwrap_or_default();
+                        let record = dht.get_value(&query_peer, k).await.ok().flatten();
+                        let (value, seq) = match record {
+                            Some(r) => (Some(r.value), r.seq),
+                            None => (None, 0),
+                        };
+                        let _ = tx.send(encode_event(&AppEvent::DhtValue {
+                            key: key_bytes,
+                            value,
+                            seq,
+                        })).await;
+                    });
+                }
+            }
         }
     }
 

@@ -46,10 +46,12 @@ impl RuntimeService for BlockTransferRuntimeService {
     }
 
     fn spawn(&self, ctx: &mut StartupContext<'_>) -> Result<()> {
-        let db = ctx
-            .db
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("block_transfer requires a database"))?;
+        // content defaults to true; db-less nodes (tests, embedded) degrade
+        // gracefully instead of failing the whole node start.
+        let Some(db) = ctx.db.as_ref() else {
+            crate::warn!("[block_transfer] no database configured — service disabled");
+            return Ok(());
+        };
         let router = ctx
             .router
             .clone()
