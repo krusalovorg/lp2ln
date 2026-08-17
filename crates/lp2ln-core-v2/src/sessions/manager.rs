@@ -268,7 +268,19 @@ impl SessionManager {
         &self,
         peer_id: &PeerId,
     ) -> Option<Arc<dyn Session + Send + Sync>> {
-        let sessions = self.get_all_for_peer(peer_id);
+        self.best_session_for_peer_where(peer_id, |_| true)
+    }
+
+    pub fn best_session_for_peer_where(
+        &self,
+        peer_id: &PeerId,
+        accept: impl Fn(LinkKind) -> bool,
+    ) -> Option<Arc<dyn Session + Send + Sync>> {
+        let sessions: Vec<_> = self
+            .get_all_for_peer(peer_id)
+            .into_iter()
+            .filter(|s| accept(s.kind()))
+            .collect();
         if sessions.is_empty() {
             return None;
         }

@@ -97,6 +97,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         runtime.options.router_broadcast_cap,
         runtime.options.router_process_concurrency,
         runtime.options.signature_format,
+        runtime.options.delivery.clone(),
     );
     let router = Arc::new(router_raw);
     runtime.router = Some(router.clone());

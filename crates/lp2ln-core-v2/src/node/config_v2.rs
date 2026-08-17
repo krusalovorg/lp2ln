@@ -44,6 +44,7 @@ pub const ADVANCED_CONFIG_KEYS: &[&str] = &[
     "topology_tuning",
     "peer_score_weights",
     "dial_policy",
+    "delivery",
     "quic",
     "transport_obfuscation",
     "transport_obfuscation_enabled",

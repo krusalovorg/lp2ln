@@ -85,6 +85,58 @@ fn default_dial_policy_transport_order() -> Vec<String> {
 }
 fn default_quic_connect_timeout_secs() -> u64 { 5 }
 
+/// delivery-integrity limits: chunk reassembly caps and relay dedup.
+///
+/// Reliability itself comes from the transport (QUIC/TCP), not from a layer on
+/// top of packets. These knobs only bound what a peer can make this
+/// node hold or deliver twice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryLimits {
+    /// Drop a partially assembled chunk stream after this long without a new chunk.
+    #[serde(default = "default_chunk_stream_ttl_ms")]
+    pub chunk_stream_ttl_ms: u64,
+    /// Max concurrently assembling chunk streams across all sessions.
+    #[serde(default = "default_max_chunk_streams")]
+    pub max_chunk_streams: usize,
+    /// Max concurrently assembling chunk streams from a single session.
+    #[serde(default = "default_max_chunk_streams_per_session")]
+    pub max_chunk_streams_per_session: usize,
+    /// Largest `total_chunks` a sender may declare for one stream.
+    #[serde(default = "default_max_chunks_per_stream")]
+    pub max_chunks_per_stream: u32,
+    /// Largest amount of chunk payload buffered for one stream before it is refused.
+    #[serde(default = "default_max_chunk_stream_bytes")]
+    pub max_chunk_stream_bytes: u64,
+    /// Entries kept in the relay duplicate-suppression set. 0 disables dedup.
+    #[serde(default = "default_relay_dedup_capacity")]
+    pub relay_dedup_capacity: usize,
+    /// Refuse to put chunked (bulk) packets on an unreliable link instead of
+    /// losing them silently.
+    #[serde(default = "default_true")]
+    pub bulk_requires_reliable_transport: bool,
+}
+
+impl Default for DeliveryLimits {
+    fn default() -> Self {
+        Self {
+            chunk_stream_ttl_ms: default_chunk_stream_ttl_ms(),
+            max_chunk_streams: default_max_chunk_streams(),
+            max_chunk_streams_per_session: default_max_chunk_streams_per_session(),
+            max_chunks_per_stream: default_max_chunks_per_stream(),
+            max_chunk_stream_bytes: default_max_chunk_stream_bytes(),
+            relay_dedup_capacity: default_relay_dedup_capacity(),
+            bulk_requires_reliable_transport: true,
+        }
+    }
+}
+
+fn default_chunk_stream_ttl_ms() -> u64 { 30_000 }
+fn default_max_chunk_streams() -> usize { 1024 }
+fn default_max_chunk_streams_per_session() -> usize { 32 }
+fn default_max_chunks_per_stream() -> u32 { 16_384 }
+fn default_max_chunk_stream_bytes() -> u64 { 64 * 1024 * 1024 }
+fn default_relay_dedup_capacity() -> usize { 8192 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanDiscoveryOptions {
     #[serde(default)]

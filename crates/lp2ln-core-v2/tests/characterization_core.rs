@@ -29,15 +29,21 @@ use lp2ln_core_v2::{
 struct RecordingSession {
     id: String,
     peer_id: Option<String>,
+    kind: LinkKind,
     sent: Mutex<Vec<Packet>>,
     closed: AtomicBool,
 }
 
 impl RecordingSession {
     fn new(id: &str, peer_id: Option<&str>) -> Arc<Self> {
+        Self::new_with_kind(id, peer_id, LinkKind::DirectTcp)
+    }
+
+    fn new_with_kind(id: &str, peer_id: Option<&str>, kind: LinkKind) -> Arc<Self> {
         Arc::new(Self {
             id: id.to_string(),
             peer_id: peer_id.map(str::to_string),
+            kind,
             sent: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
         })
@@ -59,7 +65,7 @@ impl Session for RecordingSession {
     }
 
     fn kind(&self) -> LinkKind {
-        LinkKind::DirectTcp
+        self.kind
     }
 
     async fn send(&self, packet: Packet) -> Result<u64> {
@@ -150,6 +156,18 @@ fn packet(data: Vec<u8>) -> Packet {
     }
 }
 
+/// A bulk (chunked) packet. `receiver` stays empty so the test router needs no
+/// signing key — routing target is the `send_to_peer` argument.
+fn chunk_packet(index: u32, total: u32) -> Packet {
+    Packet {
+        chunk_stream_id: Some(77),
+        chunk_index: Some(index),
+        total_chunks: Some(total),
+        request_id: Some(77),
+        ..packet(b"bulk".to_vec())
+    }
+}
+
 #[test]
 fn nat_state_answer_schedules_single_punch_job_and_result_metrics() {
     let state = NatTraversalState::new();
@@ -207,6 +225,76 @@ fn nat_state_ignores_answer_for_unknown_session() {
     assert_eq!(state.handle_answer("peer-b", &answer), None);
     assert_eq!(state.sessions_len(), 0);
     assert_eq!(state.metrics(), (0, 0, 0));
+}
+
+/// P7.5-02: a chunked packet whose only link is UDP must fail loudly rather
+/// than be handed to a transport that will not retransmit it.
+#[tokio::test]
+async fn router_refuses_to_put_chunked_packet_on_a_udp_only_link() {
+    let (router, _manager) = test_router();
+    let udp = RecordingSession::new_with_kind("sess-udp", Some("peer-bulk"), LinkKind::DirectUdp);
+    router.register_session(
+        PeerId::from("peer-bulk"),
+        SessionId::from("sess-udp"),
+        udp.clone(),
+    );
+
+    let err = router
+        .send_to_peer(PeerId::from("peer-bulk"), chunk_packet(0, 2), None)
+        .await
+        .expect_err("chunked send over a UDP-only link must be refused");
+
+    assert!(
+        err.to_string().contains("unreliable"),
+        "error should name the reason, got: {err}"
+    );
+    assert_eq!(udp.sent_len(), 0, "nothing may reach the unreliable link");
+}
+
+/// The same packet goes out normally once a reliable link to that peer exists,
+/// and the UDP session is left alone.
+#[tokio::test]
+async fn router_sends_chunked_packet_over_the_reliable_link_when_one_exists() {
+    let (router, _manager) = test_router();
+    let udp = RecordingSession::new_with_kind("sess-udp", Some("peer-bulk"), LinkKind::DirectUdp);
+    let quic = RecordingSession::new_with_kind("sess-quic", Some("peer-bulk"), LinkKind::DirectQuic);
+    router.register_session(
+        PeerId::from("peer-bulk"),
+        SessionId::from("sess-udp"),
+        udp.clone(),
+    );
+    router.register_session(
+        PeerId::from("peer-bulk"),
+        SessionId::from("sess-quic"),
+        quic.clone(),
+    );
+
+    router
+        .send_to_peer(PeerId::from("peer-bulk"), chunk_packet(0, 2), None)
+        .await
+        .expect("reliable link available");
+
+    assert_eq!(quic.sent_len(), 1);
+    assert_eq!(udp.sent_len(), 0);
+}
+
+/// Non-bulk traffic is unaffected: UDP stays a valid link for it.
+#[tokio::test]
+async fn router_still_sends_unchunked_packet_over_udp() {
+    let (router, _manager) = test_router();
+    let udp = RecordingSession::new_with_kind("sess-udp", Some("peer-plain"), LinkKind::DirectUdp);
+    router.register_session(
+        PeerId::from("peer-plain"),
+        SessionId::from("sess-udp"),
+        udp.clone(),
+    );
+
+    router
+        .send_to_peer(PeerId::from("peer-plain"), packet(b"ping".to_vec()), None)
+        .await
+        .expect("plain send over udp");
+
+    assert_eq!(udp.sent_len(), 1);
 }
 
 #[tokio::test]

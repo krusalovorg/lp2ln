@@ -386,6 +386,58 @@ Recommended:
 - bind to loopback by default
 - do not expose publicly without extra security controls
 
+### 9) Delivery integrity (`delivery`)
+
+Reliability comes from the transport, not from a retransmit layer on top of
+packets: QUIC and TCP already retransmit, order and dedup. See AD-19. These
+knobs only bound what a remote peer can make this node hold, or deliver twice.
+
+#### Chunk reassembly
+
+- `chunk_stream_ttl_ms` (default `30000`) — drop a partially assembled chunk
+  stream after this long with no new chunk.
+- `max_chunk_streams` (default `1024`) — concurrently assembling streams across
+  all sessions.
+- `max_chunk_streams_per_session` (default `32`) — same, per session.
+- `max_chunks_per_stream` (default `16384`) — largest `total_chunks` a sender
+  may declare.
+- `max_chunk_stream_bytes` (default `67108864`) — payload buffered for one
+  stream before further chunks are refused.
+
+Why:
+
+- a single lost chunk otherwise pins its buffer until the process restarts;
+- a peer can declare a huge `total_chunks` and never send the rest, so the caps
+  are what stop one session from exhausting node memory.
+
+Recommended:
+
+- leave defaults unless you move very large files and see refusals in the log
+  (`[ChunkAssembler] refused chunk: ...`);
+- raise `max_chunk_stream_bytes` before raising the stream counts.
+
+#### Relay dedup and bulk transport
+
+- `relay_dedup_capacity` (default `8192`, `0` disables) — entries kept in the
+  duplicate-suppression set for relayed packets. Only the relay path is deduped;
+  direct links dedup themselves.
+- `bulk_requires_reliable_transport` (default `true`) — refuse to put chunked
+  packets on an unreliable link instead of losing them silently. With this on, a
+  chunked send to a peer reachable only over UDP returns an error.
+
+Why:
+
+- a relayed packet can arrive twice over different paths, and nothing below the
+  router would notice;
+- one dropped chunk strands a whole stream in the receiver's assembler, so a
+  loud failure beats a silent one.
+
+Recommended:
+
+- keep `bulk_requires_reliable_transport` enabled; disable only if you knowingly
+  run a UDP-only mesh and accept stream loss;
+- lower `relay_dedup_capacity` only on memory-constrained nodes.
+
 ## Preset profiles
 
 ### A. Local development (1-5 nodes)

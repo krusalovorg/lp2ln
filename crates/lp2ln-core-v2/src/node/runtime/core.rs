@@ -142,6 +142,7 @@ impl NodeRuntime {
                 topology_react_to_session_events: options.topology_react_to_session_events,
                 dial_policy: options.dial_policy,
                 lan_discovery: options.lan_discovery,
+                delivery: options.delivery,
                 schema_version: options.schema_version,
                 topology_profile: options.topology_profile,
                 trusted_release_key: options.trusted_release_key,

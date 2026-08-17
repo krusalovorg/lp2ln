@@ -89,6 +89,7 @@ impl SimNode {
             SIM_BROADCAST_CAP,
             SIM_WORKER_CONCURRENCY,
             SignatureFormat::V3Hash,
+            crate::node::options::DeliveryLimits::default(),
         );
         let router = Arc::new(router);
         let run_router = router.clone();

@@ -14,8 +14,9 @@ use crate::transport::quic::QuicTransportOptions;
 use crate::types::PeerId;
 
 use super::options::{
-    AdaptiveTopologyProfile, AppPlaneIpcOptions, BootstrapNode, DebugServerOptions, DialPolicy,
-    DirectUpgradeConfig, FlowTraceOptions, IpcTcpOptions, LanDiscoveryOptions, NodeOptions,
+    AdaptiveTopologyProfile, AppPlaneIpcOptions, BootstrapNode, DebugServerOptions, DeliveryLimits,
+    DialPolicy, DirectUpgradeConfig, FlowTraceOptions, IpcTcpOptions, LanDiscoveryOptions,
+    NodeOptions,
     NodeRole, TopologyTuning, default_transport_obfuscation,
 };
 
@@ -132,7 +133,8 @@ struct NodeOptionsFile {
     dial_policy: DialPolicy,
     #[serde(default)]
     lan_discovery: LanDiscoveryOptions,
-    /// Compressed-point hex of the trusted release signing key (P5).
+    #[serde(default)]
+    delivery: DeliveryLimits,
     #[serde(default)]
     trusted_release_key: Option<String>,
 }
@@ -267,6 +269,7 @@ impl TryFrom<NodeOptionsFile> for NodeOptions {
             topology_react_to_session_events: file.topology_react_to_session_events,
             dial_policy: file.dial_policy,
             lan_discovery: file.lan_discovery,
+            delivery: file.delivery,
             schema_version,
             topology_profile,
             trusted_release_key: file.trusted_release_key,
@@ -428,6 +431,7 @@ impl From<&NodeOptions> for NodeOptionsFile {
             topology_react_to_session_events: opts.topology_react_to_session_events,
             dial_policy: opts.dial_policy.clone(),
             lan_discovery: opts.lan_discovery.clone(),
+            delivery: opts.delivery.clone(),
             trusted_release_key: opts.trusted_release_key.clone(),
         }
     }

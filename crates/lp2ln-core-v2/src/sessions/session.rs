@@ -13,6 +13,23 @@ pub enum LinkKind {
     Relay,
 }
 
+impl LinkKind {
+    /// Whether the link itself retransmits lost frames and keeps order.
+    ///
+    /// UDP links are deliberately fire-and-forget (hole punching, keepalive,
+    /// LAN discovery) and never carry bulk. `Relay` counts as reliable here
+    /// because reliability is decided per hop by the relay's own link, not by
+    /// this session — refusing relays would cut the mesh instead.
+    pub fn is_reliable(&self) -> bool {
+        match self {
+            LinkKind::DirectTcp | LinkKind::DirectQuic | LinkKind::TunnelTcp | LinkKind::Relay => {
+                true
+            }
+            LinkKind::DirectUdp | LinkKind::TunnelUdp => false,
+        }
+    }
+}
+
 impl fmt::Display for LinkKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

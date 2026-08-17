@@ -6,7 +6,7 @@ pub mod transport;
 pub use debug::{DebugServerOptions, FlowTraceOptions, IpcTcpOptions};
 pub use experimental::{AppPlaneIpcOptions, ExperimentalOptions, default_app_plane_path};
 pub use topology::{AdaptiveTopologyProfile, TopologyTuning};
-pub use transport::{DialPolicy, DirectUpgradeConfig, LanDiscoveryOptions};
+pub use transport::{DeliveryLimits, DialPolicy, DirectUpgradeConfig, LanDiscoveryOptions};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -98,7 +98,9 @@ pub struct NodeOptions {
     pub topology_react_to_session_events: bool,
     pub dial_policy: DialPolicy,
     pub lan_discovery: LanDiscoveryOptions,
-    /// Config schema version (P3-07). Missing on disk ⇒ treated as 1 at load.
+    /// Chunk-reassembly caps and relay dedup.
+    pub delivery: DeliveryLimits,
+    /// Config schema version. Missing on disk ⇒ treated as 1 at load.
     pub schema_version: u32,
     /// Named topology profile (public surface). Synced into `topology_tuning.adaptive_profile`.
     pub topology_profile: AdaptiveTopologyProfile,
@@ -150,6 +152,7 @@ impl NodeOptions {
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
             lan_discovery: LanDiscoveryOptions::default(),
+            delivery: DeliveryLimits::default(),
             schema_version: super::config_v2::CONFIG_SCHEMA_VERSION,
             topology_profile: AdaptiveTopologyProfile::default(),
             trusted_release_key: None,
@@ -203,6 +206,7 @@ impl NodeOptions {
             topology_react_to_session_events: false,
             dial_policy: DialPolicy::default(),
             lan_discovery: LanDiscoveryOptions::default(),
+            delivery: DeliveryLimits::default(),
             schema_version: super::config_v2::CONFIG_SCHEMA_VERSION,
             topology_profile: AdaptiveTopologyProfile::default(),
             trusted_release_key: None,

@@ -6,7 +6,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::packet_processor::{
-    ChunkAssembler, ChunkAssemblerResult, PacketProcessor, ProcessAction,
+    ChunkAssembler, ChunkAssemblerResult, PacketProcessor, ProcessAction, RelayDedup,
 };
 use crate::router::Router;
 use crate::services::MetricsProvider;
@@ -64,6 +64,7 @@ pub struct PacketIngressDispatcher {
     #[allow(dead_code)]
     packet_processor: Arc<dyn PacketProcessor>,
     chunk_assembler: Arc<ChunkAssembler>,
+    relay_dedup: Arc<RelayDedup>,
     incoming_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
     our_peer_id: String,
     job_queue: Arc<PacketJobQueue>,
@@ -76,6 +77,7 @@ impl PacketIngressDispatcher {
         session_manager: Arc<SessionManager>,
         packet_processor: Arc<dyn PacketProcessor>,
         chunk_assembler: Arc<ChunkAssembler>,
+        relay_dedup: Arc<RelayDedup>,
         incoming_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
         our_peer_id: impl Into<String>,
         worker_concurrency: usize,
@@ -113,6 +115,7 @@ impl PacketIngressDispatcher {
             session_manager,
             packet_processor,
             chunk_assembler,
+            relay_dedup,
             incoming_broadcast_tx,
             our_peer_id,
             job_queue,
@@ -154,12 +157,26 @@ impl PacketIngressDispatcher {
             bytes_estimate,
         );
 
+        // A packet that has crossed a relay can reach us twice over different
+        // paths; drop the second copy before it hits subscribers or the
+        // processor. Direct links ride QUIC/TCP, which dedup themselves (AD-19).
+        if !incoming.packet.nodes.is_empty() && !self.relay_dedup.check_and_record(&incoming.packet)
+        {
+            crate::debug!(
+                "[Router] dropping duplicate relayed packet from {} (request_id={:?})",
+                incoming.packet.sender,
+                incoming.packet.request_id
+            );
+            return;
+        }
+
         let to_process = if ChunkAssembler::is_chunk_packet(&incoming.packet) {
             match self.chunk_assembler.add(incoming) {
                 ChunkAssemblerResult::Merged(ip) | ChunkAssemblerResult::PassThrough(ip) => {
                     Some(ip)
                 }
                 ChunkAssemblerResult::Collecting => None,
+                ChunkAssemblerResult::Rejected { .. } => None,
             }
         } else {
             Some(incoming)

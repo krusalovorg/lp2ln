@@ -13,6 +13,7 @@ use crate::{
     crypto::signature::SignatureFormat,
     dht::records::{node_id_of, xor_distance},
     node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
+    node::options::DeliveryLimits,
     packet::Packet,
     packet_processor::PacketProcessor,
     protocol::control::NetworkControlPayload,
@@ -56,6 +57,7 @@ pub struct Router {
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
     our_node_id: NodeId,
+    delivery: DeliveryLimits,
 }
 
 impl Router {
@@ -77,6 +79,7 @@ impl Router {
             ROUTER_BROADCAST_CAP,
             ROUTER_PROCESS_SEMAPHORE_PERMITS,
             SignatureFormat::V3Hash,
+            DeliveryLimits::default(),
         )
     }
 
@@ -91,6 +94,7 @@ impl Router {
         broadcast_cap: usize,
         worker_concurrency: usize,
         signature_format: SignatureFormat,
+        delivery: DeliveryLimits,
     ) -> (Self, mpsc::Receiver<IncomingPacket>) {
         let our_peer_id: String = our_peer_id.into();
         let our_node_id = node_id_of(&our_peer_id);
@@ -99,13 +103,18 @@ impl Router {
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
-        let chunk_assembler = Arc::new(crate::packet_processor::ChunkAssembler::new(
+        let chunk_assembler = Arc::new(crate::packet_processor::ChunkAssembler::with_limits(
             our_peer_id.clone(),
+            delivery.clone(),
+        ));
+        let relay_dedup = Arc::new(crate::packet_processor::RelayDedup::new(
+            delivery.relay_dedup_capacity,
         ));
         let ingress = PacketIngressDispatcher::new(
             session_manager.clone(),
             packet_processor,
             chunk_assembler,
+            relay_dedup,
             incoming_broadcast_tx.clone(),
             our_peer_id.clone(),
             worker_concurrency,
@@ -129,6 +138,7 @@ impl Router {
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
                 our_node_id,
+                delivery,
             },
             incoming_rx,
         )
@@ -231,6 +241,25 @@ impl Router {
         }
     }
 
+    fn reliable_session_for(&self, peer_id: &PeerId) -> Option<Arc<dyn Session + Send + Sync>> {
+        self.session_manager
+            .best_session_for_peer_where(peer_id, |kind| kind.is_reliable())
+    }
+
+    /// Best session for a peer, restricted to reliable links when the packet is
+    /// bulk. Returns `None` rather than silently downgrading to UDP.
+    fn select_session_for(
+        &self,
+        peer_id: &PeerId,
+        bulk_needs_reliable: bool,
+    ) -> Option<Arc<dyn Session + Send + Sync>> {
+        if bulk_needs_reliable {
+            self.reliable_session_for(peer_id)
+        } else {
+            SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id)
+        }
+    }
+
     pub async fn send_to_peer(
         &self,
         peer_id: PeerId,
@@ -249,9 +278,23 @@ impl Router {
                 peer_id
             ));
         }
-        if let Some(session) =
-            SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
+
+        // Bulk (chunked) traffic must ride a link that retransmits. A single
+        // dropped chunk otherwise strands the whole stream in the receiver's
+        // assembler, so refuse loudly instead of losing it silently (AD-19).
+        let bulk_needs_reliable = packet.is_chunk() && self.delivery.bulk_requires_reliable_transport;
+        if bulk_needs_reliable
+            && SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
+                .is_some()
+            && self.reliable_session_for(&peer_id).is_none()
         {
+            return Err(anyhow::anyhow!(
+                "Chunked packet to '{}' has only unreliable links; refusing to send it over UDP",
+                peer_id
+            ));
+        }
+
+        if let Some(session) = self.select_session_for(&peer_id, bulk_needs_reliable) {
             let session_id = SessionId::from(session.id().to_string());
             let wire = encode_packet(packet)?;
             match session.send_wire(wire).await {
@@ -329,9 +372,7 @@ impl Router {
         let mut any_ok = false;
         let mut last_err = None;
         for neighbor in candidates {
-            if let Some(session) =
-                SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &neighbor)
-            {
+            if let Some(session) = self.select_session_for(&neighbor, bulk_needs_reliable) {
                 let session_id = SessionId::from(session.id().to_string());
                 match session.send_wire(wire.clone()).await {
                     Ok(bytes) => {
