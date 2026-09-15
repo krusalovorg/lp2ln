@@ -113,6 +113,69 @@ pub fn decrypt_chunk(
         .map_err(|_| ContentError::Crypto(format!("chunk {chunk_index} decryption failed")))
 }
 
+// ── Deterministic sealing (manifests) ────────────────────────────────────────
+
+/// AAD/nonce domain for sealed manifest blocks.
+pub const MANIFEST_DOMAIN: &[u8] = b"lp2ln-sealed-manifest";
+
+/// Nonce = SHA256(key || domain || plaintext), i.e. synthetic IV.
+///
+/// Manifests must be **content-addressed**: the same manifest has to seal to the
+/// same bytes, or its `ContentId` changes on every call and head comparison,
+/// dedup and `dir_manifest_id()` all break. A random nonce is therefore not an
+/// option here. Determinism is safe because the key is per-namespace and the
+/// nonce commits to the whole plaintext — two different manifests never collide.
+/// It leaks only equality of plaintexts, which content addressing exposes anyway.
+fn siv_nonce(key: &ChunkKey, domain: &[u8], plaintext: &[u8]) -> [u8; NONCE_LEN] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key);
+    h.update(domain);
+    h.update((plaintext.len() as u64).to_le_bytes());
+    h.update(plaintext);
+    let digest: [u8; 32] = h.finalize().into();
+    digest[..NONCE_LEN].try_into().expect("sha256 >= 24 bytes")
+}
+
+/// Seal `plaintext` under `key` deterministically. Envelope: `nonce || ct||tag`.
+pub fn seal_deterministic(
+    key: &ChunkKey,
+    domain: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ContentError> {
+    let nonce_bytes = siv_nonce(key, domain, plaintext);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload { msg: plaintext, aad: domain },
+        )
+        .map_err(|_| ContentError::Crypto("seal failed".into()))?;
+    let mut envelope = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    envelope.extend_from_slice(&nonce_bytes);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+/// Open an envelope produced by [`seal_deterministic`].
+pub fn open_sealed(
+    key: &ChunkKey,
+    domain: &[u8],
+    envelope: &[u8],
+) -> Result<Vec<u8>, ContentError> {
+    if envelope.len() <= NONCE_LEN {
+        return Err(ContentError::Crypto("sealed envelope too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = envelope.split_at(NONCE_LEN);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce_bytes),
+            Payload { msg: ciphertext, aad: domain },
+        )
+        .map_err(|_| ContentError::Crypto("sealed envelope auth failed".into()))
+}
+
 /// Extract the stored nonce from an envelope (for tests / diagnostics).
 pub fn envelope_nonce(envelope: &[u8]) -> Option<&[u8]> {
     (envelope.len() > NONCE_LEN).then(|| &envelope[..NONCE_LEN])

@@ -8,5 +8,5 @@ pub mod placeholder;
 pub use db::{open_db, open_store_scratch};
 pub use file_assoc::ensure_lp2ln_association;
 pub use folder_icon::ensure_folder_icon;
-pub use magic_folder::MagicFolder;
+pub use magic_folder::{MagicFolder, derive_namespace_id};
 pub use node_client::NodeClient;

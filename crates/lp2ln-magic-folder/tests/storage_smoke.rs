@@ -267,3 +267,47 @@ async fn load_state_survives_restart() {
         assert_eq!(tokio::fs::read(out).await.unwrap(), b"persistent");
     }
 }
+
+/// Two devices holding the same namespace_key must land on the same namespace_id,
+/// and a different key must not collide — that is the whole "one secret" property.
+#[test]
+fn namespace_id_is_derived_from_key_only() {
+    use lp2ln_magic_folder::derive_namespace_id;
+    let key = [7u8; 32];
+    assert_eq!(derive_namespace_id(&key), derive_namespace_id(&key));
+    assert_ne!(derive_namespace_id(&key), derive_namespace_id(&[8u8; 32]));
+    assert_ne!(derive_namespace_id(&key), key, "id must not leak the key itself");
+}
+
+/// The manifest block is what gets replicated to strangers. It must not hand
+/// them the file_key, the filename, or anything else in the clear.
+#[tokio::test]
+async fn manifest_block_is_opaque_without_namespace_key() {
+    use lp2ln_content::encrypt::{MANIFEST_DOMAIN, open_sealed};
+    use lp2ln_content::store::BlockStore;
+
+    let root = std::env::temp_dir().join(format!("mf_seal_{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    tokio::fs::write(root.join("secret-name.txt"), b"payload").await.unwrap();
+
+    let db_dir = std::env::temp_dir().join(format!("lp2ln_mf_{}", uuid::Uuid::new_v4()));
+    let (store, raw_db) = open_db(db_dir.to_str().unwrap()).unwrap();
+    let ns_key: [u8; 32] = rand::random();
+    let folder = MagicFolder::new(&root, [1u8; 32], ns_key, store, raw_db);
+    let manifest_id = folder.add_file("secret-name.txt").await.unwrap();
+
+    // Read the raw block the way a replica peer would see it.
+    let (store, _db) = lp2ln_magic_folder::open_store_scratch(db_dir.to_str().unwrap()).unwrap();
+    let block = store.get(&manifest_id).unwrap().expect("manifest block stored");
+
+    assert!(
+        !block.windows(4).any(|w| w == b"secr"),
+        "filename leaked into the replicated manifest block"
+    );
+    assert!(
+        open_sealed(&[9u8; 32], MANIFEST_DOMAIN, &block).is_err(),
+        "a peer without namespace_key must not open the manifest"
+    );
+    let plain = open_sealed(&ns_key, MANIFEST_DOMAIN, &block).expect("owner can open it");
+    assert!(plain.windows(4).any(|w| w == b"secr"), "owner should see the real manifest");
+}

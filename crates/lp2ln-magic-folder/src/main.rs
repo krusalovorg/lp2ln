@@ -18,8 +18,9 @@
 //     "stability_secs":     2,
 //     "auto_dehydrate":     false,               <- daemon auto-replaces files with .lp2ln after replica ack
 
-//     "namespace_id":       "<64 hex chars>",   <- auto-generated on first run
-//     "namespace_key":      "<64 hex chars>"    <- auto-generated on first run, keep secret
+//     "namespace_key":      "<64 hex chars>"    <- the only secret; generated on first run.
+//                                                  Same key on another device = same files.
+//     "namespace_id":       "<64 hex chars>"    <- derived from namespace_key; leave it out
 //   }
 
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 use lp2ln_content::id::content_id_hex;
 use lp2ln_magic_folder::{
-    MagicFolder, NodeClient, ensure_folder_icon, ensure_lp2ln_association, open_db,
+    MagicFolder, NodeClient, derive_namespace_id, ensure_folder_icon, ensure_lp2ln_association, open_db,
     open_store_scratch,
 };
 use tokio_util::sync::CancellationToken;
@@ -99,18 +100,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}\nCreate it with at least {{\"root\":\"...\",\"db_path\":\"...\"}}", opts_path.display()))?;
     let mut opts: Options = serde_json::from_str(&raw)?;
 
-    // Auto-generate namespace keys on first use; write back to options file.
+    // namespace_key is the ONLY secret: copy it to another device and that device
+    // sees exactly your files. namespace_id (the DHT key the head lives under) is
+    // derived from it. Pre-existing configs keep their independently generated id.
     let mut dirty = false;
-    if opts.namespace_id.is_none() {
-        let id: [u8; 32] = rand::random();
-        println!("generated namespace_id:  {}", hex32(&id));
-        opts.namespace_id = Some(hex32(&id));
-        dirty = true;
-    }
     if opts.namespace_key.is_none() {
         let key: [u8; 32] = rand::random();
-        println!("generated namespace_key: {} (keep secret — this is the decryption capability)", hex32(&key));
+        println!("generated namespace_key: {} (keep secret — this is the whole capability)", hex32(&key));
         opts.namespace_key = Some(hex32(&key));
+        dirty = true;
+    }
+    if opts.namespace_id.is_none() {
+        let key = parse_hex32(opts.namespace_key.as_deref().unwrap())?;
+        let id = derive_namespace_id(&key);
+        println!("derived namespace_id:   {}", hex32(&id));
+        opts.namespace_id = Some(hex32(&id));
         dirty = true;
     }
     if dirty {

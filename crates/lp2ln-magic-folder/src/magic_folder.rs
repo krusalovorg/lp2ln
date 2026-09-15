@@ -24,7 +24,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use lp2ln_content::compress::{compress_frame, decompress_frame};
-use lp2ln_content::encrypt::{CHUNK_SIZE, ChunkKey, decrypt_chunk, encrypt_chunk, generate_key};
+use lp2ln_content::encrypt::{
+    CHUNK_SIZE, ChunkKey, MANIFEST_DOMAIN, decrypt_chunk, encrypt_chunk, generate_key, open_sealed,
+    seal_deterministic,
+};
 use lp2ln_content::id::{ContentId, content_id_hex, hash_bytes, unix_now};
 use lp2ln_content::manifest::{CODEC_FRAMED_LZ4, DirEntry, DirectoryManifest, FileManifest};
 use lp2ln_content::store::{BlockStore, FsBlockStore};
@@ -52,6 +55,17 @@ fn head_mac(namespace_key: &[u8; 32], dir_manifest_id: &ContentId, version: u64)
     h.update(b"lp2ln-namespace-head");
     h.update(dir_manifest_id);
     h.update(version.to_le_bytes());
+    h.finalize().into()
+}
+
+/// The namespace id is the DHT key the head is published under; the key is the
+/// capability that authenticates and decrypts it. Deriving the id from the key
+/// means a device joins your personal namespace with a single secret.
+pub fn derive_namespace_id(namespace_key: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(namespace_key);
+    h.update(b"lp2ln-namespace-id");
     h.finalize().into()
 }
 
@@ -149,6 +163,50 @@ impl MagicFolder {
         self
     }
 
+    // ── Sealed manifests ─────────────────────────────────────────────────────
+    //
+    // Chunks are encrypted with a per-file key, but that key lives inside the
+    // FileManifest — and manifests are replicated to peers like any other block.
+    // Stored in the clear, a peer holding the replica could decrypt the file and
+    // read every filename out of the DirectoryManifest. So manifest blocks are
+    // themselves sealed under namespace_key, and namespace_key becomes the one
+    // capability that unlocks anything.
+
+    /// Seal `bytes` under namespace_key and store the envelope.
+    fn seal_put(&self, bytes: &[u8]) -> anyhow::Result<ContentId> {
+        let sealed = seal_deterministic(&self.namespace_key, MANIFEST_DOMAIN, bytes)
+            .map_err(|e| anyhow::anyhow!("seal manifest: {e}"))?;
+        Ok(self.store.put(&sealed)?)
+    }
+
+    /// Inverse of [`Self::seal_put`]. Blocks written before sealing existed are
+    /// plaintext postcard, so an auth failure falls back to the raw bytes.
+    fn unseal(&self, bytes: Vec<u8>) -> Vec<u8> {
+        open_sealed(&self.namespace_key, MANIFEST_DOMAIN, &bytes).unwrap_or(bytes)
+    }
+
+    fn seal_file_manifest(&self, m: &FileManifest) -> anyhow::Result<ContentId> {
+        self.seal_put(&postcard::to_allocvec(m)?)
+    }
+
+    fn seal_dir_manifest(&self, dm: &DirectoryManifest) -> anyhow::Result<ContentId> {
+        self.seal_put(&postcard::to_allocvec(dm)?)
+    }
+
+    /// Load a FileManifest from the local store only.
+    fn load_file_manifest_local(&self, id: &ContentId) -> anyhow::Result<FileManifest> {
+        let bytes = self.store.get(id)?
+            .ok_or_else(|| anyhow::anyhow!("file manifest {} not in store", content_id_hex(id)))?;
+        Ok(FileManifest::decode(&self.unseal(bytes))?)
+    }
+
+    /// Load a DirectoryManifest from the local store only.
+    fn load_dir_manifest_local(&self, id: &ContentId) -> anyhow::Result<DirectoryManifest> {
+        let bytes = self.store.get(id)?
+            .ok_or_else(|| anyhow::anyhow!("dir manifest {} not in store", content_id_hex(id)))?;
+        Ok(postcard::from_bytes(&self.unseal(bytes))?)
+    }
+
     // ── State persistence ────────────────────────────────────────────────────
 
     /// Restore in-memory dir_manifest and file_state from the durable database.
@@ -156,7 +214,7 @@ impl MagicFolder {
     pub async fn load_state(&self) -> anyhow::Result<()> {
         let dm_id = self.load_dir_manifest_id();
         if let Some(id) = dm_id {
-            if let Ok(dm) = DirectoryManifest::load(&self.store, &id) {
+            if let Ok(dm) = self.load_dir_manifest_local(&id) {
                 // Rebuild file_state: only include files currently on disk.
                 let mut fs = HashMap::new();
                 for entry in &dm.entries {
@@ -258,11 +316,11 @@ impl MagicFolder {
             modified_at: mtime,
             codec: CODEC_FRAMED_LZ4,
         };
-        let manifest_id = manifest.store(&self.store)?;
+        let manifest_id = self.seal_file_manifest(&manifest)?;
 
         let dm_id = {
             let mut dm = self.dir_manifest.lock().await;
-            let prev = dm.store(&self.store).ok();
+            let prev = self.seal_dir_manifest(&dm).ok();
             dm.prev_manifest_id = prev;
             dm.created_at = unix_now();
             dm.apply(DirEntry {
@@ -271,7 +329,7 @@ impl MagicFolder {
                 tombstone: false,
                 modified_at: mtime,
             });
-            dm.store(&self.store)?
+            self.seal_dir_manifest(&dm)?
         };
         self.save_dir_manifest_id(&dm_id)?;
 
@@ -323,11 +381,11 @@ impl MagicFolder {
                     continue;
                 }
                 ids.push(entry.manifest_id);
-                if let Ok(fm) = FileManifest::load(&self.store, &entry.manifest_id) {
+                if let Ok(fm) = self.load_file_manifest_local(&entry.manifest_id) {
                     ids.extend(fm.chunk_ids);
                 }
             }
-            dm.store(&self.store).ok()
+            self.seal_dir_manifest(&dm).ok()
         };
         if let Some(id) = dm_id {
             ids.push(id);
@@ -348,7 +406,7 @@ impl MagicFolder {
         let Some(nc) = &self.node_client else { return Ok(()) };
         let (dm_id, version) = {
             let dm = self.dir_manifest.lock().await;
-            (dm.store(&self.store)?, dm.version)
+            (self.seal_dir_manifest(&dm)?, dm.version)
         };
         let head = HeadRecord {
             dir_manifest_id: dm_id,
@@ -363,7 +421,7 @@ impl MagicFolder {
     pub async fn remove_file(&self, relative_path: &str) -> anyhow::Result<()> {
         let dm_id = {
             let mut dm = self.dir_manifest.lock().await;
-            let prev = dm.store(&self.store).ok();
+            let prev = self.seal_dir_manifest(&dm).ok();
             dm.prev_manifest_id = prev;
             dm.created_at = unix_now();
             dm.apply(DirEntry {
@@ -372,7 +430,7 @@ impl MagicFolder {
                 tombstone: true,
                 modified_at: unix_now(),
             });
-            dm.store(&self.store)?
+            self.seal_dir_manifest(&dm)?
         };
         self.save_dir_manifest_id(&dm_id)?;
         self.file_state.lock().await.remove(relative_path);
@@ -411,7 +469,7 @@ impl MagicFolder {
                 ))?
         };
 
-        let mut manifest = FileManifest::load(&self.store, &manifest_id)
+        let mut manifest = self.load_file_manifest_local(&manifest_id)
             .map_err(|e| anyhow::anyhow!("manifest not found locally: {e}"))?;
 
         // Staleness guard: if the file changed since ingest, re-ingest first —
@@ -420,7 +478,7 @@ impl MagicFolder {
         let disk_mtime = mtime_secs(&disk_meta);
         if manifest.file_size != disk_meta.len() || manifest.modified_at != disk_mtime {
             manifest_id = self.add_file(relative_path).await?;
-            manifest = FileManifest::load(&self.store, &manifest_id)?;
+            manifest = self.load_file_manifest_local(&manifest_id)?;
         }
 
         // Safety check: all blocks must be present and verified.
@@ -515,7 +573,7 @@ impl MagicFolder {
 
         let fm_bytes = self.load_block(&manifest_id).await
             .map_err(|e| anyhow::anyhow!("manifest not available (was the cache cleared?): {e}"))?;
-        let manifest = FileManifest::decode(&fm_bytes)
+        let manifest = FileManifest::decode(&self.unseal(fm_bytes))
             .map_err(|e| anyhow::anyhow!("manifest decode: {e}"))?;
 
         {
@@ -608,7 +666,7 @@ impl MagicFolder {
         );
 
         // Skip if it's our own current head or one we already merged.
-        let local_id = { self.dir_manifest.lock().await.store(&self.store)? };
+        let local_id = { let dm = self.dir_manifest.lock().await; self.seal_dir_manifest(&dm)? };
         if head.dir_manifest_id == local_id
             || self.load_meta(LAST_REMOTE_HEAD_KEY).as_deref() == Some(head.dir_manifest_id.as_slice())
         {
@@ -618,7 +676,7 @@ impl MagicFolder {
         let dm_bytes = self.load_block(&head.dir_manifest_id).await
             .map_err(|e| anyhow::anyhow!("remote dir manifest {}: {e}",
                 lp2ln_content::id::content_id_hex(&head.dir_manifest_id)))?;
-        let remote: DirectoryManifest = postcard::from_bytes(&dm_bytes)
+        let remote: DirectoryManifest = postcard::from_bytes(&self.unseal(dm_bytes))
             .map_err(|e| anyhow::anyhow!("remote dir manifest decode: {e}"))?;
         anyhow::ensure!(remote.namespace_id == self.namespace_id, "namespace_id mismatch in remote manifest");
 
@@ -662,7 +720,7 @@ impl MagicFolder {
             let dm_id = {
                 let mut dm = self.dir_manifest.lock().await;
                 dm.version = dm.version.max(remote.version);
-                dm.store(&self.store)?
+                self.seal_dir_manifest(&dm)?
             };
             self.save_dir_manifest_id(&dm_id)?;
         }
@@ -709,7 +767,7 @@ impl MagicFolder {
 
         let fm_bytes = self.load_block(&rentry.manifest_id).await
             .map_err(|e| anyhow::anyhow!("file manifest for '{}': {e}", rentry.path))?;
-        let fm = FileManifest::decode(&fm_bytes)
+        let fm = FileManifest::decode(&self.unseal(fm_bytes))
             .map_err(|e| anyhow::anyhow!("file manifest decode for '{}': {e}", rentry.path))?;
 
         if adopt {
@@ -754,12 +812,7 @@ impl MagicFolder {
     pub async fn restore_to(&self, dir_manifest_id: ContentId, target: &Path) -> anyhow::Result<()> {
         let dm_bytes = self.load_block(&dir_manifest_id).await
             .map_err(|e| anyhow::anyhow!("dir manifest: {e}"))?;
-        let dm = DirectoryManifest::load(&self.store, &dir_manifest_id)
-            .or_else(|_| {
-                // May have been fetched via network into store — retry after load_block cached it.
-                let _ = self.store.put(&dm_bytes);
-                DirectoryManifest::load(&self.store, &dir_manifest_id)
-            })
+        let dm: DirectoryManifest = postcard::from_bytes(&self.unseal(dm_bytes))
             .map_err(|e| anyhow::anyhow!("dir manifest decode: {e}"))?;
 
         tokio::fs::create_dir_all(target).await?;
@@ -767,7 +820,7 @@ impl MagicFolder {
         for entry in dm.entries.iter().filter(|e| !e.tombstone) {
             let fm_bytes = self.load_block(&entry.manifest_id).await
                 .map_err(|e| anyhow::anyhow!("file manifest for '{}': {e}", entry.path))?;
-            let manifest = FileManifest::decode(&fm_bytes)
+            let manifest = FileManifest::decode(&self.unseal(fm_bytes))
                 .map_err(|e| anyhow::anyhow!("file manifest decode for '{}': {e}", entry.path))?;
 
             let out = target.join(&entry.path);
@@ -791,7 +844,8 @@ impl MagicFolder {
     // ── Status ───────────────────────────────────────────────────────────────
 
     pub async fn dir_manifest_id(&self) -> ContentId {
-        self.dir_manifest.lock().await.store(&self.store).unwrap_or([0u8; 32])
+        let dm = self.dir_manifest.lock().await;
+        self.seal_dir_manifest(&dm).unwrap_or([0u8; 32])
     }
 
     /// Returns (relative_path, is_tombstone) for all entries.
