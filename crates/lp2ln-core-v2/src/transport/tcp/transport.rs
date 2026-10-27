@@ -13,6 +13,59 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+/// Upper bound for reading the client's hello on an accepted connection.
+const INCOMING_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn handle_incoming(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    obfuscator: Arc<Obfuscator>,
+    incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
+) {
+    let handshake = tokio::time::timeout(
+        INCOMING_HANDSHAKE_TIMEOUT,
+        TcpSession::perform_handshake_on_stream(&mut stream, obfuscator.as_ref()),
+    )
+    .await;
+    let peer_id = match handshake {
+        Ok(Ok(peer_id)) => {
+            crate::info!("[TcpTransport] Handshake successful, peer_id: {}", peer_id);
+            peer_id
+        }
+        Ok(Err(e)) => {
+            crate::error!("[TcpTransport] Handshake from {} failed: {}", peer_addr, e);
+            return;
+        }
+        Err(_) => {
+            crate::warn!("[TcpTransport] Handshake from {} timed out", peer_addr);
+            return;
+        }
+    };
+
+    match TcpSession::new_from_stream(stream, Some(peer_id), LinkKind::DirectTcp, obfuscator) {
+        Ok(session) => {
+            match incoming_sessions_tx
+                .send(session.clone() as Arc<dyn Session>)
+                .await
+            {
+                Ok(()) => {
+                    crate::session!(
+                        "[TcpTransport] Session registered: {} (peer_id: {:?})",
+                        session.id(),
+                        session.peer_id()
+                    );
+                }
+                Err(_) => {
+                    crate::error!("[TcpTransport] Failed to send incoming session: channel closed");
+                }
+            }
+        }
+        Err(e) => {
+            crate::error!("[TcpTransport] Failed to create session from stream: {}", e);
+        }
+    }
+}
+
 pub struct TcpTransport {
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
@@ -140,38 +193,18 @@ impl Transport for TcpTransport {
                     }
                     result = listener_clone.accept() => {
                         match result {
-                            Ok((mut stream, peer_addr)) => {
+                            Ok((stream, peer_addr)) => {
                                 crate::info!("[TcpTransport] New incoming connection from {}", peer_addr);
-
-                                let peer_id = match TcpSession::perform_handshake_on_stream(&mut stream, obfuscator.as_ref()).await {
-                                    Ok(peer_id) => {
-                                        crate::info!("[TcpTransport] Handshake successful, peer_id: {}", peer_id);
-                                        Some(peer_id)
-                                    }
-                                    Err(e) => {
-                                        crate::error!("[TcpTransport] Handshake failed: {}", e);
-                                        continue;
-                                    }
-                                };
-
-                                match TcpSession::new_from_stream(stream, peer_id, LinkKind::DirectTcp, obfuscator.clone()) {
-                                    Ok(session) => {
-                                        match incoming_sessions_tx
-                                            .send(session.clone() as Arc<dyn Session>)
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                crate::session!("[TcpTransport] Session registered: {} (peer_id: {:?})", session.id(), session.peer_id());
-                                            }
-                                            Err(_) => {
-                                                crate::error!("[TcpTransport] Failed to send incoming session: channel closed");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        crate::error!("[TcpTransport] Failed to create session from stream: {}", e);
-                                    }
-                                }
+                                // Handshake per connection in its own task: a client that
+                                // connects but never sends a full hello (port scanners on a
+                                // public address, half-open mobile links) must not stall the
+                                // accept loop for everyone else.
+                                tokio::spawn(handle_incoming(
+                                    stream,
+                                    peer_addr,
+                                    obfuscator.clone(),
+                                    incoming_sessions_tx.clone(),
+                                ));
                             }
                             Err(e) => {
                                 crate::error!("[TcpTransport] Error accepting connection: {}", e);
@@ -236,5 +269,67 @@ impl Transport for TcpTransport {
         )?;
 
         Ok(session as Arc<dyn Session>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::node_keypair::NodeKeypair;
+    use crate::crypto::signature::sign_packet;
+    use crate::packet::Packet;
+    use crate::transport::tcp::codec::encode_packet;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn silent_connection_does_not_block_other_handshakes() {
+        let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::channel(4);
+        let (packets_tx, _packets_rx) = tokio::sync::mpsc::channel(4);
+        let transport = TcpTransport::new_listener(Some("127.0.0.1:0".parse().unwrap()));
+        let addr = transport
+            .start(TransportContext {
+                incoming_sessions_tx: sessions_tx,
+                incoming_packets_tx: packets_tx,
+                listen_addr: None,
+                event_tx: None,
+                keypair: None,
+                catalog: None,
+            })
+            .await
+            .expect("start")
+            .expect("listen addr");
+
+        // Connects and never sends a hello, like a port scanner.
+        let _silent = TcpStream::connect(addr).await.expect("silent connect");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let keypair = NodeKeypair::generate();
+        let mut hello = Packet {
+            signature: None,
+            data: crate::protocol::handshake::encode_hello(vec![], None),
+            nodes: vec![],
+            sender: keypair.peer_id().to_string(),
+            receiver: String::new(),
+            max_hops: 8,
+            request_id: None,
+            chunk_stream_id: None,
+            chunk_index: None,
+            total_chunks: None,
+            protocol_id: None,
+        };
+        sign_packet(&mut hello, keypair.signing_key()).expect("sign");
+        let mut client = TcpStream::connect(addr).await.expect("client connect");
+        Obfuscator::plain()
+            .write_frame(&mut client, &encode_packet(hello).expect("encode"))
+            .await
+            .expect("write hello");
+
+        let session = tokio::time::timeout(Duration::from_secs(2), sessions_rx.recv())
+            .await
+            .expect("handshake not blocked by silent connection")
+            .expect("session");
+        assert_eq!(session.peer_id(), Some(keypair.peer_id()));
+
+        transport.stop().await.expect("stop");
     }
 }

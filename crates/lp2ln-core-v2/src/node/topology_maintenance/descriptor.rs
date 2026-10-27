@@ -51,6 +51,10 @@ pub(super) async fn publish_descriptor_if_due(
             continue;
         }
         let proto = transport.name().to_string();
+        // An operator-pinned public address (static IP server) makes STUN redundant.
+        if advertise_addrs.contains_key(&proto) {
+            continue;
+        }
         let Some(listen_addr) = listens.get(&proto).map(|r| *r.value()) else {
             continue;
         };
