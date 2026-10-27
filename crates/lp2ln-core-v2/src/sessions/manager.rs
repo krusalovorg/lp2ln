@@ -389,6 +389,23 @@ impl SessionManager {
             .map(|entry| entry.value().clone())
     }
 
+    pub fn link_snapshots(&self) -> Vec<crate::node::link_survival::LinkSnapshot> {
+        self.sessions
+            .iter()
+            .filter_map(|entry| {
+                let session_id = entry.key().clone();
+                let metrics = self.metrics.get(&session_id).map(|m| m.clone())?;
+                Some(crate::node::link_survival::LinkSnapshot {
+                    peer_id: self.session_to_peer.get(&session_id).map(|p| p.clone()),
+                    kind: entry.value().kind(),
+                    remote_addr: entry.value().remote_addr(),
+                    session_id,
+                    metrics,
+                })
+            })
+            .collect()
+    }
+
     pub fn debug_sessions(&self) -> Vec<SessionDebugEntry> {
         self.sessions
             .iter()

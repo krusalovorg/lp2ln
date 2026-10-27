@@ -8,6 +8,7 @@ pub mod flow_trace;
 pub mod health_server;
 pub mod incoming_sessions;
 pub mod lan_discovery;
+pub mod link_survival;
 pub mod nat_traversal;
 pub mod options;
 mod options_file;

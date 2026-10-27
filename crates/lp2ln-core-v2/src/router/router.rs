@@ -13,6 +13,7 @@ use crate::{
     crypto::signature::SignatureFormat,
     dht::records::{node_id_of, xor_distance},
     node::direct_upgrade::{DirectUpgradeEvent, DirectUpgradeRouterSink},
+    node::link_survival::{LinkSnapshot, PathScoreboard},
     node::options::DeliveryLimits,
     packet::Packet,
     packet_processor::PacketProcessor,
@@ -58,6 +59,7 @@ pub struct Router {
     direct_upgrade_channel_full: AtomicU64,
     our_node_id: NodeId,
     delivery: DeliveryLimits,
+    paths: Arc<PathScoreboard>,
 }
 
 impl Router {
@@ -139,6 +141,7 @@ impl Router {
                 direct_upgrade_channel_full: AtomicU64::new(0),
                 our_node_id,
                 delivery,
+                paths: Arc::new(PathScoreboard::new()),
             },
             incoming_rx,
         )
@@ -427,6 +430,23 @@ impl Router {
     pub fn set_peer_for_session(&self, session_id: SessionId, peer_id: PeerId) {
         self.session_manager
             .set_peer_for_session(session_id, peer_id);
+    }
+
+    /// Which (transport, endpoint) paths work from this network; shared by
+    /// every dialer so they learn from each other's outcomes.
+    pub fn paths(&self) -> &Arc<PathScoreboard> {
+        &self.paths
+    }
+
+    /// True once anything arrived on the session (handshake ack or later).
+    pub fn session_has_received(&self, session_id: &SessionId) -> bool {
+        self.session_manager
+            .get_metrics(session_id)
+            .is_some_and(|m| m.packets_received > 0)
+    }
+
+    pub fn link_snapshots(&self) -> Vec<LinkSnapshot> {
+        self.session_manager.link_snapshots()
     }
 
     pub async fn teardown_session(&self, session_id: &SessionId) -> Result<()> {

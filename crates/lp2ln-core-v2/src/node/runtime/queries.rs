@@ -83,6 +83,22 @@ impl NodeRuntime {
         self.session_manager.debug_sessions()
     }
 
+    /// Call when the device switched networks (Wi-Fi <-> cellular, roaming):
+    /// paths that were blocked on the old network get another chance.
+    pub fn notify_network_changed(&self) {
+        if let Some(router) = self.router.as_ref() {
+            router.paths().network_changed();
+        }
+    }
+
+    /// What the node has learned about each (transport, endpoint) path.
+    pub fn link_paths(&self) -> Vec<crate::node::link_survival::PathReport> {
+        self.router
+            .as_ref()
+            .map(|r| r.paths().report(crate::topology::now_ms()))
+            .unwrap_or_default()
+    }
+
     pub fn health_snapshot(&self) -> RuntimeHealthSnapshot {
         self.health.snapshot()
     }

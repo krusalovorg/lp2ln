@@ -14,6 +14,11 @@ pub struct SessionMetrics {
     pub last_reconnection: Option<std::time::Instant>,
     pub is_active: bool,
     pub is_degraded: bool,
+    /// When anything last arrived; `None` until the first packet.
+    pub last_received: Option<Instant>,
+    /// `bytes_sent` at the moment of the last receive. Bytes sent after it with
+    /// nothing coming back is how a silently frozen link shows up.
+    pub bytes_sent_at_last_receive: u64,
 }
 
 impl SessionMetrics {
@@ -32,6 +37,8 @@ impl SessionMetrics {
             last_reconnection: None,
             is_active: true,
             is_degraded: false,
+            last_received: None,
+            bytes_sent_at_last_receive: 0,
         }
     }
 
@@ -48,6 +55,8 @@ impl SessionMetrics {
     pub fn increment_packets_received(&mut self, bytes: u64) {
         self.packets_received += 1;
         self.bytes_received += bytes;
+        self.last_received = Some(Instant::now());
+        self.bytes_sent_at_last_receive = self.bytes_sent;
         self.update_activity();
     }
 
@@ -78,6 +87,11 @@ impl SessionMetrics {
 
     pub fn time_since_last_activity(&self) -> Duration {
         self.last_activity.elapsed()
+    }
+
+    pub fn bytes_sent_since_last_receive(&self) -> u64 {
+        self.bytes_sent
+            .saturating_sub(self.bytes_sent_at_last_receive)
     }
 
     pub fn total_packets(&self) -> u64 {

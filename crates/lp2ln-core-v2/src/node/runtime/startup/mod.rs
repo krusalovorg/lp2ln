@@ -5,6 +5,7 @@ pub(crate) mod direct_upgrade;
 pub(crate) mod flow_trace;
 pub(crate) mod incoming;
 pub(crate) mod lan_discovery;
+pub(crate) mod link_survival;
 pub(crate) mod orchestrator;
 pub(crate) mod router;
 pub(crate) mod topology;
