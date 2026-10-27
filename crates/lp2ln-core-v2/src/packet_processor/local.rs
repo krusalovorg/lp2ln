@@ -91,8 +91,16 @@ pub async fn handle_local_packet(
                 total_chunks: None,
                 protocol_id: None,
             };
-            if let Err(e) = publisher.send_to_peer(peer_id.clone(), pong, None).await {
-                crate::error!("[PacketProcessor] Failed to send pong: {}", e);
+            // Answer on the link the ping came in on: pings double as liveness
+            // probes for that specific link.
+            if publisher
+                .send_to_session(session_id.clone(), pong.clone())
+                .await
+                .is_err()
+            {
+                if let Err(e) = publisher.send_to_peer(peer_id.clone(), pong, None).await {
+                    crate::error!("[PacketProcessor] Failed to send pong: {}", e);
+                }
             }
         }
         b"pong" => {

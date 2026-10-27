@@ -50,6 +50,27 @@ impl BootstrapNode {
         }
         Self { addr, protocols, peer_id_hint }
     }
+
+    /// Dialable (transport, address) pairs, in listed order. A protocol entry
+    /// is either `"tcp"` (uses `addr`) or `"quic:18280"` (same host, its own
+    /// port), so one seed can be reached over several transports.
+    pub fn endpoints(&self) -> Vec<(String, SocketAddr)> {
+        let mut out: Vec<(String, SocketAddr)> = Vec::new();
+        for entry in &self.protocols {
+            let (proto, addr) = match entry.split_once(':') {
+                Some((proto, port)) => match port.trim().parse::<u16>() {
+                    Ok(port) => (proto, SocketAddr::new(self.addr.ip(), port)),
+                    Err(_) => continue,
+                },
+                None => (entry.as_str(), self.addr),
+            };
+            let endpoint = (proto.trim().to_ascii_lowercase(), addr);
+            if !out.contains(&endpoint) {
+                out.push(endpoint);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]
@@ -384,6 +405,22 @@ pub(super) fn default_transport_obfuscation() -> HashMap<String, ObfuscationConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_endpoints_accept_per_protocol_ports() {
+        let node = BootstrapNode::new(
+            "95.182.82.43:18080".parse().unwrap(),
+            ["tcp", "QUIC:18280", "udp:bad", "tcp"],
+            None,
+        );
+        assert_eq!(
+            node.endpoints(),
+            vec![
+                ("tcp".to_string(), "95.182.82.43:18080".parse().unwrap()),
+                ("quic".to_string(), "95.182.82.43:18280".parse().unwrap()),
+            ]
+        );
+    }
 
     #[test]
     fn experimental_defaults() {

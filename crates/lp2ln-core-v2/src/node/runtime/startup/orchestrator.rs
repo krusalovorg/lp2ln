@@ -18,6 +18,7 @@ use crate::node::runtime::startup::direct_upgrade::DirectUpgradeService;
 use crate::node::runtime::startup::flow_trace::FlowTraceRuntimeService;
 use crate::node::runtime::startup::incoming::IncomingService;
 use crate::node::runtime::startup::lan_discovery::LanDiscoveryService;
+use crate::node::runtime::startup::link_survival::LinkWatchdogService;
 use crate::node::runtime::startup::router::RouterService;
 use crate::node::runtime::startup::topology::TopologyService;
 use crate::node::supervisor::NodeSupervisor;
@@ -203,6 +204,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         Box::new(FlowTraceRuntimeService),
         Box::new(TransportListenerService),
         Box::new(IncomingService),
+        Box::new(LinkWatchdogService),
         Box::new(BootstrapService),
         Box::new(TopologyService),
         Box::new(LanDiscoveryService),
