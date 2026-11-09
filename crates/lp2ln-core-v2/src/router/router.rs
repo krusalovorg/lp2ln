@@ -297,8 +297,14 @@ impl Router {
         // Bulk (chunked) traffic must ride a link that retransmits. A single
         // dropped chunk otherwise strands the whole stream in the receiver's
         // assembler, so refuse loudly instead of losing it silently (AD-19).
-        let bulk_needs_reliable = packet.is_chunk() && self.delivery.bulk_requires_reliable_transport;
-        if bulk_needs_reliable
+        // File blocks use their own protocol envelope, not Packet chunk fields.
+        // A 256 KiB block cannot fit in a UDP datagram. Require a reliable hop
+        // for both requests and replies, with automatic relay fallback when the
+        // target only has UDP sessions. Other traffic keeps normal selection.
+        let is_block_transfer = packet.protocol_id == Some(crate::storage::block_transfer::BLOCK_PROTOCOL_ID);
+        let bulk_needs_reliable = (packet.is_chunk() || is_block_transfer)
+            && self.delivery.bulk_requires_reliable_transport;
+        if packet.is_chunk() && bulk_needs_reliable
             && SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
                 .is_some()
             && self.reliable_session_for(&peer_id).is_none()
