@@ -87,7 +87,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
     } else {
         (None, None)
     };
-    let (router_raw, incoming_packets_rx) = Router::new_with_caps(
+    let (mut router_raw, incoming_packets_rx) = Router::new_with_caps(
         runtime.session_manager.clone(),
         runtime.packet_processor.clone(),
         signing_key,
@@ -100,6 +100,9 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         runtime.options.signature_format,
         runtime.options.delivery.clone(),
     );
+    if let Some(directory) = runtime.options.database_dir.as_ref() {
+        router_raw.use_sequence_state(&directory.join("secure-sequence"))?;
+    }
     let router = Arc::new(router_raw);
     runtime.router = Some(router.clone());
 

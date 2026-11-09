@@ -54,6 +54,7 @@ pub struct Router {
     ingress: PacketIngressDispatcher,
     incoming_tx: Arc<Mutex<Option<mpsc::Sender<IncomingPacket>>>>,
     incoming_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
+    authenticated_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
     peer_cache: Arc<PeerCryptoCache>,
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
@@ -102,6 +103,7 @@ impl Router {
         let our_node_id = node_id_of(&our_peer_id);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
         let (incoming_broadcast_tx, _rx) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
+        let (authenticated_broadcast_tx, _) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
@@ -136,6 +138,7 @@ impl Router {
                 ingress,
                 incoming_tx,
                 incoming_broadcast_tx,
+                authenticated_broadcast_tx,
                 peer_cache,
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
@@ -149,6 +152,14 @@ impl Router {
 
     fn prepare_outgoing(&self, packet: Packet) -> Result<Packet> {
         self.egress.prepare_outgoing(packet)
+    }
+
+    pub(crate) fn use_sequence_state(&mut self, path: &std::path::Path) -> Result<()> {
+        self.egress.use_sequence_state(path)
+    }
+
+    pub fn subscribe_authenticated(&self) -> broadcast::Receiver<Arc<IncomingPacket>> {
+        self.authenticated_broadcast_tx.subscribe()
     }
 
     fn try_record_direct_upgrade_fallback(&self, peer_id: &PeerId, bytes: u64) {
@@ -215,6 +226,7 @@ impl Router {
     }
 
     pub(crate) fn broadcast_incoming_after_decrypt(&self, incoming: IncomingPacket) {
+        let _ = self.authenticated_broadcast_tx.send(Arc::new(incoming.clone()));
         self.ingress.broadcast_incoming_after_decrypt(incoming);
     }
 
@@ -285,8 +297,14 @@ impl Router {
         // Bulk (chunked) traffic must ride a link that retransmits. A single
         // dropped chunk otherwise strands the whole stream in the receiver's
         // assembler, so refuse loudly instead of losing it silently (AD-19).
-        let bulk_needs_reliable = packet.is_chunk() && self.delivery.bulk_requires_reliable_transport;
-        if bulk_needs_reliable
+        // File blocks use their own protocol envelope, not Packet chunk fields.
+        // A 256 KiB block cannot fit in a UDP datagram. Require a reliable hop
+        // for both requests and replies, with automatic relay fallback when the
+        // target only has UDP sessions. Other traffic keeps normal selection.
+        let is_block_transfer = packet.protocol_id == Some(crate::storage::block_transfer::BLOCK_PROTOCOL_ID);
+        let bulk_needs_reliable = (packet.is_chunk() || is_block_transfer)
+            && self.delivery.bulk_requires_reliable_transport;
+        if packet.is_chunk() && bulk_needs_reliable
             && SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
                 .is_some()
             && self.reliable_session_for(&peer_id).is_none()

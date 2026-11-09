@@ -84,12 +84,12 @@ impl DefaultPacketProcessor {
     }
 
     fn record_drop(&self, session_id: SessionId, reason: &'static str) -> ProcessAction {
-        let count = self
-            .session_drop_counts
-            .entry(session_id.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-        if *count >= 3 {
+        let count = {
+            let count = self.session_drop_counts.entry(session_id.clone())
+                .and_modify(|c| *c += 1).or_insert(1);
+            *count
+        };
+        if count >= 3 {
             self.session_drop_counts.remove(&session_id);
             ProcessAction::CloseSession { session_id, reason }
         } else {
@@ -113,6 +113,9 @@ impl PacketProcessor for DefaultPacketProcessor {
                     e
                 );
                 return self.record_drop(session_id, "invalid signature");
+            }
+            if packet.signature.as_deref().is_some_and(|s| s.starts_with("v4:")) {
+                self.peer_cache.mark_routed_signatures(&packet.sender);
             }
         }
 
@@ -230,5 +233,42 @@ impl PacketProcessor for DefaultPacketProcessor {
         }
         self.session_drop_counts.remove(&session_id);
         ProcessAction::Delivered
+    }
+}
+
+
+#[cfg(test)]
+mod reconnect_regression_tests {
+    use super::*;
+
+    #[test]
+    fn third_invalid_packet_closes_session_without_deadlocking() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let keypair = NodeKeypair::generate();
+            let processor = DefaultPacketProcessor::new(
+                keypair.peer_id().to_owned(),
+                false,
+                Arc::new(PeerCatalog::with_max_peers(16)),
+                0.0,
+                NatTraversalState::new(),
+                keypair,
+                PeerCryptoCache::new(),
+            );
+            let session = SessionId::from("reconnect-regression");
+            let actions: Vec<_> = (0..4)
+                .map(|_| processor.record_drop(session.clone(), "invalid signature"))
+                .collect();
+            tx.send((session, actions)).unwrap();
+        });
+        let (session, actions) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("packet rejection must not deadlock a runtime worker");
+        assert_eq!(actions, vec![
+            ProcessAction::Dropped { reason: "invalid signature" },
+            ProcessAction::Dropped { reason: "invalid signature" },
+            ProcessAction::CloseSession { session_id: session, reason: "invalid signature" },
+            ProcessAction::Dropped { reason: "invalid signature" },
+        ]);
     }
 }
