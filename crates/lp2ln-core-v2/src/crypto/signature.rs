@@ -7,16 +7,28 @@ use sha2::{Digest, Sha256};
 
 /// Wire signature format for outgoing packets.
 ///
-/// Only V3 is supported. Older V1/V2 formats were removed before any public
-/// network deployment (no compatibility burden).
+/// V3 keeps direct-link compatibility. V4 authenticates the immutable payload
+/// while allowing relays to update the hop path and budget. A verified V4
+/// packet opts that peer into V4 replies; other peers continue receiving V3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureFormat {
     #[default]
     V3Hash,
+    V4Hash,
 }
 
 const V3_SIGNATURE_PREFIX: &str = "v3:";
+const V4_SIGNATURE_PREFIX: &str = "v4:";
+
+fn packet_to_signing_payload_v4(packet: &Packet) -> SigningPayloadV3 {
+    let mut payload = packet_to_signing_payload_v3(packet);
+    // Routers update these hop-local fields. The author's signature protects
+    // the encrypted body, endpoints, request ID and stream/protocol metadata.
+    payload.nodes.clear();
+    payload.max_hops = 0;
+    payload
+}
 
 #[derive(Serialize)]
 struct SigningPayloadV3 {
@@ -60,12 +72,15 @@ pub fn sign_packet_with_format(
     format: SignatureFormat,
 ) -> Result<(), String> {
     match format {
-        SignatureFormat::V3Hash => {
-            let payload = packet_to_signing_payload_v3(packet);
+        SignatureFormat::V3Hash | SignatureFormat::V4Hash => {
+            let (prefix, payload) = match format {
+                SignatureFormat::V3Hash => (V3_SIGNATURE_PREFIX, packet_to_signing_payload_v3(packet)),
+                SignatureFormat::V4Hash => (V4_SIGNATURE_PREFIX, packet_to_signing_payload_v4(packet)),
+            };
             let data = postcard::to_allocvec(&payload).map_err(|e| e.to_string())?;
             let signature: Signature = signing_key.sign(&data);
             packet.signature = Some(format!(
-                "{V3_SIGNATURE_PREFIX}{}",
+                "{prefix}{}",
                 hex::encode(signature.to_bytes())
             ));
         }
@@ -86,10 +101,11 @@ pub fn verify_packet_with_key(
         .as_ref()
         .ok_or_else(|| "Missing signature".to_string())?;
 
-    let rest = sig_hex
-        .strip_prefix(V3_SIGNATURE_PREFIX)
-        .ok_or_else(|| "Unsupported signature format (only v3: is accepted)".to_string())?;
-
+    if let Some(rest) = sig_hex.strip_prefix(V4_SIGNATURE_PREFIX) {
+        return verify_signed_payload(packet, rest, verifying_key, packet_to_signing_payload_v4(packet));
+    }
+    let rest = sig_hex.strip_prefix(V3_SIGNATURE_PREFIX)
+        .ok_or_else(|| "Unsupported signature format".to_string())?;
     verify_packet_v3(packet, rest, verifying_key)
 }
 
@@ -112,6 +128,12 @@ fn verify_packet_v3(
     verifying_key: Option<&VerifyingKey>,
 ) -> Result<(), String> {
     let payload = packet_to_signing_payload_v3(packet);
+    verify_signed_payload(packet, sig_hex, verifying_key, payload)
+}
+
+fn verify_signed_payload(
+    packet: &Packet, sig_hex: &str, verifying_key: Option<&VerifyingKey>, payload: SigningPayloadV3,
+) -> Result<(), String> {
     let data = postcard::to_allocvec(&payload).map_err(|e| e.to_string())?;
     let sig_bytes = hex::decode(sig_hex).map_err(|e| e.to_string())?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|e| e.to_string())?;
@@ -155,6 +177,21 @@ mod tests {
                 .starts_with(V3_SIGNATURE_PREFIX)
         );
         verify_packet(&packet).unwrap();
+    }
+
+    #[test]
+    fn v4_preserves_author_authentication_across_relay_hops() {
+        let key = NodeKeypair::generate();
+        let mut packet = sample_packet(&key, Some(0x4c46));
+        sign_packet_with_format(&mut packet, key.signing_key(), SignatureFormat::V4Hash).unwrap();
+        packet.nodes.push("relay".into());
+        packet.max_hops -= 1;
+        verify_packet(&packet).unwrap();
+        let mut changed = packet.clone();
+        changed.receiver = "attacker".into();
+        assert!(verify_packet(&changed).is_err());
+        packet.data[0] ^= 1;
+        assert!(verify_packet(&packet).is_err());
     }
 
     #[test]

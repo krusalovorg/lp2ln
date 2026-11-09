@@ -11,9 +11,18 @@ use super::secure_channel::{decode_secure_envelope, derive_shared_key, encode_se
 pub struct PeerCryptoCache {
     shared_keys: DashMap<String, [u8; 32]>,
     verifying_keys: DashMap<String, VerifyingKey>,
+    routed_signatures: DashMap<String, ()>,
 }
 
 impl PeerCryptoCache {
+    pub fn mark_routed_signatures(&self, peer: &str) {
+        self.routed_signatures.insert(peer.to_owned(), ());
+    }
+
+    pub fn supports_routed_signatures(&self, peer: &str) -> bool {
+        self.routed_signatures.contains_key(peer)
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
