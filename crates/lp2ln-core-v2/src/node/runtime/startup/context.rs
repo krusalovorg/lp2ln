@@ -37,6 +37,7 @@ pub(crate) struct StartupContext<'a> {
     pub db: &'a Option<Arc<P2PDatabase>>,
     pub keypair: &'a NodeKeypair,
     pub transports: &'a [Arc<dyn Transport>],
+    pub bound_listens: Arc<DashMap<String, SocketAddr>>,
     pub packet_processor: Arc<dyn PacketProcessor>,
     pub session_manager: Arc<SessionManager>,
     pub peer_catalog: Arc<PeerCatalog>,

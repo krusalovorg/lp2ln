@@ -34,7 +34,7 @@ impl RuntimeService for TopologyService {
         let peer_store = ctx.session_manager.peer_score_store();
         let catalog = ctx.peer_catalog.clone();
         let db = ctx.db.clone();
-        let listens = ctx.options.listens.clone();
+        let listens = ctx.bound_listens.clone();
         let advertise_addrs = ctx.options.advertise_addrs.clone();
         let transports = ctx.transports.to_vec();
         let router = ctx

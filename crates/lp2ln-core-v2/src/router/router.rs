@@ -261,15 +261,19 @@ impl Router {
             .best_session_for_peer_where(peer_id, |kind| kind.is_reliable())
     }
 
-    /// Best session for a peer, restricted to reliable links when the packet is
-    /// bulk. Returns `None` rather than silently downgrading to UDP.
+    /// Application protocols prefer retransmitting links. Bulk packets require
+    /// one; small packets can still use datagram-only peers.
     fn select_session_for(
         &self,
         peer_id: &PeerId,
         bulk_needs_reliable: bool,
+        application_packet: bool,
     ) -> Option<Arc<dyn Session + Send + Sync>> {
         if bulk_needs_reliable {
             self.reliable_session_for(peer_id)
+        } else if application_packet {
+            self.reliable_session_for(peer_id)
+                .or_else(|| SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id))
         } else {
             SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id)
         }
@@ -286,6 +290,7 @@ impl Router {
             anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
         })?;
         let is_control_packet = NetworkControlPayload::is_likely_control_packet(&packet.data);
+        let application_packet = packet.protocol_id.is_some();
         let in_nodes = packet.nodes.iter().any(|n| n == peer_id.as_str());
         if in_nodes || exclude_from.as_ref() == Some(&peer_id) {
             return Err(anyhow::anyhow!(
@@ -315,7 +320,7 @@ impl Router {
             ));
         }
 
-        if let Some(session) = self.select_session_for(&peer_id, bulk_needs_reliable) {
+        if let Some(session) = self.select_session_for(&peer_id, bulk_needs_reliable, application_packet) {
             let session_id = SessionId::from(session.id().to_string());
             let wire = encode_packet(packet)?;
             match session.send_wire(wire).await {
@@ -393,7 +398,7 @@ impl Router {
         let mut any_ok = false;
         let mut last_err = None;
         for neighbor in candidates {
-            if let Some(session) = self.select_session_for(&neighbor, bulk_needs_reliable) {
+            if let Some(session) = self.select_session_for(&neighbor, bulk_needs_reliable, application_packet) {
                 let session_id = SessionId::from(session.id().to_string());
                 match session.send_wire(wire.clone()).await {
                     Ok(bytes) => {

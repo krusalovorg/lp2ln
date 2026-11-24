@@ -206,6 +206,19 @@ pub async fn run_lan_discovery(
     peer_dir: Arc<PeerDirectory>,
     opts: LanDiscoveryOptions,
 ) {
+    run_lan_discovery_with_endpoints(
+        cancel, our_peer_id, signing_key, move || listen_endpoints.clone(), peer_dir, opts,
+    ).await;
+}
+
+pub(crate) async fn run_lan_discovery_with_endpoints(
+    cancel: CancellationToken,
+    our_peer_id: String,
+    signing_key: SigningKey,
+    listen_endpoints: impl Fn() -> Vec<String>,
+    peer_dir: Arc<PeerDirectory>,
+    opts: LanDiscoveryOptions,
+) {
     let socket_v4 = match bind_multicast_v4(opts.port) {
         Ok(s) => s,
         Err(e) => {
@@ -247,10 +260,14 @@ pub async fn run_lan_discovery(
             _ = cancel.cancelled() => break,
 
             _ = tick.tick() => {
+                let endpoints = listen_endpoints();
+                if endpoints.is_empty() {
+                    continue;
+                }
                 if let Err(e) = send_hello(
                     &socket_v4, Some(&socket_v6), &target_v4, &target_v6,
                     &our_peer_id, &boot_id, &mut seq,
-                    &listen_endpoints, &signing_key, &opts,
+                    &endpoints, &signing_key, &opts,
                 ).await {
                     crate::warn!("[LanDiscovery] send error: {e}");
                 }

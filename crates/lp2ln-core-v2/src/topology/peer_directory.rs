@@ -79,7 +79,7 @@ impl PeerDirectory {
             if let Some(rec) = entry
                 .addresses
                 .iter_mut()
-                .find(|r| r.proto == proto && r.addr == addr)
+                .find(|r| r.source != AddressSource::Lan && r.proto == proto && r.addr == addr)
             {
                 if last_seen >= rec.last_seen_ms {
                     rec.last_seen_ms = last_seen;
@@ -146,13 +146,23 @@ impl PeerDirectory {
     /// Build a dial book containing only non-expired addresses.
     /// Consumed by `build_topology_snapshot` → `TopologySnapshot.dial_book`.
     pub fn dial_book(&self, now: u64) -> HashMap<PeerId, Vec<(String, SocketAddr)>> {
+        self.address_book(now, None)
+    }
+
+    pub(crate) fn lan_dial_book(&self, now: u64) -> HashMap<PeerId, Vec<(String, SocketAddr)>> {
+        self.address_book(now, Some(AddressSource::Lan))
+    }
+
+    fn address_book(
+        &self, now: u64, source: Option<AddressSource>,
+    ) -> HashMap<PeerId, Vec<(String, SocketAddr)>> {
         self.peers
             .iter()
             .filter_map(|entry| {
                 let addrs: Vec<(String, SocketAddr)> = entry
                     .addresses
                     .iter()
-                    .filter(|r| r.expires_at_ms > now)
+                    .filter(|r| r.expires_at_ms > now && source.is_none_or(|source| r.source == source))
                     .map(|r| (r.proto.clone(), r.addr))
                     .collect();
                 if addrs.is_empty() {
@@ -183,6 +193,17 @@ impl PeerDirectory {
         last_seen_ms: u64,
     ) {
         let mut entry = self.peers.entry(peer_id.clone()).or_default();
+        let has_new_endpoint = endpoints.iter().any(|(proto, addr)| {
+            !entry.addresses.iter().any(|record| {
+                record.source == AddressSource::Lan
+                    && record.expires_at_ms > last_seen_ms
+                    && &record.proto == proto && record.addr == *addr
+            })
+        });
+        if has_new_endpoint {
+            entry.dial.backoff_until_ms = 0;
+            entry.dial.consecutive_failures = 0;
+        }
         entry.addresses.retain(|r| r.source != AddressSource::Lan);
         for (proto, addr) in endpoints {
             entry.addresses.push(AddressRecord {

@@ -39,6 +39,7 @@ impl RuntimeService for TransportListenerService {
             ctx.producer_cancel.clone(),
             ctx.transports,
             &ctx.options.listens,
+            ctx.bound_listens.clone(),
             transport_ctx,
             ctx.health.clone(),
             ctx.core_bus.clone(),

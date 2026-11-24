@@ -28,7 +28,7 @@ pub(crate) struct TopologyMaintenanceArgs {
     pub(crate) peer_store: Arc<PeerScoreStore>,
     pub(crate) catalog: Arc<PeerCatalog>,
     pub(crate) db: Option<Arc<P2PDatabase>>,
-    pub(crate) listens: DashMap<String, SocketAddr>,
+    pub(crate) listens: Arc<DashMap<String, SocketAddr>>,
     pub(crate) advertise_addrs: HashMap<String, SocketAddr>,
     pub(crate) advertise_fallback_ip: Option<IpAddr>,
     pub(crate) transports: Vec<Arc<dyn Transport>>,

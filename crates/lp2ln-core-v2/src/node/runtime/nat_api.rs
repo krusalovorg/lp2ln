@@ -7,15 +7,18 @@ use crate::types::PeerId;
 impl NodeRuntime {
     async fn build_local_nat_candidates(&self) -> Vec<NatCandidate> {
         let mut candidates = Vec::new();
-        for listen in self.options.listens.iter() {
-            let proto = listen.key().to_ascii_lowercase();
-            let addr = *listen.value();
-            candidates.push(NatCandidate {
-                protocol: proto.clone(),
-                addr: addr.to_string(),
-                kind: NatCandidateKind::Host,
-                priority: 200,
-            });
+        let listens: Vec<_> = self.bound_listens.iter().map(|listen| {
+            (listen.key().to_ascii_lowercase(), *listen.value())
+        }).collect();
+        for (proto, addr) in listens {
+            if !addr.ip().is_unspecified() {
+                candidates.push(NatCandidate {
+                    protocol: proto.clone(),
+                    addr: addr.to_string(),
+                    kind: NatCandidateKind::Host,
+                    priority: 200,
+                });
+            }
             if proto == "udp" {
                 if let Some(transport) = self
                     .transports
@@ -23,9 +26,10 @@ impl NodeRuntime {
                     .find(|t| t.name().eq_ignore_ascii_case("udp"))
                 {
                     if let Ok(public_addr) = transport.get_public_address(addr.port()).await {
+                        let Ok(ip) = public_addr.ip.parse() else { continue; };
                         candidates.push(NatCandidate {
                             protocol: "udp".to_string(),
-                            addr: format!("{}:{}", public_addr.ip, public_addr.port),
+                            addr: std::net::SocketAddr::new(ip, public_addr.port).to_string(),
                             kind: NatCandidateKind::Srflx,
                             priority: 300,
                         });

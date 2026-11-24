@@ -188,7 +188,11 @@ pub(crate) async fn run_incoming_session_handler(
         if let Some(peer_id) = session.peer_id() {
             let pid = PeerId::from(peer_id.to_string());
             let already_connected = session_manager.is_connected_to_peer(&pid);
-            if already_connected {
+            // A reliable path for an existing UDP peer does not add a peer.
+            // Keep subnet and global accept budgets for all sessions.
+            let reliable_upgrade = already_connected && session.kind().is_reliable()
+                && session_manager.get_all_for_peer(&pid).iter().all(|path| !path.kind().is_reliable());
+            if already_connected && !reliable_upgrade {
                 crate::debug!(
                     "[NodeRuntime] Reject duplicate incoming session from {}",
                     pid
@@ -256,7 +260,7 @@ pub(crate) async fn run_incoming_session_handler(
                 fairness_window_started_ms = now;
             }
             if let Some(until) = recent_redirect_until.get(&pid).copied() {
-                if now < until {
+                if now < until && !reliable_upgrade {
                     send_discovery_redirect_and_close(
                         &router_for_incoming,
                         session.clone(),
@@ -294,13 +298,13 @@ pub(crate) async fn run_incoming_session_handler(
                 last_bootstrap_reseed_ms: 0,
                 now_ms: now,
             };
-            if let AdmissionDecision::Redirect { .. } = SmartMeshPlanner.evaluate_incoming(
+            if !reliable_upgrade && matches!(SmartMeshPlanner.evaluate_incoming(
                 &admission_snapshot,
                 &PeerCandidate {
                     peer_id: pid.clone(),
                     is_bootstrap_entry: false,
                 },
-            ) {
+            ), AdmissionDecision::Redirect { .. }) {
                 let preamble = less_loaded_bootstrap_descriptors(
                     incoming_catalog.as_ref(),
                     &our_peer_id_for_incoming,

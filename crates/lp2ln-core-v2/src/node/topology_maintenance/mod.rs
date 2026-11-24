@@ -92,11 +92,19 @@ fn build_topology_snapshot(
             )
         })
         .collect();
-    let dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> = ctx
+    let mut dial_book: HashMap<PeerId, Vec<(String, SocketAddr)>> = ctx
         .dial_book
         .iter()
         .map(|r| (r.key().clone(), r.value().clone()))
         .collect();
+    for (peer, endpoints) in ctx.peer_dir.lan_dial_book(now) {
+        let known = dial_book.entry(peer).or_default();
+        for endpoint in endpoints {
+            if !known.contains(&endpoint) {
+                known.push(endpoint);
+            }
+        }
+    }
     let peer_age_ms = ctx.router.peer_connection_ages();
 
     TopologySnapshot {
@@ -502,7 +510,19 @@ pub(crate) async fn run_topology_maintenance_loop(
 
         // Dial: SmartMesh already selected and ordered candidates; execute_dial_plan handles
         // transport selection, backoff guards, and session registration.
-        if !topology_plan.dial.is_empty() {
+        let lan_paths = peer_dir.lan_dial_book(now);
+        let upgrades = lan_paths.iter().filter_map(|(peer, addrs)| {
+            let sessions = sm.get_all_for_peer(peer);
+            if sessions.is_empty() || sessions.iter().any(|session| session.kind().is_reliable()) {
+                return None;
+            }
+            let addrs: Vec<_> = addrs.iter()
+                .filter(|(proto, _)| matches!(proto.as_str(), "tcp" | "quic")).cloned().collect();
+            if addrs.is_empty() { return None; }
+            Some(crate::topology::planner::DialIntent { peer_id: peer.clone(), addrs })
+        });
+        let candidates: Vec<_> = upgrades.chain(topology_plan.dial).collect();
+        if !candidates.is_empty() {
             let desc_by_peer: HashMap<PeerId, NodeDescriptor> = catalog
                 .descriptors()
                 .into_iter()
@@ -514,11 +534,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 dial_target
             };
             let mut plan = DialPlan {
-                candidates: topology_plan
-                    .dial
-                    .iter()
-                    .map(|i| i.peer_id.clone())
-                    .collect(),
+                candidates,
                 desc_by_peer,
                 connected_bootstrap: connected_bootstrap_now,
                 dial_limit,
@@ -541,6 +557,7 @@ pub(crate) async fn run_topology_maintenance_loop(
                 &peer_dir,
                 &topology_tuning,
                 loop_ctx.dial_policy.transport_order.as_slice(),
+                &lan_paths,
                 &bootstrap_targets_maint,
                 now,
             )
@@ -663,5 +680,128 @@ mod tests {
 
         assert_eq!(snapshot.phase, TopologyPhase::Steady);
         assert!(!snapshot.reseed_for_bridge);
+    }
+}
+#[cfg(test)]
+mod lan_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::crypto::signature::SignatureFormat;
+    use crate::node::{NodeBuilder, NodeOptions, NodeRuntime};
+    use crate::packet::Packet;
+    use crate::sessions::{IncomingPacket, LinkKind, Session};
+    use crate::topology::now_ms;
+    use crate::transport::tcp::TcpTransport;
+    use crate::types::{PeerId, SessionId};
+
+    struct SilentUdp(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Session for SilentUdp {
+        fn id(&self) -> &str { "filtered-udp-link" }
+        fn peer_id(&self) -> Option<&str> { None }
+        fn kind(&self) -> LinkKind { LinkKind::DirectUdp }
+        async fn send(&self, _: Packet) -> anyhow::Result<u64> {
+            self.send_wire(Vec::new()).await
+        }
+        async fn send_wire(&self, _: Vec<u8>) -> anyhow::Result<u64> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        }
+        async fn close(&self) -> anyhow::Result<()> { Ok(()) }
+        fn spawn_reader(self: Arc<Self>, _: tokio::sync::mpsc::Sender<IncomingPacket>) {}
+    }
+
+    async fn tcp_node() -> NodeRuntime {
+        let mut options = NodeOptions::empty().with_listen("tcp", "127.0.0.1:0".parse().unwrap());
+        options.signature_format = SignatureFormat::V4Hash;
+        options.lan_discovery.enabled = false;
+        options.enable_topology_maintenance = true;
+        options.experimental.content = false;
+        options.experimental.dht = false;
+        let mut node = NodeBuilder::new().add_transport(Arc::new(TcpTransport::new()))
+            .build(options).expect("build node");
+        node.start().await.expect("start node");
+        wait_for(|| node.bound_listens.contains_key("tcp")).await;
+        node
+    }
+
+    async fn wait_for(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !ready() { tokio::time::sleep(Duration::from_millis(25)).await; }
+        }).await.expect("path not established");
+    }
+
+    fn observe_lan(node: &NodeRuntime, peer: &NodeRuntime) {
+        let addr = *peer.bound_listens.get("tcp").expect("TCP listener bound");
+        assert_ne!(addr.port(), 0);
+        let now = now_ms();
+        node.peer_dir.replace_lan_addresses(&PeerId::from(peer.peer_id()), &[("tcp".into(), addr)], now + 30_000, now);
+    }
+
+    fn has_tcp(node: &NodeRuntime, peer: &NodeRuntime) -> bool {
+        node.session_manager.get_all_for_peer(&PeerId::from(peer.peer_id())).iter()
+            .any(|session| session.kind() == LinkKind::DirectTcp)
+    }
+
+    async fn send_app_packet(a: &NodeRuntime, b: &NodeRuntime, data: &'static [u8]) {
+        let mut packets = b.router().unwrap().subscribe_authenticated();
+        a.router().unwrap().send_to_peer(PeerId::from(b.peer_id()), Packet {
+            signature: None,
+            sender: a.peer_id().to_owned(), receiver: b.peer_id().to_owned(), data: data.to_vec(),
+            nodes: Vec::new(), max_hops: 8, request_id: None, protocol_id: Some(0x1234),
+            chunk_stream_id: None, chunk_index: None, total_chunks: None,
+        }, None).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let received = packets.recv().await.unwrap();
+                if received.packet.protocol_id == Some(0x1234) { return received; }
+            }
+        }).await.expect("application packet did not reach the LAN peer");
+        assert_eq!(received.packet.data, data);
+        assert_eq!(received.packet.sender, a.peer_id());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lan_candidates_dial_without_a_bootstrap_or_signed_descriptor() {
+        let a = tcp_node().await;
+        let b = tcp_node().await;
+        observe_lan(&a, &b);
+        observe_lan(&b, &a);
+        wait_for(|| has_tcp(&a, &b) && has_tcp(&b, &a)).await;
+        send_app_packet(&a, &b, b"local payload").await;
+        a.stop().await.unwrap();
+        b.stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lan_upgrades_over_silent_udp_and_keeps_delivering_when_the_relay_stops() {
+        let a = tcp_node().await;
+        let b = tcp_node().await;
+        let relay = tcp_node().await;
+        let relay_addr = *relay.bound_listens.get("tcp").unwrap();
+        a.connect("tcp", relay_addr).await.unwrap();
+        b.connect("tcp", relay_addr).await.unwrap();
+        wait_for(|| has_tcp(&a, &relay) && has_tcp(&b, &relay)).await;
+        let a_udp = Arc::new(SilentUdp(AtomicUsize::new(0)));
+        let b_udp = Arc::new(SilentUdp(AtomicUsize::new(0)));
+        a.router().unwrap().register_session(
+            PeerId::from(b.peer_id()), SessionId::from(a_udp.id()), a_udp.clone(),
+        );
+        b.router().unwrap().register_session(
+            PeerId::from(a.peer_id()), SessionId::from(b_udp.id()), b_udp.clone(),
+        );
+        observe_lan(&a, &b);
+        observe_lan(&b, &a);
+        wait_for(|| has_tcp(&a, &b) && has_tcp(&b, &a)).await;
+        relay.stop().await.unwrap();
+        let before = a_udp.0.load(Ordering::Relaxed) + b_udp.0.load(Ordering::Relaxed);
+        send_app_packet(&a, &b, b"generic payload after relay loss").await;
+        send_app_packet(&b, &a, b"answer after relay loss").await;
+        assert_eq!(a_udp.0.load(Ordering::Relaxed) + b_udp.0.load(Ordering::Relaxed), before);
+        a.stop().await.unwrap();
+        b.stop().await.unwrap();
     }
 }

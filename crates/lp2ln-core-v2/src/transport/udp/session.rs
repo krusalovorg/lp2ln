@@ -5,7 +5,10 @@ use crate::transport::udp::codec::{decode_packet, encode_packet};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Upper bound for a single datagram send before the writer task gives up and
@@ -24,6 +27,8 @@ pub struct UdpSession {
 
     peer_addr: SocketAddr,
     obfuscator: Arc<Obfuscator>,
+    datagrams: Option<tokio::sync::Mutex<mpsc::Receiver<Packet>>>,
+    reader_started: AtomicBool,
     // Cancelled by close(); reader and writer loops select on it so both
     // tasks terminate even while blocked on socket recv / channel recv.
     shutdown: tokio_util::sync::CancellationToken,
@@ -57,10 +62,12 @@ impl Session for UdpSession {
 
     async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
         let len = encoded.len() as u64;
-        self.tx
-            .send((encoded, self.peer_addr))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
+        tokio::select! {
+            _ = self.shutdown.cancelled() => anyhow::bail!("UDP session closed"),
+            result = self.tx.send((encoded, self.peer_addr)) => {
+                result.map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
+            }
+        }
         Ok(len)
     }
 
@@ -78,6 +85,9 @@ impl Session for UdpSession {
         self: Arc<Self>,
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
     ) {
+        if self.reader_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
         let shutdown = self.shutdown.clone();
@@ -91,14 +101,15 @@ impl Session for UdpSession {
                 };
                 match read_result {
                     Ok(pkt) => {
-                        match incoming_packets_tx
-                            .send(IncomingPacket {
+                        let forwarded = tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            result = incoming_packets_tx.send(IncomingPacket {
                                 session_id: session_id.clone(),
                                 from_node: peer_id.clone(),
                                 packet: pkt,
-                            })
-                            .await
-                        {
+                            }) => result,
+                        };
+                        match forwarded {
                             Ok(()) => {}
                             Err(_) => {
                                 crate::warn!(
@@ -127,10 +138,52 @@ impl UdpSession {
         kind: LinkKind,
         obfuscator: Arc<Obfuscator>,
     ) -> Result<Arc<Self>> {
+        Ok(Self::create(
+            socket,
+            peer_addr,
+            peer_id,
+            kind,
+            obfuscator,
+            None,
+            CancellationToken::new(),
+        ))
+    }
+
+    pub(super) fn from_listener(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        kind: LinkKind,
+        obfuscator: Arc<Obfuscator>,
+        datagrams: mpsc::Receiver<Packet>,
+        shutdown: CancellationToken,
+    ) -> Arc<Self> {
+        Self::create(
+            socket,
+            peer_addr,
+            None,
+            kind,
+            obfuscator,
+            Some(datagrams),
+            shutdown,
+        )
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
+    fn create(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        peer_id: Option<String>,
+        kind: LinkKind,
+        obfuscator: Arc<Obfuscator>,
+        datagrams: Option<mpsc::Receiver<Packet>>,
+        shutdown: CancellationToken,
+    ) -> Arc<Self> {
         let id = Uuid::new_v4().to_string();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
-        let shutdown = tokio_util::sync::CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
 
         let session = Arc::new(Self {
@@ -141,6 +194,8 @@ impl UdpSession {
             socket: socket.clone(),
             peer_addr,
             obfuscator: obfuscator.clone(),
+            datagrams: datagrams.map(tokio::sync::Mutex::new),
+            reader_started: AtomicBool::new(false),
             shutdown: shutdown.clone(),
             task_tracker: task_tracker.clone(),
         });
@@ -173,6 +228,7 @@ impl UdpSession {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         crate::error!("[UdpSession] Error sending datagram: {}", e);
+                        shutdown.cancel();
                         break;
                     }
                     Err(_) => {
@@ -184,20 +240,30 @@ impl UdpSession {
             }
         });
 
-        Ok(session)
+        session
     }
 
     async fn read_packet(&self) -> Result<Packet> {
+        if let Some(datagrams) = &self.datagrams {
+            return datagrams
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("UDP listener closed"));
+        }
         let mut buf = vec![0u8; 65507];
-
-        match self.socket.recv_from(&mut buf).await {
-            Ok((size, _from_addr)) => {
-                buf.truncate(size);
-                let decoded = self.obfuscator.decode_datagram(&buf)?;
-                let packet = decode_packet(decoded)?;
-                Ok(packet)
+        loop {
+            let (size, from_addr) = self.socket.recv_from(&mut buf).await?;
+            if from_addr == self.peer_addr {
+                if let Ok(packet) = self
+                    .obfuscator
+                    .decode_datagram(&buf[..size])
+                    .and_then(decode_packet)
+                {
+                    return Ok(packet);
+                }
             }
-            Err(e) => Err(anyhow::anyhow!("Failed to receive UDP datagram: {}", e)),
         }
     }
 }

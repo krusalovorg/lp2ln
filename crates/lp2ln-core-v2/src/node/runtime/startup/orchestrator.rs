@@ -175,6 +175,7 @@ pub(crate) async fn run_startup(runtime: &mut NodeRuntime) -> Result<()> {
         db: &runtime.db,
         keypair: &runtime.keypair,
         transports: &runtime.transports,
+        bound_listens: runtime.bound_listens.clone(),
         packet_processor: runtime.packet_processor.clone(),
         session_manager: runtime.session_manager.clone(),
         peer_catalog: runtime.peer_catalog.clone(),

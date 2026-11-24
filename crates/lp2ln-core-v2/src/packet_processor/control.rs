@@ -169,7 +169,6 @@ pub async fn try_handle_control_packet(
             start_after_ms,
         } => {
             nat_state.mark_punch_start(&session_id, start_after_ms);
-            nat_state.mark_punching(&session_id);
         }
         NetworkControlPayload::NatPunchResult {
             session_id,

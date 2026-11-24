@@ -10,6 +10,7 @@ use crate::router::Router;
 use crate::sessions::manager::SessionManager;
 use crate::sessions::session::IncomingPacket;
 use crate::topology::{NodeDescriptor, PeerCatalog, PeerDirectory};
+use crate::topology::planner::DialIntent;
 use crate::transport::Transport;
 use crate::types::{PeerId, SessionId};
 use dashmap::DashMap;
@@ -18,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 const REGULAR_DIAL_ATTEMPT_BUDGET_MAX: usize = super::REGULAR_DIAL_ATTEMPT_BUDGET_MAX;
 pub(super) struct DialPlan {
-    pub(super) candidates: Vec<PeerId>,
+    pub(super) candidates: Vec<DialIntent>,
     pub(super) desc_by_peer: HashMap<PeerId, NodeDescriptor>,
     pub(super) connected_bootstrap: usize,
     pub(super) dial_limit: usize,
@@ -74,6 +75,7 @@ pub(super) async fn execute_dial_plan(
     peer_dir: &Arc<PeerDirectory>,
     topology_tuning: &TopologyTuning,
     transport_order: &[String],
+    lan_paths: &HashMap<PeerId, Vec<(String, SocketAddr)>>,
     seed_targets: &[BootstrapNode],
     now: u64,
 ) -> DialExecutionResult {
@@ -81,11 +83,21 @@ pub(super) async fn execute_dial_plan(
     let mut dial_attempts_left = dial_deficit.min(REGULAR_DIAL_ATTEMPT_BUDGET_MAX);
     let mut active_peers = n;
     let mut dialed_any = false;
-    for pid in plan.candidates.clone() {
-        if active_peers >= plan.dial_limit || dial_attempts_left == 0 {
+    for DialIntent { peer_id: pid, addrs: mut endpoints } in std::mem::take(&mut plan.candidates) {
+        if dial_attempts_left == 0 {
             break;
         }
-        if pid.as_str() == our_peer_maint || sm.is_connected_to_peer(&pid) {
+        if pid.as_str() == our_peer_maint {
+            continue;
+        }
+        let sessions = sm.get_all_for_peer(&pid);
+        let local_paths = lan_paths.get(&pid).map(Vec::as_slice).unwrap_or_default();
+        let upgrade = !sessions.is_empty()
+            && sessions.iter().all(|session| !session.kind().is_reliable())
+            && endpoints.iter().all(|endpoint| {
+                matches!(endpoint.0.as_str(), "tcp" | "quic") && local_paths.contains(endpoint)
+            });
+        if !upgrade && (!sessions.is_empty() || active_peers >= plan.dial_limit) {
             continue;
         }
         let is_seed = is_local_seed_peer(&pid, catalog.as_ref(), dial_book.as_ref(), seed_targets);
@@ -99,7 +111,7 @@ pub(super) async fn execute_dial_plan(
         if plan.force_non_bootstrap && is_seed {
             continue;
         }
-        if should_skip_for_bootstrap_quota(
+        if !upgrade && should_skip_for_bootstrap_quota(
             is_seed,
             node_role,
             plan.connected_bootstrap,
@@ -109,7 +121,7 @@ pub(super) async fn execute_dial_plan(
         ) {
             continue;
         }
-        if let Some(desc) = plan.desc_by_peer.get(&pid) {
+        if let Some(desc) = plan.desc_by_peer.get(&pid).filter(|_| !upgrade) {
             // Soft-cap applies to everyone including seeds (no cast exemption).
             let selective =
                 connectivity_selective(active_peers, dial_target, adaptive_min_active_peers);
@@ -131,11 +143,6 @@ pub(super) async fn execute_dial_plan(
                 continue;
             }
         }
-        let Some(entry) = dial_book.get(&pid) else {
-            continue;
-        };
-        let mut endpoints = entry.value().to_vec();
-        drop(entry);
         endpoints.sort_by_key(|(proto, _)| {
             transport_order
                 .iter()
@@ -143,7 +150,10 @@ pub(super) async fn execute_dial_plan(
                 .unwrap_or(usize::MAX)
         });
         // Static order is only the prior; what actually worked here wins.
-        let endpoints = router_maint.paths().rank(&endpoints, now);
+        let mut endpoints = router_maint.paths().rank(&endpoints, now);
+        endpoints.sort_by_key(|endpoint| {
+            !(matches!(endpoint.0.as_str(), "tcp" | "quic") && local_paths.contains(endpoint))
+        });
         let max_endpoints = dial_endpoint_attempt_budget(
             active_peers,
             dial_target,
@@ -166,13 +176,20 @@ pub(super) async fn execute_dial_plan(
                 if !t.is_listener() {
                     continue;
                 }
-                if sm.is_connected_to_peer(&pid) {
+                if !upgrade && sm.is_connected_to_peer(&pid) {
                     break;
                 }
                 endpoint_attempts = endpoint_attempts.saturating_add(1);
                 dial_attempts_left = dial_attempts_left.saturating_sub(1);
                 match t.dial_with_peer(addr, Some(pid.as_str())).await {
                     Ok(session) => {
+                        if session.peer_id().is_some_and(|peer| peer != pid.as_str()) {
+                            let _ = session.close().await;
+                            router_maint.paths().record_failure(
+                                &transport_name, addr, PathFailure::Connect, now,
+                            );
+                            continue;
+                        }
                         let session_id = SessionId::from(session.id().to_string());
                         spawn_path_verification(
                             router_maint.clone(),
