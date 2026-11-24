@@ -1,4 +1,5 @@
-﻿use std::io::ErrorKind;
+use crate::router::admission::{IngressPermit, ReaderIngress};
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 use crate::crypto::signature::verify_packet;
@@ -9,6 +10,7 @@ use crate::sessions::session::LinkKind;
 use crate::sessions::session::Session;
 use crate::transport::obfuscation::Obfuscator;
 use crate::transport::tcp::codec::{decode_packet, encode_packet};
+use crate::transport::writer_queue::{STREAM_QUEUE_BYTES, WriterQueue};
 use anyhow::Result;
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -69,7 +71,7 @@ pub struct TcpSession {
     kind: LinkKind,
     remote_addr: Option<std::net::SocketAddr>,
 
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: WriterQueue,
 
     read: tokio::sync::Mutex<tokio::net::tcp::OwnedReadHalf>,
     obfuscator: Arc<Obfuscator>,
@@ -79,6 +81,7 @@ pub struct TcpSession {
     // Tracks the reader and writer tasks so close_session() can join them
     // during shutdown instead of leaving them detached.
     task_tracker: tokio_util::task::TaskTracker,
+    reader_started: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -105,12 +108,7 @@ impl Session for TcpSession {
     }
 
     async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
-        let len = encoded.len() as u64;
-        self.tx
-            .send(encoded)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send packet to writer task: {}", e))?;
-        Ok(len)
+        self.tx.send(encoded).await
     }
 
     async fn close(&self) -> Result<()> {
@@ -127,6 +125,22 @@ impl Session for TcpSession {
         self: Arc<Self>,
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
     ) {
+        self.start_reader(ReaderIngress::Legacy(incoming_packets_tx));
+    }
+
+    fn spawn_budgeted_reader(self: Arc<Self>, ingress: crate::router::SessionIngress) {
+        self.start_reader(ReaderIngress::Budgeted(ingress));
+    }
+}
+
+impl TcpSession {
+    fn start_reader(self: Arc<Self>, ingress: ReaderIngress) {
+        if self
+            .reader_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
         let link_kind = self.kind();
@@ -137,24 +151,23 @@ impl Session for TcpSession {
             loop {
                 let read_result = tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    result = self.read_packet() => result,
+                    result = self.read_packet(&ingress) => result,
                 };
                 match read_result {
-                    Ok(pkt) => {
-                        match incoming_packets_tx
-                            .send(IncomingPacket {
-                                session_id: session_id.clone(),
-                                from_node: peer_id.clone(),
-                                packet: pkt,
-                            })
-                            .await
-                        {
-                            Ok(()) => {}
-                            Err(_) => {
-                                crate::warn!(
-                                    "[TcpSession] Incoming packets channel closed, stopping reader"
-                                );
-                                break;
+                    Ok((pkt, permit)) => {
+                        let incoming = IncomingPacket {
+                            session_id: session_id.clone(),
+                            from_node: peer_id.clone(),
+                            packet: pkt,
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            sent = ingress.submit(incoming, permit) => {
+                                if let Err(error) = sent {
+                                    crate::warn!("reliable ingress handoff failed for {}: {}", session_id, error);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -168,16 +181,14 @@ impl Session for TcpSession {
                                 e
                             );
                         }
-                        let _ = self.close().await;
                         break;
                     }
                 }
             }
+            let _ = self.close().await;
         });
     }
-}
 
-impl TcpSession {
     pub fn new_from_stream(
         stream: TcpStream,
         peer_id: Option<String>,
@@ -185,10 +196,16 @@ impl TcpSession {
         obfuscator: Arc<Obfuscator>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
+        // Legacy framing writes the length and payload separately. Avoid
+        // withholding the second small write while the first awaits an ACK.
+        stream.set_nodelay(true)?;
         let remote_addr = stream.peer_addr().ok();
         let (read_half, write_half) = stream.into_split();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let (tx, mut rx) = WriterQueue::channel(
+            STREAM_QUEUE_BYTES,
+            crate::transport::tcp::codec::MAX_FRAME_BYTES,
+        );
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
 
@@ -202,10 +219,10 @@ impl TcpSession {
             obfuscator: obfuscator.clone(),
             shutdown: shutdown.clone(),
             task_tracker: task_tracker.clone(),
+            reader_started: std::sync::atomic::AtomicBool::new(false),
         });
 
-        let write_half_arc = Arc::new(tokio::sync::Mutex::new(write_half));
-        let write_half_clone = write_half_arc.clone();
+        let mut writer = write_half;
         let obfuscator_clone = obfuscator.clone();
         let writer_peer_id = session.peer_id.clone();
         let writer_session_id = session.id.clone();
@@ -220,17 +237,13 @@ impl TcpSession {
                         None => break,
                     },
                 };
-                let mut writer = write_half_clone.lock().await;
-
-                // Bound the write: under TCP backpressure write_frame().await can
-                // block indefinitely (it runs outside the select!), which would
-                // wedge this task even after shutdown is requested. On timeout we
-                // cancel the session so the reader half also unwinds.
-                let write_result = tokio::time::timeout(
-                    WRITE_TIMEOUT,
-                    obfuscator_clone.write_frame(&mut *writer, &data),
-                )
-                .await;
+                let write_result = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    result = tokio::time::timeout(
+                        WRITE_TIMEOUT, obfuscator_clone.write_frame(&mut writer, &data.data),
+                    ) => result,
+                };
                 match write_result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -248,6 +261,7 @@ impl TcpSession {
                                 e
                             );
                         }
+                        shutdown.cancel();
                         break;
                     }
                     Err(_) => {
@@ -265,18 +279,29 @@ impl TcpSession {
         Ok(session)
     }
 
-    async fn read_packet(&self) -> Result<Packet> {
+    async fn read_packet(
+        &self,
+        ingress: &ReaderIngress,
+    ) -> Result<(Packet, Option<IngressPermit>)> {
         let mut reader = self.read.lock().await;
-        let frame_data = self.obfuscator.read_frame(&mut *reader).await?;
-        let packet = decode_packet(frame_data)?;
-        Ok(packet)
+        let (frame, permit) = self
+            .obfuscator
+            .read_admitted_frame(
+                &mut *reader,
+                Some(ingress),
+                crate::transport::tcp::codec::MAX_FRAME_BYTES,
+            )
+            .await?;
+        Ok((decode_packet(frame)?, permit))
     }
 
     pub async fn perform_handshake_on_stream(
         stream: &mut TcpStream,
         obfuscator: &Obfuscator,
     ) -> Result<String> {
-        let frame_data = obfuscator.read_frame(stream).await?;
+        let (frame_data, _) = obfuscator
+            .read_admitted_frame(stream, None, 64 * 1024)
+            .await?;
         let packet = decode_packet(frame_data)?;
         verify_packet(&packet).map_err(anyhow::Error::msg)?;
         if decode_hello(&packet.data).is_none() {
@@ -320,6 +345,25 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
+    async fn framed_session_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(!stream.nodelay().unwrap());
+        let session = TcpSession::new_from_stream(
+            stream,
+            None,
+            LinkKind::DirectTcp,
+            Arc::new(Obfuscator::plain()),
+        )
+        .unwrap();
+        assert!(session.read.lock().await.as_ref().nodelay().unwrap());
+        session.close().await.unwrap();
+        session.join_tasks().await;
+    }
+
+    #[tokio::test]
     async fn close_then_join_tasks_finishes_promptly() {
         // After close() cancels the session, join_tasks() must observe both
         // the reader and writer tasks terminating without leaking them.
@@ -329,7 +373,7 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let connect = tokio::spawn(async move { TcpStream::connect(addr).await });
         let (server, _peer_addr) = listener.accept().await.expect("accept");
-        let _client = connect.await.expect("join connect").expect("connect");
+        let mut client = connect.await.expect("join connect").expect("connect");
 
         let session = TcpSession::new_from_stream(
             server,
@@ -339,8 +383,35 @@ mod tests {
         )
         .expect("session");
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         session.clone().spawn_reader(tx);
+        let frame = encode_packet(Packet {
+            signature: None,
+            data: b"buffered".to_vec(),
+            nodes: vec![],
+            sender: "remote".into(),
+            receiver: "local".into(),
+            max_hops: 1,
+            request_id: None,
+            protocol_id: None,
+            chunk_stream_id: None,
+            chunk_index: None,
+            total_chunks: None,
+        })
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for _ in 0..3 {
+                Obfuscator::plain()
+                    .write_frame(&mut client, &frame)
+                    .await
+                    .unwrap();
+            }
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fill ingress");
 
         session.close().await.expect("close");
         tokio::time::timeout(std::time::Duration::from_secs(2), session.join_tasks())

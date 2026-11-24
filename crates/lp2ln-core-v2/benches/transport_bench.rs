@@ -1,4 +1,5 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 
 // Packets sent per criterion iteration – large enough to amortise async overhead.
 const BATCH: usize = 1_000;
+const BENCH_WAIT: Duration = Duration::from_secs(3);
 
 fn make_packet(size: usize) -> Packet {
     Packet {
@@ -144,7 +146,7 @@ fn throughput(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let mut group = c.benchmark_group("throughput");
+    let mut group = c.benchmark_group("enqueue_throughput");
     group.measurement_time(Duration::from_secs(10));
 
     // 100 B в†’ max packet rate; 8 KB в†’ data throughput (fits in a UDP datagram after encoding).
@@ -165,9 +167,13 @@ fn throughput(c: &mut Criterion) {
             let s = tcp_sender.clone();
             let p = make_packet(size);
             b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    s.send(p.clone()).await.unwrap();
-                }
+                tokio::time::timeout(BENCH_WAIT, async {
+                    for _ in 0..BATCH {
+                        s.send(p.clone()).await.unwrap();
+                    }
+                })
+                .await
+                .expect("enqueue batch timed out");
             });
         });
 
@@ -180,9 +186,13 @@ fn throughput(c: &mut Criterion) {
             let s = udp_sender.clone();
             let p = make_packet(size);
             b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    s.send(p.clone()).await.unwrap();
-                }
+                tokio::time::timeout(BENCH_WAIT, async {
+                    for _ in 0..BATCH {
+                        s.send(p.clone()).await.unwrap();
+                    }
+                })
+                .await
+                .expect("enqueue batch timed out");
             });
         });
 
@@ -195,14 +205,40 @@ fn throughput(c: &mut Criterion) {
             let s = quic_sender.clone();
             let p = make_packet(size);
             b.to_async(&rt).iter(|| async {
-                for _ in 0..BATCH {
-                    s.send(p.clone()).await.unwrap();
-                }
+                tokio::time::timeout(BENCH_WAIT, async {
+                    for _ in 0..BATCH {
+                        s.send(p.clone()).await.unwrap();
+                    }
+                })
+                .await
+                .expect("enqueue batch timed out");
             });
         });
     }
 
     group.finish();
+}
+
+async fn round_trip(
+    session: &Arc<dyn Session>,
+    mut packet: Packet,
+    rx: &tokio::sync::Mutex<mpsc::Receiver<IncomingPacket>>,
+    next_id: &AtomicU64,
+) {
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    packet.request_id = Some(id);
+    tokio::time::timeout(BENCH_WAIT, async {
+        session.send(packet).await.unwrap();
+        let mut receiver = rx.lock().await;
+        loop {
+            let incoming = receiver.recv().await.expect("echo receiver closed");
+            if incoming.packet.request_id == Some(id) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("echo timed out");
 }
 
 fn latency(c: &mut Criterion) {
@@ -217,6 +253,7 @@ fn latency(c: &mut Criterion) {
     group.sample_size(500);
 
     let ping = make_packet(64);
+    let next_id = AtomicU64::new(1);
 
     let (tcp_client, tcp_pong) = rt.block_on(async {
         let (c, s) = pair_tcp().await;
@@ -227,8 +264,7 @@ fn latency(c: &mut Criterion) {
         let rx = tcp_pong.clone();
         let p = ping.clone();
         b.to_async(&rt).iter(|| async {
-            s.send(p.clone()).await.unwrap();
-            rx.lock().await.recv().await.unwrap();
+            round_trip(&s, p.clone(), &rx, &next_id).await;
         });
     });
 
@@ -241,8 +277,7 @@ fn latency(c: &mut Criterion) {
         let rx = udp_pong.clone();
         let p = ping.clone();
         b.to_async(&rt).iter(|| async {
-            s.send(p.clone()).await.unwrap();
-            rx.lock().await.recv().await.unwrap();
+            round_trip(&s, p.clone(), &rx, &next_id).await;
         });
     });
 
@@ -255,8 +290,7 @@ fn latency(c: &mut Criterion) {
         let rx = quic_pong.clone();
         let p = ping.clone();
         b.to_async(&rt).iter(|| async {
-            s.send(p.clone()).await.unwrap();
-            rx.lock().await.recv().await.unwrap();
+            round_trip(&s, p.clone(), &rx, &next_id).await;
         });
     });
 

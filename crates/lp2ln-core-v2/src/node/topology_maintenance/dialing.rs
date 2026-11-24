@@ -68,7 +68,7 @@ pub(super) async fn execute_dial_plan(
     sm: &Arc<SessionManager>,
     transports_maint: &[Arc<dyn Transport>],
     router_maint: &Arc<Router>,
-    incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
+    _incoming_maint: &tokio::sync::mpsc::Sender<IncomingPacket>,
     our_peer_maint: &str,
     maintenance_handshake_payload: &[u8],
     peer_dir: &Arc<PeerDirectory>,
@@ -185,7 +185,7 @@ pub(super) async fn execute_dial_plan(
                             session_id.clone(),
                             session.clone(),
                         );
-                        session.spawn_reader(incoming_maint.clone());
+                        router_maint.start_session_reader(session);
                         let handshake =
                             handshake_packet(our_peer_maint, maintenance_handshake_payload);
                         let _ = router_maint.send_to_session(session_id, handshake).await;

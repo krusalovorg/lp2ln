@@ -89,7 +89,11 @@ async fn attempt(
 
     let session_id = SessionId::from(session.id().to_string());
     router.register_session_only(session_id.clone(), session.clone());
-    session.spawn_reader(incoming);
+    if incoming.same_channel(&router.incoming_sender()) {
+        router.start_session_reader(session);
+    } else {
+        session.spawn_reader(incoming);
+    }
     let sent_at = Instant::now();
     if let Err(e) = router.send_to_session(session_id.clone(), hello).await {
         crate::net_dial!("[LinkSurvival] {} {} hello failed: {}", name, addr, e);

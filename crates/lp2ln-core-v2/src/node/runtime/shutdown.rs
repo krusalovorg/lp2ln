@@ -64,6 +64,7 @@ pub(crate) async fn run_shutdown(runtime: &NodeRuntime) -> Result<()> {
     if let Some(supervisor) = supervisor {
         supervisor.shutdown().await;
     }
+    runtime.bound_listens.clear();
 
     if let Some(router) = runtime.router.as_ref() {
         router

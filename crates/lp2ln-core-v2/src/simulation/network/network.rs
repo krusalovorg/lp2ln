@@ -15,7 +15,7 @@ use super::graph::{FarthestPair, find_farthest_pair, shortest_path_hops};
 use super::linked_session::LinkedSession;
 use super::metrics::{
     RoutingMetrics, make_routing_packet, make_routing_packet_with_id, wait_for_deliveries,
-    wait_for_request_id, wait_for_unique_deliveries,
+    wait_for_matching_deliveries, wait_for_request_id,
 };
 use super::node::SimNode;
 use super::routing::SimRoutingTable;
@@ -205,14 +205,32 @@ impl SimNetwork {
     ) -> RoutingMetrics {
         let mut rx = self.subscribe(to);
         let started = Instant::now();
-        for i in 0..batch {
-            let rid = base_request_id + i as u64;
-            let pkt =
-                make_routing_packet_with_id(sender, receiver, payload_size, max_hops, Some(rid));
-            let _ = self.send_from(from, pkt).await;
-        }
-        let remaining = deadline.saturating_sub(started.elapsed());
-        let mut m = wait_for_unique_deliveries(&mut rx, batch, sender, receiver, remaining).await;
+        let send = async {
+            for i in 0..batch {
+                let rid = base_request_id + i as u64;
+                let packet = make_routing_packet_with_id(
+                    sender,
+                    receiver,
+                    payload_size,
+                    max_hops,
+                    Some(rid),
+                );
+                let _ = self.send_from(from, packet).await;
+            }
+        };
+        let matching_batch = |id: u64| {
+            id.checked_sub(base_request_id)
+                .is_some_and(|offset| offset < batch as u64)
+        };
+        let receive = wait_for_matching_deliveries(
+            &mut rx,
+            batch,
+            sender,
+            receiver,
+            deadline,
+            matching_batch,
+        );
+        let (_, mut m) = tokio::join!(tokio::time::timeout(deadline, send), receive);
         m.wall_time = started.elapsed();
         m
     }

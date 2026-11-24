@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod db;
 pub mod dht;
 pub mod event_core;
+pub mod flow;
 pub mod logger;
 pub mod metrics;
 pub mod nat;
@@ -42,3 +43,6 @@ pub use topology::{
     verify_descriptor, verify_evidence,
 };
 pub use types::{PeerId, SessionId};
+
+#[cfg(feature = "packet-trace")]
+pub mod packet_trace;

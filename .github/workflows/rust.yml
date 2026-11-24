@@ -17,10 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned toolchain and native build dependencies
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev libwayland-dev
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -36,10 +38,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace --features lp2ln-core-v2/packet-trace

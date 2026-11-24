@@ -3,29 +3,21 @@
 // Gate: a fresh node can find a NodeRecord / ProviderRecord without a direct address hint,
 //       routing through an intermediary.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lp2ln_core_v2::dht::{DhtService, NodeRecord, ProviderRecord, node_id_of, unix_now};
-use lp2ln_core_v2::node::{NodeBuilder, NodeOptions};
+use lp2ln_core_v2::event_core::prelude::{CoreEvent, TransportEvent};
+use lp2ln_core_v2::node::{NodeBuilder, NodeOptions, NodeRuntime};
 use lp2ln_core_v2::transport::Transport;
 use lp2ln_core_v2::transport::tcp::TcpTransport;
 
-/// Reserve an ephemeral localhost TCP port for integration tests.
-/// Avoids fixed-port collisions when multiple cargo test processes run in parallel (local/CI).
-fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
-
-fn node_opts(port: u16) -> NodeOptions {
+fn node_opts() -> NodeOptions {
     let mut opts = NodeOptions::empty()
         .allow_unsigned_packets(true)
         .keypair_generate()
-        .with_listen("tcp", format!("127.0.0.1:{port}").parse().unwrap());
+        .with_listen("tcp", "127.0.0.1:0".parse().unwrap());
     opts.enable_topology_maintenance = false;
     // Keep console quiet and never arm the global async file logger — each
     // `info!` used to `tokio::spawn(write_to_file)`, which could pin the
@@ -41,13 +33,25 @@ fn node_opts(port: u16) -> NodeOptions {
     opts
 }
 
-async fn make_node(port: u16) -> lp2ln_core_v2::node::NodeRuntime {
-    let mut n = NodeBuilder::new()
+async fn make_node() -> (NodeRuntime, SocketAddr) {
+    let mut node = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new()) as Arc<dyn Transport>)
-        .build(node_opts(port))
+        .build(node_opts())
         .expect("build");
-    n.start().await.expect("start");
-    n
+    let mut events = node.core_bus().subscribe_events();
+    node.start().await.expect("start");
+    let address = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let CoreEvent::Transport(TransportEvent::Ready(ready)) = events.recv().await.unwrap()
+                && let Some(address) = ready.listen_addr
+            {
+                return address;
+            }
+        }
+    })
+    .await
+    .expect("DHT test TCP listener did not become ready");
+    (node, address)
 }
 
 /// Build a NodeRecord for a given peer_id with a short TTL.
@@ -187,26 +191,21 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_announce_and_find() {
-    let port_a = free_tcp_port();
-    let port_b = free_tcp_port();
-    let node_a = make_node(port_a).await;
-    let node_b = make_node(port_b).await;
+    let (node_a, addr_a) = make_node().await;
+    let (node_b, addr_b) = make_node().await;
 
-    node_b
-        .connect("tcp", format!("127.0.0.1:{port_a}").parse().unwrap())
-        .await
-        .expect("connect");
+    node_b.connect("tcp", addr_a).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let dht_a = DhtService::new(
         node_a.peer_id(),
         node_a.router().unwrap(),
-        vec![format!("tcp:127.0.0.1:{port_a}")],
+        vec![format!("tcp:{addr_a}")],
     );
     let dht_b = DhtService::new(
         node_b.peer_id(),
         node_b.router().unwrap(),
-        vec![format!("tcp:127.0.0.1:{port_b}")],
+        vec![format!("tcp:{addr_b}")],
     );
     dht_a.seed(vec![dht_b.local_record.clone()]);
     dht_b.seed(vec![dht_a.local_record.clone()]);
@@ -245,14 +244,9 @@ async fn two_node_announce_and_find() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_announce_and_find() {
-    let port_a = free_tcp_port();
-    let port_b = free_tcp_port();
-    let node_a = make_node(port_a).await;
-    let node_b = make_node(port_b).await;
-    node_b
-        .connect("tcp", format!("127.0.0.1:{port_a}").parse().unwrap())
-        .await
-        .expect("connect");
+    let (node_a, addr_a) = make_node().await;
+    let (node_b, _) = make_node().await;
+    node_b.connect("tcp", addr_a).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let dht_a = DhtService::new(node_a.peer_id(), node_a.router().unwrap(), vec![]);

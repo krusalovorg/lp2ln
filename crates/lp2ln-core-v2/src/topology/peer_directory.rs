@@ -143,6 +143,22 @@ impl PeerDirectory {
             .is_some_and(|e| now < e.dial.backoff_until_ms)
     }
 
+    /// Fresh endpoints learned directly from signed LAN hellos for local UI consumers.
+    pub fn lan_hints(&self, now: u64, limit: usize) -> Vec<(PeerId, String, SocketAddr)> {
+        let mut result = Vec::new();
+        for entry in self.peers.iter() {
+            for record in &entry.addresses {
+                if result.len() >= limit.min(256) {
+                    return result;
+                }
+                if record.source == AddressSource::Lan && record.expires_at_ms > now {
+                    result.push((entry.key().clone(), record.proto.clone(), record.addr));
+                }
+            }
+        }
+        result
+    }
+
     /// Build a dial book containing only non-expired addresses.
     /// Consumed by `build_topology_snapshot` → `TopologySnapshot.dial_book`.
     pub fn dial_book(&self, now: u64) -> HashMap<PeerId, Vec<(String, SocketAddr)>> {
@@ -218,6 +234,26 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         format!("1.2.3.4:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn lan_picker_respects_expiry_and_limit() {
+        let dir = PeerDirectory::new();
+        let peer = PeerId::from("example");
+        dir.replace_lan_addresses(
+            &peer,
+            &[
+                ("quic".into(), make_addr(123)),
+                ("tcp".into(), make_addr(456)),
+            ],
+            200,
+            100,
+        );
+        assert_eq!(
+            dir.lan_hints(199, 1),
+            vec![(peer, "quic".into(), make_addr(123))]
+        );
+        assert!(dir.lan_hints(200, 10).is_empty());
     }
 
     #[test]

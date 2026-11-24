@@ -5,6 +5,7 @@ members = [
   "crates/lp2ln-db-export",
   "crates/lp2ln-app-protocol",
   "crates/lp2ln-app-sdk",
+  "crates/lp2ln-rtc",
   "crates/lp2ln-content",
   "crates/lp2ln-release",
   "crates/lp2ln-updater",
@@ -14,10 +15,6 @@ exclude = [
   "archive/lp2ln-core",
   "archive/lp2ln-gateway",
   "crates/lp2lnd-vpn",
+  "vendor/h3-quinn",
 ]
 resolver = "2"
-
-[patch.crates-io]
-# h3-quinn 0.0.6 accesses quinn::StreamId.0 which became private in quinn 0.11.x;
-# this local copy replaces .0 with u64::from(id) using the stable From impl.
-h3-quinn = { path = "vendor/h3-quinn" }

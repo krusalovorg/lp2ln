@@ -3,10 +3,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
-
 use crate::node::options::DeliveryLimits;
 use crate::packet::Packet;
+use crate::router::admission::IngressPermit;
 use crate::sessions::IncomingPacket;
 
 pub enum ChunkAssemblerResult {
@@ -26,13 +25,16 @@ struct ChunkStreamKey {
 struct ChunkBuffer {
     total_chunks: u32,
     chunks: HashMap<u32, Vec<u8>>,
+    permits: Vec<IngressPermit>,
     buffered_bytes: u64,
+    charged_bytes: u64,
     last_activity: Instant,
     sender: String,
     receiver: String,
     nodes: Vec<String>,
     max_hops: u8,
     request_id: Option<u64>,
+    protocol_id: Option<u16>,
 }
 
 /// Reassembles chunked packets addressed to this node.
@@ -45,16 +47,47 @@ struct ChunkBuffer {
 pub struct ChunkAssembler {
     our_peer_id: String,
     limits: DeliveryLimits,
-    streams: DashMap<ChunkStreamKey, ChunkBuffer>,
-    per_session: DashMap<String, usize>,
-    last_sweep: Mutex<Instant>,
+    state: Mutex<ChunkState>,
+    aggregate_budget: u64,
     rejected: AtomicU64,
 }
 
-enum Outcome {
-    Merged(Packet),
-    Collecting,
-    Rejected(&'static str),
+const MAX_REASSEMBLY_BYTES: u64 = 128 * 1024 * 1024;
+
+struct ChunkState {
+    streams: HashMap<ChunkStreamKey, ChunkBuffer>,
+    per_session: HashMap<String, usize>,
+    charged_bytes: u64,
+    last_sweep: Instant,
+}
+
+impl ChunkState {
+    fn remove(&mut self, key: &ChunkStreamKey) -> Option<ChunkBuffer> {
+        let stream = self.streams.remove(key)?;
+        self.charged_bytes -= stream.charged_bytes;
+        if let std::collections::hash_map::Entry::Occupied(mut count) =
+            self.per_session.entry(key.session_id.clone())
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
+        Some(stream)
+    }
+
+    fn expire(&mut self, ttl: Duration) {
+        let expired: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.last_activity.elapsed() >= ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.remove(&key);
+        }
+        self.last_sweep = Instant::now();
+    }
 }
 
 impl ChunkAssembler {
@@ -66,10 +99,14 @@ impl ChunkAssembler {
         Self {
             our_peer_id: our_peer_id.into(),
             limits,
-            streams: DashMap::new(),
-            per_session: DashMap::new(),
-            last_sweep: Mutex::new(Instant::now()),
+            state: Mutex::new(ChunkState {
+                streams: HashMap::new(),
+                per_session: HashMap::new(),
+                charged_bytes: 0,
+                last_sweep: Instant::now(),
+            }),
             rejected: AtomicU64::new(0),
+            aggregate_budget: MAX_REASSEMBLY_BYTES,
         }
     }
 
@@ -79,7 +116,7 @@ impl ChunkAssembler {
 
     /// Streams currently being assembled (observability / tests).
     pub fn active_streams(&self) -> usize {
-        self.streams.len()
+        self.state.lock().unwrap().streams.len()
     }
 
     /// Chunks refused by a limit since startup (observability / tests).
@@ -88,9 +125,17 @@ impl ChunkAssembler {
     }
 
     pub fn add(&self, incoming: IncomingPacket) -> ChunkAssemblerResult {
-        let packet = &incoming.packet;
+        self.add_admitted(incoming, None).0
+    }
+
+    pub(crate) fn add_admitted(
+        &self,
+        mut incoming: IncomingPacket,
+        permit: Option<IngressPermit>,
+    ) -> (ChunkAssemblerResult, Option<IngressPermit>) {
+        let packet = &mut incoming.packet;
         if !packet.is_chunk() || packet.receiver != self.our_peer_id {
-            return ChunkAssemblerResult::PassThrough(incoming);
+            return (ChunkAssemblerResult::PassThrough(incoming), permit);
         }
 
         let (Some(stream_id), Some(index), Some(total)) = (
@@ -98,18 +143,16 @@ impl ChunkAssembler {
             packet.chunk_index,
             packet.total_chunks,
         ) else {
-            return ChunkAssemblerResult::PassThrough(incoming);
+            return (ChunkAssemblerResult::PassThrough(incoming), permit);
         };
 
         // Validate the stream shape before allocating anything for it.
         if total == 0 || total > self.limits.max_chunks_per_stream {
-            return self.reject("total_chunks out of range");
+            return (self.reject("total_chunks out of range"), None);
         }
         if index >= total {
-            return self.reject("chunk_index out of range");
+            return (self.reject("chunk_index out of range"), None);
         }
-
-        self.sweep_expired_if_due();
 
         let from = incoming
             .from_node
@@ -122,92 +165,162 @@ impl ChunkAssembler {
             chunk_stream_id: stream_id,
         };
 
-        // Admission for a stream we have not seen before. The check/insert pair
-        // is not atomic, so concurrent workers can overshoot a cap by a handful
-        // of streams — harmless for a resource bound, and cheaper than holding a
-        // global lock across every chunk.
-        if !self.streams.contains_key(&key) {
-            if self.streams.len() >= self.limits.max_chunk_streams {
-                self.sweep_expired();
-                if self.streams.len() >= self.limits.max_chunk_streams {
-                    return self.reject("chunk stream table full");
-                }
-            }
-            let live = self
-                .per_session
-                .get(&key.session_id)
-                .map(|n| *n)
-                .unwrap_or(0);
-            if live >= self.limits.max_chunk_streams_per_session {
-                return self.reject("per-session chunk stream limit");
-            }
+        // Include allocation capacity and a fixed charge for each map entry.
+        // Stream metadata is bounded separately by stream count and admission.
+        let chunk_charge = (packet.data.capacity() as u64).saturating_add(64);
+        let mut state = self.state.lock().unwrap();
+        let ttl = Duration::from_millis(self.limits.chunk_stream_ttl_ms);
+        let sweep_interval = Duration::from_millis((self.limits.chunk_stream_ttl_ms / 4).max(250));
+        if state.last_sweep.elapsed() >= sweep_interval {
+            state.expire(ttl);
         }
 
-        let mut created = false;
-        let outcome = {
-            let mut entry = self.streams.entry(key.clone()).or_insert_with(|| {
-                created = true;
-                ChunkBuffer {
-                    total_chunks: total,
-                    chunks: HashMap::new(),
-                    buffered_bytes: 0,
-                    last_activity: Instant::now(),
-                    sender: packet.sender.clone(),
-                    receiver: packet.receiver.clone(),
-                    nodes: packet.nodes.clone(),
-                    max_hops: packet.max_hops,
-                    request_id: packet.request_id,
-                }
-            });
-
-            if entry.total_chunks != total {
-                Outcome::Rejected("total_chunks mismatch within stream")
-            } else if entry.chunks.contains_key(&index) {
-                // Duplicate chunk: reassembly is idempotent per index, so just
-                // keep the stream alive and wait for the ones still missing.
-                entry.last_activity = Instant::now();
-                Outcome::Collecting
-            } else if entry.buffered_bytes + packet.data.len() as u64
+        if let Some(stream) = state.streams.get(&key) {
+            if stream.last_activity.elapsed() >= ttl {
+                state.remove(&key);
+            }
+        }
+        if let Some(stream) = state.streams.get(&key) {
+            if stream.total_chunks != total {
+                return (self.reject("total_chunks mismatch within stream"), None);
+            }
+            if stream.sender != packet.sender
+                || stream.protocol_id != packet.protocol_id
+                || stream.request_id != packet.request_id
+            {
+                return (self.reject("chunk metadata mismatch within stream"), None);
+            }
+            if stream.chunks.contains_key(&index) {
+                return (ChunkAssemblerResult::Collecting, None);
+            }
+            if stream
+                .buffered_bytes
+                .saturating_add(packet.data.len() as u64)
                 > self.limits.max_chunk_stream_bytes
             {
-                Outcome::Rejected("chunk stream byte budget exceeded")
-            } else {
-                entry.buffered_bytes += packet.data.len() as u64;
-                entry.chunks.insert(index, packet.data.clone());
-                entry.last_activity = Instant::now();
-                if entry.chunks.len() as u32 == entry.total_chunks {
-                    Outcome::Merged(merge(&mut entry))
-                } else {
-                    Outcome::Collecting
-                }
+                return (self.reject("chunk stream byte budget exceeded"), None);
             }
+        } else {
+            if packet.data.len() as u64 > self.limits.max_chunk_stream_bytes {
+                return (self.reject("chunk stream byte budget exceeded"), None);
+            }
+            if state.streams.len() >= self.limits.max_chunk_streams
+                || state.per_session.get(&key.session_id).copied().unwrap_or(0)
+                    >= self.limits.max_chunk_streams_per_session
+            {
+                state.expire(ttl);
+            }
+            if state.streams.len() >= self.limits.max_chunk_streams {
+                return (self.reject("chunk stream table full"), None);
+            }
+            if state.per_session.get(&key.session_id).copied().unwrap_or(0)
+                >= self.limits.max_chunk_streams_per_session
+            {
+                return (self.reject("per-session chunk stream limit"), None);
+            }
+        }
+
+        let is_new = !state.streams.contains_key(&key);
+        let stream_charge = if is_new {
+            let metadata = packet.nodes.iter().map(String::capacity).sum::<usize>()
+                + packet.nodes.capacity() * std::mem::size_of::<String>()
+                + packet.sender.capacity()
+                + packet.receiver.capacity()
+                + key.session_id.capacity()
+                + key.from.capacity();
+            (metadata as u64).saturating_add(256)
+        } else {
+            0
         };
-
-        if created {
-            *self
-                .per_session
-                .entry(key.session_id.clone())
-                .or_insert(0) += 1;
+        let charge = stream_charge.saturating_add(chunk_charge);
+        if charge > self.aggregate_budget.saturating_sub(state.charged_bytes) {
+            return (self.reject("aggregate chunk byte budget exceeded"), None);
         }
 
-        match outcome {
-            Outcome::Merged(merged) => {
-                self.remove_stream(&key);
-                ChunkAssemblerResult::Merged(IncomingPacket {
-                    session_id: incoming.session_id,
-                    from_node: incoming.from_node,
-                    packet: merged,
-                })
-            }
-            Outcome::Collecting => ChunkAssemblerResult::Collecting,
-            Outcome::Rejected(reason) => {
-                if created {
-                    // Never leave an empty buffer behind for a chunk we refused.
-                    self.remove_stream(&key);
-                }
-                self.reject(reason)
-            }
+        if is_new {
+            *state.per_session.entry(key.session_id.clone()).or_default() += 1;
         }
+        state.charged_bytes += charge;
+        let entry = state
+            .streams
+            .entry(key.clone())
+            .or_insert_with(|| ChunkBuffer {
+                total_chunks: total,
+                chunks: HashMap::new(),
+                permits: Vec::new(),
+                buffered_bytes: 0,
+                charged_bytes: 0,
+                last_activity: Instant::now(),
+                sender: packet.sender.clone(),
+                receiver: packet.receiver.clone(),
+                nodes: packet.nodes.clone(),
+                max_hops: packet.max_hops,
+                request_id: packet.request_id,
+                protocol_id: packet.protocol_id,
+            });
+        entry.charged_bytes += charge;
+        entry.buffered_bytes += packet.data.len() as u64;
+        entry.chunks.insert(index, std::mem::take(&mut packet.data));
+        if let Some(permit) = permit {
+            entry.permits.push(permit);
+        }
+        entry.last_activity = Instant::now();
+        if entry.chunks.len() as u32 != entry.total_chunks {
+            return (ChunkAssemblerResult::Collecting, None);
+        }
+
+        let mut complete = state.remove(&key).expect("completed stream exists");
+        drop(state);
+        // The output allocation overlaps the source chunks until merge ends.
+        // Never wait on an additional permit while holding the source permits.
+        let merged_permit = if let Some(source) = complete.permits.first() {
+            let metadata = complete.nodes.iter().map(|n| n.len() + 24).sum::<usize>()
+                + complete.sender.len()
+                + complete.receiver.len()
+                + incoming.session_id.len()
+                + incoming.from_node.as_ref().map_or(0, String::len)
+                + 1024;
+            let bytes = (complete.buffered_bytes as usize).saturating_add(metadata);
+            let Some(copy) = source.try_copy(bytes) else {
+                return (self.reject("chunk merge admission exhausted"), None);
+            };
+            Some(copy)
+        } else {
+            None
+        };
+        (
+            ChunkAssemblerResult::Merged(IncomingPacket {
+                session_id: incoming.session_id,
+                from_node: incoming.from_node,
+                packet: merge(&mut complete),
+            }),
+            merged_permit,
+        )
+    }
+
+    pub(crate) fn reap(&self) {
+        let ttl = Duration::from_millis(self.limits.chunk_stream_ttl_ms);
+        self.state.lock().unwrap().expire(ttl);
+    }
+
+    pub(crate) fn remove_session(&self, session_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        let keys: Vec<_> = state
+            .streams
+            .keys()
+            .filter(|key| key.session_id == session_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            state.remove(&key);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.streams.clear();
+        state.per_session.clear();
+        state.charged_bytes = 0;
     }
 
     pub fn is_chunk_packet(packet: &Packet) -> bool {
@@ -224,53 +337,6 @@ impl ChunkAssembler {
             );
         }
         ChunkAssemblerResult::Rejected { reason }
-    }
-
-    fn remove_stream(&self, key: &ChunkStreamKey) {
-        if self.streams.remove(key).is_none() {
-            return;
-        }
-        if let Some(mut live) = self.per_session.get_mut(&key.session_id) {
-            *live = live.saturating_sub(1);
-        }
-        self.per_session.remove_if(&key.session_id, |_, n| *n == 0);
-    }
-
-    /// Sweep at most once per quarter-TTL: an O(n) scan on every chunk would
-    /// make a large stream table quadratic.
-    fn sweep_expired_if_due(&self) {
-        let interval = Duration::from_millis((self.limits.chunk_stream_ttl_ms / 4).max(250));
-        {
-            let Ok(mut last) = self.last_sweep.lock() else {
-                return;
-            };
-            if last.elapsed() < interval {
-                return;
-            }
-            *last = Instant::now();
-        }
-        self.sweep_expired();
-    }
-
-    fn sweep_expired(&self) {
-        let ttl = Duration::from_millis(self.limits.chunk_stream_ttl_ms);
-        let expired: Vec<ChunkStreamKey> = self
-            .streams
-            .iter()
-            .filter(|entry| entry.last_activity.elapsed() >= ttl)
-            .map(|entry| entry.key().clone())
-            .collect();
-        if expired.is_empty() {
-            return;
-        }
-        crate::debug!(
-            "[ChunkAssembler] dropping {} chunk stream(s) idle for >{}ms",
-            expired.len(),
-            self.limits.chunk_stream_ttl_ms
-        );
-        for key in expired {
-            self.remove_stream(&key);
-        }
     }
 }
 
@@ -294,13 +360,37 @@ fn merge(entry: &mut ChunkBuffer) -> Packet {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
-        protocol_id: None,
+        protocol_id: entry.protocol_id,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_chunk_budget_is_released_on_completion() {
+        let mut assembler = ChunkAssembler::new("me");
+        assembler.aggregate_budget = 640;
+        assert!(matches!(
+            assembler.add(chunk(1, 0, 2, &[1; 64])),
+            ChunkAssemblerResult::Collecting
+        ));
+        assert!(matches!(
+            assembler.add(chunk(2, 0, 2, &[2; 64])),
+            ChunkAssemblerResult::Rejected {
+                reason: "aggregate chunk byte budget exceeded"
+            }
+        ));
+        assert!(matches!(
+            assembler.add(chunk(1, 1, 2, &[3; 64])),
+            ChunkAssemblerResult::Merged(_)
+        ));
+        assert!(matches!(
+            assembler.add(chunk(2, 0, 2, &[2; 64])),
+            ChunkAssemblerResult::Collecting
+        ));
+    }
 
     const ME: &str = "me";
 
@@ -377,7 +467,12 @@ mod tests {
         // Any later chunk triggers the due sweep.
         a.add(chunk(2, 0, 100, b"other"));
         assert!(
-            !a.streams.iter().any(|e| e.key().chunk_stream_id == 1),
+            !a.state
+                .lock()
+                .unwrap()
+                .streams
+                .keys()
+                .any(|key| key.chunk_stream_id == 1),
             "stalled stream 1 should have been swept"
         );
     }

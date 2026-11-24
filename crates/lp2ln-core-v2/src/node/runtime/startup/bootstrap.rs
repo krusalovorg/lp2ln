@@ -26,6 +26,11 @@ impl RuntimeService for TransportListenerService {
             .router
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("router not initialized"))?;
+        let budget =
+            crate::transport::TransportReceiveBudget(Arc::downgrade(router.ingress_budget()));
+        for transport in ctx.transports {
+            transport.bind_receive_budget(budget.clone())?;
+        }
         let transport_ctx = TransportContext {
             incoming_sessions_tx,
             incoming_packets_tx: router.incoming_sender(),
@@ -39,6 +44,7 @@ impl RuntimeService for TransportListenerService {
             ctx.producer_cancel.clone(),
             ctx.transports,
             &ctx.options.listens,
+            ctx.bound_listens.clone(),
             transport_ctx,
             ctx.health.clone(),
             ctx.core_bus.clone(),

@@ -9,6 +9,65 @@ use crate::crypto::secure_channel::is_secure_envelope;
 use crate::crypto::signature::{SignatureFormat, sign_packet_with_format};
 use crate::packet::Packet;
 
+const MAX_CONCURRENT_EGRESS_TARGETS: usize = 4096;
+
+#[derive(Default)]
+pub(crate) struct EgressOrder {
+    gates: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    contended: AtomicU64,
+    waited_micros: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EgressContention {
+    pub contended: u64,
+    pub waited_micros: u64,
+}
+
+impl EgressOrder {
+    pub(crate) async fn lock(&self, receiver: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        anyhow::ensure!(
+            receiver.len() <= 256,
+            "invalid encrypted packet recipient length"
+        );
+        let gate = {
+            let mut gates = self.gates.lock().unwrap();
+            if let Some(gate) = gates.get(receiver) {
+                gate.clone()
+            } else {
+                if gates.len() >= MAX_CONCURRENT_EGRESS_TARGETS {
+                    gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+                }
+                anyhow::ensure!(
+                    gates.len() < MAX_CONCURRENT_EGRESS_TARGETS,
+                    "egress ordering at capacity"
+                );
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(receiver.to_owned(), gate.clone());
+                gate
+            }
+        };
+        match gate.clone().try_lock_owned() {
+            Ok(held) => Ok(held),
+            Err(_) => {
+                self.contended.fetch_add(1, Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                let held = gate.lock_owned().await;
+                self.waited_micros
+                    .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                Ok(held)
+            }
+        }
+    }
+
+    pub(crate) fn contention(&self) -> EgressContention {
+        EgressContention {
+            contended: self.contended.load(Ordering::Relaxed),
+            waited_micros: self.waited_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Outgoing packet signing and secure-envelope encoding (extracted from Router).
 pub struct PacketEgressSecurity {
     signing_key: Option<Arc<SigningKey>>,
@@ -28,8 +87,8 @@ impl PacketEgressSecurity {
         peer_cache: Arc<PeerCryptoCache>,
         signature_format: SignatureFormat,
     ) -> Self {
-        let (start_secure_seq, secure_seq_limit) = initial_secure_sequence_range()
-            .expect("cannot reserve secure packet sequences");
+        let (start_secure_seq, secure_seq_limit) =
+            initial_secure_sequence_range().expect("cannot reserve secure packet sequences");
         Self {
             signing_key,
             our_peer_id: our_peer_id.into(),
@@ -46,24 +105,37 @@ impl PacketEgressSecurity {
         &self.peer_cache
     }
 
+    pub(crate) fn needs_secure_envelope(&self, packet: &Packet) -> bool {
+        packet.sender == self.our_peer_id
+            && !packet.data.is_empty()
+            && !packet.receiver.is_empty()
+            && packet.receiver != self.our_peer_id
+            && !is_secure_envelope(&packet.data)
+    }
+
     pub fn prepare_outgoing(&self, mut packet: Packet) -> Result<Packet> {
         // Forward the author's encrypted body and signature unchanged.
-        if packet.sender != self.our_peer_id { return Ok(packet); }
+        if packet.sender != self.our_peer_id {
+            anyhow::ensure!(
+                packet.request_id.is_some(),
+                "forwarded packet is missing its author's request_id"
+            );
+            return Ok(packet);
+        }
         if packet.request_id.is_none() {
             let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
             packet.request_id = Some(id);
         }
-        if !packet.data.is_empty()
-            && !packet.receiver.is_empty()
-            && packet.receiver != self.our_peer_id
-            && !is_secure_envelope(&packet.data)
-        {
+        if self.needs_secure_envelope(&packet) {
             let signing_key = self
                 .signing_key
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Secure transport requires signing key"))?;
-            let seq = self.next_secure_seq.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                |seq| (seq < self.secure_seq_limit).then(|| seq + 1))
+            let seq = self
+                .next_secure_seq
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                    (seq < self.secure_seq_limit).then(|| seq + 1)
+                })
                 .map_err(|_| anyhow::anyhow!("secure sequence reservation exhausted"))?;
             packet.data = self.peer_cache.encode_secure(
                 signing_key.as_ref(),
@@ -75,9 +147,10 @@ impl PacketEgressSecurity {
         if let Some(ref key) = self.signing_key {
             let format = if self.peer_cache.supports_routed_signatures(&packet.receiver) {
                 SignatureFormat::V4Hash
-            } else { self.signature_format };
-            sign_packet_with_format(&mut packet, key, format)
-                .map_err(anyhow::Error::msg)?;
+            } else {
+                self.signature_format
+            };
+            sign_packet_with_format(&mut packet, key, format).map_err(anyhow::Error::msg)?;
         }
         Ok(packet)
     }
@@ -89,7 +162,6 @@ impl PacketEgressSecurity {
         Ok(())
     }
 }
-
 
 // Persist an exclusive high-water mark before sending any packet. A crash may
 // skip a range, but cannot reuse it. Replay protection stays enabled per peer.
@@ -117,14 +189,18 @@ fn reserve_secure_sequence_range(path: &std::path::Path) -> Result<(u64, u64)> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => now,
         Err(error) => return Err(error.into()),
     };
-    let limit = start.checked_add(SECURE_SEQUENCE_RESERVATION)
+    let limit = start
+        .checked_add(SECURE_SEQUENCE_RESERVATION)
         .ok_or_else(|| anyhow::anyhow!("secure sequence space exhausted"))?;
-    let _parent = path.parent()
+    let _parent = path
+        .parent()
         .ok_or_else(|| anyhow::anyhow!("sequence state requires a parent directory"))?;
     let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), now));
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
-            .write(true).create_new(true).open(&temp)?;
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
         writeln!(file, "{}", limit)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)?;
@@ -152,14 +228,33 @@ mod reconnect_regression_tests {
         let relay = NodeKeypair::generate();
         let author_cache = PeerCryptoCache::new();
         let relay_cache = PeerCryptoCache::new();
-        let sender = PacketEgressSecurity::new(Some(Arc::new(author.signing_key().clone())),
-            author.peer_id(), 1, author_cache, SignatureFormat::V4Hash);
-        let intermediary = PacketEgressSecurity::new(Some(Arc::new(relay.signing_key().clone())),
-            relay.peer_id(), 1, relay_cache.clone(), SignatureFormat::V3Hash);
-        let original = Packet { signature: None, data: b"private file capability".to_vec(),
-            nodes: vec![], sender: author.peer_id().to_owned(), receiver: recipient.peer_id().to_owned(),
-            max_hops: 8, request_id: None, chunk_stream_id: None, chunk_index: None,
-            total_chunks: None, protocol_id: Some(0x4c46) };
+        let sender = PacketEgressSecurity::new(
+            Some(Arc::new(author.signing_key().clone())),
+            author.peer_id(),
+            1,
+            author_cache,
+            SignatureFormat::V4Hash,
+        );
+        let intermediary = PacketEgressSecurity::new(
+            Some(Arc::new(relay.signing_key().clone())),
+            relay.peer_id(),
+            1,
+            relay_cache.clone(),
+            SignatureFormat::V3Hash,
+        );
+        let original = Packet {
+            signature: None,
+            data: b"private file capability".to_vec(),
+            nodes: vec![],
+            sender: author.peer_id().to_owned(),
+            receiver: recipient.peer_id().to_owned(),
+            max_hops: 8,
+            request_id: None,
+            chunk_stream_id: None,
+            chunk_index: None,
+            total_chunks: None,
+            protocol_id: Some(0x4c46),
+        };
         let mut encrypted = sender.prepare_outgoing(original).unwrap();
         let signature = encrypted.signature.clone();
         let ciphertext = encrypted.data.clone();
@@ -169,16 +264,24 @@ mod reconnect_regression_tests {
         assert_eq!(forwarded.data, ciphertext);
         assert_eq!(forwarded.signature, signature);
         verify_packet(&forwarded).unwrap();
-        assert!(relay_cache.decode_secure(relay.signing_key(), author.peer_id(), &forwarded.data).is_err());
+        assert!(
+            relay_cache
+                .decode_secure(relay.signing_key(), author.peer_id(), &forwarded.data)
+                .is_err()
+        );
         let (_, plaintext) = PeerCryptoCache::new()
-            .decode_secure(recipient.signing_key(), author.peer_id(), &forwarded.data).unwrap();
+            .decode_secure(recipient.signing_key(), author.peer_id(), &forwarded.data)
+            .unwrap();
         assert_eq!(plaintext, b"private file capability");
     }
 
     #[test]
     fn reserved_sequences_survive_restart_and_keep_replay_protection() {
         let directory = std::env::temp_dir().join(format!(
-            "lp2ln-sequence-test-{}-{}", std::process::id(), sequence_clock().unwrap()));
+            "lp2ln-sequence-test-{}-{}",
+            std::process::id(),
+            sequence_clock().unwrap()
+        ));
         std::fs::create_dir(&directory).unwrap();
         let state = directory.join("sequence");
         let (first, first_limit) = reserve_secure_sequence_range(&state).unwrap();
@@ -195,5 +298,28 @@ mod reconnect_regression_tests {
         assert!(reserve_secure_sequence_range(&state).is_err());
         std::fs::remove_file(&state).unwrap();
         std::fs::remove_dir(&directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_recipient_does_not_hold_an_independent_recipient() {
+        let gates = EgressOrder::default();
+        let held = gates.lock("a").await.unwrap();
+        let waiting = gates.lock("a");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert_eq!(gates.contention().contended, 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), gates.lock("b"))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        drop(held);
+        assert!(waiting.await.is_ok());
     }
 }

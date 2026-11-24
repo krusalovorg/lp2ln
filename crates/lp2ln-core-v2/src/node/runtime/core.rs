@@ -12,8 +12,6 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::NodeKeypair;
 use crate::crypto::peer_cache::PeerCryptoCache;
 use crate::db::P2PDatabase;
-use crate::storage::block_transfer::BlockTransferService;
-use crate::storage::dht::DhtService;
 use crate::event_core::prelude::{CoreBus, HandlerRegistration};
 use crate::logger;
 use crate::nat::NatTraversalState;
@@ -27,6 +25,8 @@ use crate::peer_score::{PeerConnectionPolicy, PeerScoreStore};
 use crate::router::Router;
 use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::topology::{PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 
@@ -36,6 +36,7 @@ pub struct NodeRuntime {
     pub(crate) peer_connection_policy_live: Arc<RwLock<PeerConnectionPolicy>>,
     pub(crate) keypair: NodeKeypair,
     pub(crate) transports: Vec<Arc<dyn Transport>>,
+    pub(crate) bound_listens: Arc<DashMap<String, SocketAddr>>,
     pub(crate) packet_processor: Arc<dyn PacketProcessor>,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) peer_catalog: Arc<PeerCatalog>,
@@ -150,6 +151,7 @@ impl NodeRuntime {
             peer_connection_policy_live: Arc::new(RwLock::new(peer_policy_init)),
             keypair,
             transports: vec![],
+            bound_listens: Arc::new(DashMap::new()),
             packet_processor,
             session_manager,
             peer_catalog,
@@ -222,5 +224,43 @@ impl NodeRuntime {
                 token.cancel();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_core::prelude::{CoreEvent, TransportEvent};
+    use crate::node::NodeBuilder;
+    use crate::transport::tcp::TcpTransport;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn lan_listener_map_uses_bound_port_and_clears_on_stop() {
+        let mut opts = NodeOptions::empty().with_listen("tcp", "0.0.0.0:0".parse().unwrap());
+        opts.enable_topology_maintenance = false;
+        opts.lan_discovery.enabled = false;
+        let mut node = NodeBuilder::new()
+            .add_transport(Arc::new(TcpTransport::new()))
+            .build(opts)
+            .unwrap();
+        assert!(node.bound_listens.is_empty());
+        let mut events = node.core_bus().subscribe_events();
+        node.start().await.unwrap();
+        let bound = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let CoreEvent::Transport(TransportEvent::Ready(ready)) =
+                    events.recv().await.unwrap()
+                {
+                    break ready.listen_addr.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(bound.port(), 0);
+        assert_eq!(*node.bound_listens.get("tcp").unwrap(), bound);
+        node.stop().await.unwrap();
+        assert!(node.bound_listens.is_empty());
     }
 }

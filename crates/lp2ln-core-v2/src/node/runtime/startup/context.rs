@@ -10,8 +10,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::crypto::NodeKeypair;
 use crate::db::P2PDatabase;
-use crate::storage::block_transfer::BlockTransferService;
-use crate::storage::dht::DhtService;
 use crate::event_core::prelude::{CoreBus, HandlerRegistration};
 use crate::nat::NatTraversalState;
 use crate::node::options::NodeOptions;
@@ -24,6 +22,8 @@ use crate::peer_score::PeerConnectionPolicy;
 use crate::router::Router;
 use crate::sessions::Session;
 use crate::sessions::manager::SessionManager;
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::topology::{PeerCatalog, PeerDirectory};
 use crate::transport::Transport;
 
@@ -37,6 +37,7 @@ pub(crate) struct StartupContext<'a> {
     pub db: &'a Option<Arc<P2PDatabase>>,
     pub keypair: &'a NodeKeypair,
     pub transports: &'a [Arc<dyn Transport>],
+    pub bound_listens: Arc<DashMap<String, SocketAddr>>,
     pub packet_processor: Arc<dyn PacketProcessor>,
     pub session_manager: Arc<SessionManager>,
     pub peer_catalog: Arc<PeerCatalog>,

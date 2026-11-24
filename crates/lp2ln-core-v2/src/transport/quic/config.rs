@@ -73,6 +73,9 @@ fn default_quic_alpn() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuicTransportOptions {
+    /// Opt in to the separate, authenticated Flow ALPN on this endpoint.
+    #[serde(default)]
+    pub enable_realtime_flows: bool,
     #[serde(default = "default_max_idle_timeout_secs")]
     pub max_idle_timeout_secs: u64,
     #[serde(default = "default_max_concurrent_bidi_streams")]
@@ -92,6 +95,7 @@ pub struct QuicTransportOptions {
 impl Default for QuicTransportOptions {
     fn default() -> Self {
         Self {
+            enable_realtime_flows: false,
             max_idle_timeout_secs: default_max_idle_timeout_secs(),
             max_concurrent_bidi_streams: default_max_concurrent_bidi_streams(),
             initial_mtu: default_initial_mtu(),
@@ -130,7 +134,12 @@ pub fn build_server_config(options: &QuicTransportOptions) -> Result<ServerConfi
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("invalid QUIC server TLS material")?;
+    let flow_alpn = crate::flow::security::ALPN;
     let mut alpn = alpn_bytes(&options.tls.alpn);
+    alpn.retain(|name| name != flow_alpn);
+    if options.enable_realtime_flows {
+        alpn.push(flow_alpn.to_vec());
+    }
     if options.masquerade.enabled && !alpn.contains(&H3_ALPN.to_vec()) {
         alpn.push(H3_ALPN.to_vec());
     }
@@ -140,6 +149,9 @@ pub fn build_server_config(options: &QuicTransportOptions) -> Result<ServerConfi
         QuicServerConfig::try_from(rustls_config).context("quic server crypto")?,
     ));
     server_config.transport_config(Arc::new(transport_config(options)));
+    server_config.max_incoming(128);
+    server_config.incoming_buffer_size(256 * 1024);
+    server_config.incoming_buffer_size_total(ENDPOINT_PENDING_CREDIT);
     Ok(server_config)
 }
 
@@ -153,12 +165,88 @@ pub fn build_client_config(options: &QuicTransportOptions) -> Result<ClientConfi
     if options.masquerade.enabled {
         rustls_config.alpn_protocols = vec![H3_ALPN.to_vec()];
     } else {
-        rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn);
+        rustls_config.alpn_protocols = alpn_bytes(&options.tls.alpn)
+            .into_iter()
+            .filter(|name| name != crate::flow::security::ALPN)
+            .collect();
     }
 
     let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(rustls_config)?));
     client_config.transport_config(Arc::new(transport_config(options)));
     Ok(client_config)
+}
+
+pub(super) fn build_flow_client_config(options: &QuicTransportOptions) -> Result<ClientConfig> {
+    ensure_rustls_crypto_provider();
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FlowCertificateProof))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![crate::flow::security::ALPN.to_vec()];
+    let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+    config.transport_config(Arc::new(transport_config(options)));
+    Ok(config)
+}
+
+#[derive(Debug)]
+struct FlowCertificateProof;
+
+impl ServerCertVerifier for FlowCertificateProof {
+    // Certificates can be self-signed. LP2LN identity is authenticated over
+    // this connection's exporter after verifying TLS proof of key possession.
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("Flow requires TLS 1.3".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub(super) const NATIVE_RECEIVE_CREDIT: u32 = 4 * 1024 * 1024;
+pub(super) const ENDPOINT_PENDING_CREDIT: u64 = 8 * 1024 * 1024;
+
+pub(super) fn native_connection_charge(options: &QuicTransportOptions) -> usize {
+    let extra = if options.masquerade.enabled {
+        1_250_000
+    } else if options.enable_realtime_flows {
+        crate::flow::DATAGRAM_BUFFER
+    } else {
+        0
+    };
+    NATIVE_RECEIVE_CREDIT as usize + extra + 64 * 1024
 }
 
 fn transport_config(options: &QuicTransportOptions) -> TransportConfig {
@@ -168,6 +256,20 @@ fn transport_config(options: &QuicTransportOptions) -> TransportConfig {
         idle_timeout_varint(options.max_idle_timeout_secs).into(),
     ));
     transport.initial_mtu(options.initial_mtu);
+    // The legacy protocol uses one bidirectional stream. Bound aggregate
+    // receive credit and refuse unused incoming streams and DATAGRAM buffers.
+    transport.receive_window(VarInt::from_u32(NATIVE_RECEIVE_CREDIT));
+    if !options.masquerade.enabled {
+        transport.max_concurrent_uni_streams(VarInt::from_u32(0));
+        let buffer = options
+            .enable_realtime_flows
+            .then_some(crate::flow::DATAGRAM_BUFFER);
+        transport.datagram_receive_buffer_size(buffer);
+        transport.datagram_send_buffer_size(buffer.unwrap_or(0));
+    } else if options.enable_realtime_flows {
+        transport.datagram_receive_buffer_size(Some(crate::flow::DATAGRAM_BUFFER));
+        transport.datagram_send_buffer_size(crate::flow::DATAGRAM_BUFFER);
+    }
     transport
 }
 
@@ -433,9 +535,33 @@ mod tests {
         )
         .expect("inbound");
 
-        let (tx, mut rx) = mpsc::channel(4);
-        inbound.spawn_reader(tx);
-        let received = rx.recv().await.expect("packet");
+        let (tx, mut rx) = mpsc::channel(1);
+        inbound.clone().spawn_reader(tx);
+        let deadline = Duration::from_secs(2);
+        let received = tokio::time::timeout(deadline, rx.recv())
+            .await
+            .unwrap()
+            .expect("packet");
         assert_eq!(received.packet.data, packet.data);
+
+        // A consumer that stopped draining ingress must not hold shutdown.
+        for _ in 0..3 {
+            outbound.send(packet.clone()).await.expect("send");
+        }
+        tokio::time::timeout(deadline, async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fill ingress");
+        inbound.close().await.expect("close");
+        tokio::time::timeout(deadline, inbound.join_tasks())
+            .await
+            .expect("join while ingress is saturated");
+        outbound.close().await.expect("outbound close");
+        tokio::time::timeout(deadline, outbound.join_tasks())
+            .await
+            .expect("outbound join");
     }
 }

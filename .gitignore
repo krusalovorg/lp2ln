@@ -71,6 +71,9 @@ temp_configs/
 temp_db/
 .cursor/
 docs/
+!/docs/
+/docs/*
+!/docs/realtime/
 crates/lp2lnd/options-*.json
 ClAUDE.md
 db

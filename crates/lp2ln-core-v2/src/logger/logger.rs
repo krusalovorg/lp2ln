@@ -1,23 +1,28 @@
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use chrono::Local;
 use colored::*;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 
-lazy_static::lazy_static! {
-    static ref LOG_FILE: std::sync::Arc<Mutex<Option<tokio::fs::File>>> =
-        std::sync::Arc::new(Mutex::new(None));
+const FILE_LOG_CAPACITY: usize = 1024;
+const MAX_FILE_LOG_BYTES: usize = 4096;
+
+struct FileLogRecord {
+    path: Arc<PathBuf>,
+    line: Box<str>,
 }
+
+static FILE_LOG_PATH: Mutex<Option<Arc<PathBuf>>> = Mutex::new(None);
+static FILE_LOG_TX: OnceLock<Option<mpsc::SyncSender<FileLogRecord>>> = OnceLock::new();
+static DROPPED_FILE_LOGS: AtomicU64 = AtomicU64::new(0);
 
 static SHOW_DEBUG: AtomicBool = AtomicBool::new(true);
 static SHOW_INFO: AtomicBool = AtomicBool::new(true);
 static SHOW_WARNING: AtomicBool = AtomicBool::new(true);
 static SHOW_ERROR: AtomicBool = AtomicBool::new(true);
-static FILE_LOGGING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 pub struct LoggerOptions {
@@ -83,54 +88,77 @@ pub fn init(options: &LoggerOptions) {
     SHOW_INFO.store(options.show_info, Ordering::SeqCst);
     SHOW_WARNING.store(options.show_warning, Ordering::SeqCst);
     SHOW_ERROR.store(options.show_error, Ordering::SeqCst);
-    FILE_LOGGING.store(options.file_enabled, Ordering::SeqCst);
-
-    if !options.file_enabled {
-        return;
-    }
-
-    let log_dir = options
-        .log_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("logs"));
-    let file_name = format!("{}.log", Local::now().format("%Y-%m-%d"));
-    let path = log_dir.join(&file_name);
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let path = path.clone();
-    tokio::spawn(async move {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-            .expect("Failed to open log file");
-
-        let mut guard = LOG_FILE.lock().await;
-        *guard = Some(file);
+    let mut path = FILE_LOG_PATH.lock().unwrap();
+    *path = options.file_enabled.then(|| {
+        let log_dir = options
+            .log_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("logs"));
+        let file_name = format!("{}.log", Local::now().format("%Y-%m-%d"));
+        Arc::new(log_dir.join(file_name))
     });
 }
 
-fn spawn_file_write(message: String) {
-    if !FILE_LOGGING.load(Ordering::SeqCst) {
+/// File log records rejected due to capacity or a disconnected writer.
+pub fn dropped_file_logs() -> u64 {
+    DROPPED_FILE_LOGS.load(Ordering::Relaxed)
+}
+
+fn queue_file_write(mut message: String) {
+    let Some(path) = FILE_LOG_PATH.lock().unwrap().clone() else {
         return;
+    };
+    message.truncate(message.floor_char_boundary(MAX_FILE_LOG_BYTES));
+    let record = FileLogRecord {
+        path,
+        line: message.into_boxed_str(),
+    };
+    let tx = FILE_LOG_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(FILE_LOG_CAPACITY);
+        std::thread::Builder::new()
+            .name("lp2ln-file-log".into())
+            .spawn(move || write_file_logs(rx))
+            .ok()
+            .map(|_| tx)
+    });
+    if tx.as_ref().is_none_or(|tx| tx.try_send(record).is_err()) {
+        DROPPED_FILE_LOGS.fetch_add(1, Ordering::Relaxed);
     }
-    tokio::spawn(write_to_file(message));
+}
+
+fn write_file_logs(rx: mpsc::Receiver<FileLogRecord>) {
+    let mut current: Option<(Arc<PathBuf>, Option<File>)> = None;
+    for record in rx {
+        if current
+            .as_ref()
+            .is_none_or(|(path, _)| path != &record.path)
+        {
+            let open = || -> std::io::Result<File> {
+                if let Some(parent) = record.path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(record.path.as_ref())
+            };
+            let file = match open() {
+                Ok(file) => Some(file),
+                Err(err) => {
+                    eprintln!("[LP2LN] Could not open log file: {err}");
+                    None
+                }
+            };
+            current = Some((record.path, file));
+        }
+        if let Some((_, Some(file))) = &mut current {
+            let _ = writeln!(file, "{}", record.line);
+        }
+    }
 }
 
 fn get_timestamp() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-async fn write_to_file(message: String) {
-    let mut guard = LOG_FILE.lock().await;
-    if let Some(file) = &mut *guard {
-        let _ = file.write_all(format!("{}\n", message).as_bytes()).await;
-        let _ = file.flush().await;
-    }
 }
 
 pub fn set_log_dir(dir: Option<&str>) {
@@ -199,7 +227,7 @@ pub fn debug(message: &str) {
     if SHOW_DEBUG.load(Ordering::SeqCst) {
         println!("{}", log_message.blue().bold());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 pub fn info(message: &str) {
@@ -208,7 +236,7 @@ pub fn info(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message);
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 pub fn warning(message: &str) {
@@ -217,7 +245,7 @@ pub fn warning(message: &str) {
     if SHOW_WARNING.load(Ordering::SeqCst) {
         println!("{}", log_message.yellow().bold());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 pub fn error(message: &str) {
@@ -226,7 +254,7 @@ pub fn error(message: &str) {
     if SHOW_ERROR.load(Ordering::SeqCst) {
         println!("{}", log_message.red().bold());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 pub fn session(message: &str) {
@@ -235,7 +263,7 @@ pub fn session(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.cyan());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 pub fn processor(message: &str) {
@@ -244,7 +272,7 @@ pub fn processor(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.magenta());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 /// Expected peer / TCP session teardown (colored on stderr).
@@ -254,7 +282,7 @@ pub fn net_disconnect(message: &str) {
     if SHOW_INFO.load(Ordering::SeqCst) {
         println!("{}", log_message.cyan().bold());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 /// Failed outbound dial / reachability (colored on stderr).
@@ -264,7 +292,7 @@ pub fn net_dial(message: &str) {
     if SHOW_DEBUG.load(Ordering::SeqCst) {
         println!("{}", log_message.yellow().bold());
     }
-    spawn_file_write(log_message);
+    queue_file_write(log_message);
 }
 
 #[macro_export]
@@ -321,4 +349,32 @@ macro_rules! net_dial {
     ($($arg:tt)*) => {
         $crate::logger::net_dial(&format!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_writer_runs_without_a_tokio_runtime() {
+        let dir = std::env::temp_dir().join(format!("lp2ln-test-{}", uuid::Uuid::new_v4()));
+        let path = Arc::new(dir.join("net.log"));
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(FileLogRecord {
+            path: path.clone(),
+            line: "first".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            tx.try_send(FileLogRecord {
+                path: path.clone(),
+                line: "overflow".into()
+            }),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        drop(tx);
+        write_file_logs(rx);
+        assert_eq!(std::fs::read_to_string(path.as_ref()).unwrap(), "first\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

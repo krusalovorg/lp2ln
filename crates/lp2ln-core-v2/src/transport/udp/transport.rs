@@ -3,19 +3,26 @@ use crate::sessions::session::LinkKind;
 use crate::stun::StunClient;
 use crate::transport::obfuscation::{ObfuscationConfig, Obfuscator};
 use crate::transport::transport::{PublicAddress, TransportContext, TunnelPunchParams};
-use crate::transport::udp::session::UdpSession;
+use crate::transport::udp::session::{InboundDatagram, MAX_UDP_DATAGRAM, UdpSession};
 use crate::transport::{
     ACCEPT_TASK_JOIN_TIMEOUT, Transport, bind_with_port_fallback, join_accept_task,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
 
+// All virtual sessions on one listener share a datagram memory budget.
+const LISTENER_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const MAX_LISTENER_SESSIONS: usize = 1024;
+const SESSION_INBOX_CAPACITY: usize = 64;
+
 pub struct UdpTransport {
+    receive_budget: std::sync::Mutex<Option<crate::transport::TransportReceiveBudget>>,
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     accept_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -33,6 +40,7 @@ impl Default for UdpTransport {
 impl UdpTransport {
     pub fn new() -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -44,6 +52,7 @@ impl UdpTransport {
 
     pub fn new_listener(listen_addr: SocketAddr) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr,
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -55,6 +64,7 @@ impl UdpTransport {
 
     pub fn new_dial() -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -69,6 +79,7 @@ impl UdpTransport {
         config: ObfuscationConfig,
     ) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr,
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -80,6 +91,7 @@ impl UdpTransport {
 
     pub fn new_dial_with_obfuscation(config: ObfuscationConfig) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -92,6 +104,18 @@ impl UdpTransport {
 
 #[async_trait]
 impl Transport for UdpTransport {
+    fn bind_receive_budget(&self, budget: crate::transport::TransportReceiveBudget) -> Result<()> {
+        let mut current = self.receive_budget.lock().unwrap();
+        if let Some(active) = current.as_ref().and_then(|b| b.get()) {
+            anyhow::ensure!(
+                budget.get().is_some_and(|new| Arc::ptr_eq(&active, &new)),
+                "transport already bound to another node"
+            );
+        }
+        *current = Some(budget);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "udp"
     }
@@ -128,75 +152,120 @@ impl Transport for UdpTransport {
         }
 
         let socket = Arc::new(socket);
-        let socket_clone = socket.clone();
-        let incoming_sessions_tx = ctx.incoming_sessions_tx.clone();
+        let shared = self
+            .receive_budget
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|b| b.get());
+        let scratch = shared
+            .as_ref()
+            .map(|b| {
+                b.wire(MAX_UDP_DATAGRAM + 256)
+                    .context("UDP listener scratch budget exhausted")
+            })
+            .transpose()?;
+        let incoming_sessions_tx = ctx.incoming_sessions_tx;
         let obfuscator = self.obfuscator.clone();
-
-        let sessions: Arc<
-            tokio::sync::Mutex<std::collections::HashMap<SocketAddr, Arc<dyn Session>>>,
-        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let sessions_clone = sessions.clone();
-
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        {
-            let mut shutdown_tx_guard = self.shutdown_tx.lock().await;
-            *shutdown_tx_guard = Some(shutdown_tx);
-        }
+        *self.shutdown_tx.lock().await = Some(shutdown_tx);
 
         let accept_handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65507];
+            let _scratch = scratch;
+            let mut sessions: HashMap<
+                SocketAddr,
+                (Weak<UdpSession>, mpsc::Sender<InboundDatagram>),
+            > = HashMap::new();
+            let budget = Arc::new(Semaphore::new(LISTENER_BYTE_BUDGET));
+            let mut buffer = vec![0; MAX_UDP_DATAGRAM];
 
             loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        crate::info!("[UdpTransport] Listener shutting down");
+                let received = tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = incoming_sessions_tx.closed() => break,
+                    result = socket.recv_from(&mut buffer) => result,
+                };
+                let (size, peer_addr) = match received {
+                    Ok(datagram) => datagram,
+                    Err(error) => {
+                        crate::debug!("[UdpTransport] Receive failed: {}", error);
                         break;
                     }
-                    result = socket_clone.recv_from(&mut buf) => {
-                        match result {
-                            Ok((_size, peer_addr)) => {
-                                let needs_new_session = {
-                                    let sessions_guard = sessions_clone.lock().await;
-                                    !sessions_guard.contains_key(&peer_addr)
-                                };
+                };
+                let Ok(permit) = budget.clone().try_acquire_many_owned((size + 128) as u32) else {
+                    continue;
+                };
 
-                                if needs_new_session {
-                                    match UdpSession::new_from_socket(
-                                        socket_clone.clone(),
-                                        peer_addr,
-                                        None,
-                                        LinkKind::DirectUdp,
-                                        obfuscator.clone(),
-                                    ) {
-                                        Ok(session) => {
-                                            crate::info!("[UdpTransport] New session from {}", peer_addr);
+                let node_permit = match &shared {
+                    Some(b) => match b.wire(size + 128) {
+                        Some(permit) => Some(permit),
+                        None => continue,
+                    },
+                    None => None,
+                };
 
-                                            let session_dyn = session.clone() as Arc<dyn Session>;
-                                            match incoming_sessions_tx.send(session_dyn.clone()).await {
-                                                Ok(()) => {
-                                                    let mut sessions_guard = sessions_clone.lock().await;
-                                                    if let std::collections::hash_map::Entry::Vacant(e) = sessions_guard.entry(peer_addr) {
-                                                        e.insert(session_dyn);
-                                                        crate::session!("[UdpTransport] Session registered: {}", session.id());
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    crate::error!("[UdpTransport] Failed to send incoming session: channel closed");
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            crate::error!("[UdpTransport] Failed to create session: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                crate::error!("[UdpTransport] Error receiving datagram: {}", e);
-                            }
+                if let Some((peer, inbox)) = sessions.get(&peer_addr) {
+                    if peer.upgrade().is_some_and(|session| !session.is_closed()) {
+                        if let Ok(slot) = inbox.try_reserve() {
+                            slot.send((buffer[..size].to_vec(), permit, node_permit));
                         }
+                        continue;
                     }
+                    sessions.remove(&peer_addr);
+                }
+                if sessions.len() >= MAX_LISTENER_SESSIONS {
+                    sessions.retain(|_, (peer, _)| {
+                        peer.upgrade().is_some_and(|session| !session.is_closed())
+                    });
+                    if sessions.len() >= MAX_LISTENER_SESSIONS {
+                        continue;
+                    }
+                }
+                // Validate framing before allocating a peer inbox. Authentication
+                // still belongs to the existing packet processor.
+                let first = &buffer[..size];
+                let first_valid = {
+                    let _decode = match &shared {
+                        Some(b) => match b
+                            .pre_auth(crate::transport::tcp::codec::decode_reservation(size))
+                        {
+                            Some(permit) => Some(permit),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    if obfuscator.is_enabled() {
+                        obfuscator
+                            .decode_datagram(first)
+                            .and_then(crate::transport::tcp::codec::decode_packet)
+                            .is_ok()
+                    } else {
+                        crate::transport::tcp::codec::decode_packet_slice(first).is_ok()
+                    }
+                };
+                if !first_valid {
+                    continue;
+                }
+                let Ok(registration) = incoming_sessions_tx.try_reserve() else {
+                    continue;
+                };
+                let (inbox_tx, inbox_rx) = mpsc::channel(SESSION_INBOX_CAPACITY);
+                let Ok(session) = UdpSession::from_listener(
+                    socket.clone(),
+                    peer_addr,
+                    obfuscator.clone(),
+                    inbox_rx,
+                ) else {
+                    continue;
+                };
+                // Register the inbox and retain the triggering packet before
+                // publishing the session to the runtime.
+                if inbox_tx
+                    .try_send((first.to_vec(), permit, node_permit))
+                    .is_ok()
+                {
+                    sessions.insert(peer_addr, (Arc::downgrade(&session), inbox_tx));
+                    registration.send(session);
                 }
             }
         });
@@ -234,7 +303,12 @@ impl Transport for UdpTransport {
     async fn dial(&self, addr: SocketAddr) -> Result<Arc<dyn Session>> {
         crate::info!("[UdpTransport] Dialing {}", addr);
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        let bind_addr = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
 

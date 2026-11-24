@@ -1,4 +1,4 @@
-﻿/// End-to-end throughput through full NodeRuntime pipeline:
+/// End-to-end throughput through full NodeRuntime pipeline:
 /// Router ingress в†’ PacketProcessor (semaphore, 256 permits) в†’ broadcast delivery.
 ///
 /// Unlike transport_bench (raw sessions), this exercises every layer:
@@ -19,10 +19,11 @@
 /// blocks indicates per-packet overhead, not wire bandwidth.
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use lp2ln_core_v2::event_core::prelude::{CoreEvent, TransportEvent};
 use lp2ln_core_v2::logger::LoggerOptions;
 use lp2ln_core_v2::node::{NodeBuilder, NodeOptions, NodeRuntime};
 use lp2ln_core_v2::packet::Packet;
@@ -38,7 +39,56 @@ use lp2ln_core_v2::types::SessionId;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
 
+// Allocator instrumentation is confined to this benchmark executable.
+#[global_allocator]
+static BENCH_ALLOCATOR: ProbeAllocator = ProbeAllocator;
+static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+static REQUESTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct ProbeAllocator;
+
+impl ProbeAllocator {
+    fn record(ptr: *mut u8, size: usize) -> *mut u8 {
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
+            ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+            REQUESTED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        }
+        ptr
+    }
+}
+
+// SAFETY: all allocation operations preserve System's pointer and layout
+// contracts. The probe only records successful calls.
+unsafe impl std::alloc::GlobalAlloc for ProbeAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::record(unsafe { std::alloc::System.alloc(layout) }, layout.size())
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::record(
+            unsafe { std::alloc::System.alloc_zeroed(layout) },
+            layout.size(),
+        )
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        Self::record(
+            unsafe { std::alloc::System.realloc(ptr, layout, size) },
+            size,
+        )
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
 /// Target ~1.6 MiB per criterion iteration (same as the original 200 Г— 8 KiB).
+const BENCH_PROTOCOL_ID: u16 = 0xffe0;
+const BATCH_TIMEOUT: Duration = Duration::from_secs(3);
+const UDP_OBSERVATION_WINDOW: Duration = Duration::from_millis(100);
+
 const TARGET_ITER_BYTES: usize = 200 * 8 * 1024;
 
 const PAYLOAD_SIZES: &[usize] = &[100, 8 * 1024, 64 * 1024, 256 * 1024];
@@ -107,18 +157,24 @@ fn make_packet(size: usize, sender: &str, receiver: &str) -> Packet {
         chunk_stream_id: None,
         chunk_index: None,
         total_chunks: None,
-        protocol_id: None,
+        protocol_id: Some(BENCH_PROTOCOL_ID),
     }
 }
 
-/// Grab a free OS-assigned port, release it, return the number.
-/// Tiny race window – acceptable for benchmark setup only.
-async fn free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    p
+async fn start_listener(node: &mut NodeRuntime) -> SocketAddr {
+    let mut events = node.core_bus().subscribe_events();
+    node.start().await.unwrap();
+    tokio::time::timeout(BATCH_TIMEOUT, async {
+        loop {
+            if let CoreEvent::Transport(TransportEvent::Ready(ready)) = events.recv().await.unwrap()
+                && let Some(bound) = ready.listen_addr
+            {
+                return bound;
+            }
+        }
+    })
+    .await
+    .expect("benchmark listener did not become ready")
 }
 
 fn node_opts(listen: Option<(&str, SocketAddr)>, security: SecurityProfile) -> NodeOptions {
@@ -146,7 +202,7 @@ struct BenchSetup {
     session_id: SessionId,
     peer_a: String,
     peer_b: String,
-    subscriber: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
+    subscriber: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>,
 }
 
 // peer_b must be the packet sender – DefaultPacketProcessor enforces sender == session.peer_id.
@@ -156,9 +212,7 @@ async fn setup(proto: Protocol, security: SecurityProfile) -> BenchSetup {
         Protocol::Udp => setup_udp(security).await,
         Protocol::Quic => setup_quic(security).await,
     };
-    let subscriber = Arc::new(tokio::sync::Mutex::new(
-        node_a.router().unwrap().subscribe(),
-    ));
+    let subscriber = tokio::sync::Mutex::new(node_a.router().unwrap().subscribe_authenticated());
     BenchSetup {
         _nodes: (node_a, node_b),
         router_b,
@@ -179,14 +233,13 @@ async fn setup_tcp(
     String,
     String,
 ) {
-    let port = free_port().await;
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr = "127.0.0.1:0".parse().unwrap();
 
     let mut node_a = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new()) as Arc<dyn Transport>)
         .build(node_opts(Some(("tcp", addr)), security))
         .unwrap();
-    node_a.start().await.unwrap();
+    let addr = start_listener(&mut node_a).await;
 
     let mut node_b = NodeBuilder::new()
         .add_transport(Arc::new(TcpTransport::new_dial()) as Arc<dyn Transport>)
@@ -194,7 +247,10 @@ async fn setup_tcp(
         .unwrap();
     node_b.start().await.unwrap();
 
-    let session_id = node_b.connect("tcp", addr).await.unwrap();
+    let session_id = tokio::time::timeout(BATCH_TIMEOUT, node_b.connect("tcp", addr))
+        .await
+        .expect("TCP dial timed out")
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let router_b = node_b.router().unwrap();
@@ -203,10 +259,8 @@ async fn setup_tcp(
     (node_a, node_b, router_b, session_id, peer_a, peer_b)
 }
 
-// UDP uses two independent sockets rather than UdpTransport's shared accept-loop
-// socket. The shared-socket design would create a race between the accept loop's
-// recv_from and the inbound session reader's recv_from on the same fd, causing
-// ~50% of bench datagrams to be silently discarded by the accept loop.
+// Keep the preconnected sockets here for comparability with the previous
+// loopback bench. Listener/demux is covered by udp_transport_smoke.
 async fn setup_udp(
     security: SecurityProfile,
 ) -> (
@@ -269,8 +323,7 @@ async fn setup_quic(
     String,
     String,
 ) {
-    let port = free_port().await;
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let addr = "127.0.0.1:0".parse().unwrap();
     let quic_opts = QuicTransportOptions::default();
 
     let mut node_a = NodeBuilder::new()
@@ -280,7 +333,7 @@ async fn setup_quic(
         )
         .build(node_opts(Some(("quic", addr)), security))
         .unwrap();
-    node_a.start().await.unwrap();
+    let addr = start_listener(&mut node_a).await;
 
     let mut node_b = NodeBuilder::new()
         .add_transport(Arc::new(QuicTransport::new_dial(quic_opts)) as Arc<dyn Transport>)
@@ -288,7 +341,10 @@ async fn setup_quic(
         .unwrap();
     node_b.start().await.unwrap();
 
-    let session_id = node_b.connect("quic", addr).await.unwrap();
+    let session_id = tokio::time::timeout(BATCH_TIMEOUT, node_b.connect("quic", addr))
+        .await
+        .expect("QUIC dial timed out")
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let router_b = node_b.router().unwrap();
@@ -313,27 +369,42 @@ fn register_protocol_benches(
         let batch = batch_for_payload(size);
         let label = format_size_label(size);
         let bench_id = BenchmarkId::new(proto.as_str(), format!("{label}/{}", security.label));
-        group.throughput(Throughput::Bytes(batch as u64 * size as u64));
-
+        if matches!(proto, Protocol::Udp) && std::env::var_os("LP2LN_BENCH_UDP").is_none() {
+            continue;
+        }
         let setup = rt.block_on(setup(proto, security));
-        let _keepalive = setup._nodes;
-        let router_b = setup.router_b;
-        let session_id = setup.session_id;
-        let peer_a = setup.peer_a;
-        let peer_b = setup.peer_b;
-        let subscriber = setup.subscriber;
+        let next_id = AtomicU64::new(1);
+        let pkt = make_packet(size, &setup.peer_b, &setup.peer_a);
 
-        group.bench_function(bench_id, |b| {
-            let r = router_b.clone();
-            let sid = session_id.clone();
-            let pkt = make_packet(size, &peer_b, &peer_a);
-            let sub = subscriber.clone();
-            b.to_async(rt).iter(|| async {
-                for _ in 0..batch {
-                    r.send_to_session(sid.clone(), pkt.clone()).await.unwrap();
-                }
-                drain_batch(sub.clone(), batch).await;
+        if matches!(proto, Protocol::Udp) {
+            let sample = rt.block_on(run_batch(&setup, &pkt, &next_id, batch, proto, None));
+            sample.print(&format!("udp/{label}/{}", security.label), batch, size);
+            eprintln!(
+                "[udp ingress] {label}/{} {:?}",
+                security.label,
+                setup._nodes.0.router().unwrap().ingress_metrics(),
+            );
+        } else {
+            // Fixed throughput is valid only for the reliable scenarios that
+            // assert receipt of every unique message.
+            group.throughput(Throughput::Bytes(batch as u64 * size as u64));
+            group.bench_function(bench_id, |b| {
+                b.to_async(rt).iter(|| async {
+                    let sample = run_batch(&setup, &pkt, &next_id, batch, proto, None).await;
+                    assert_eq!(
+                        sample.latencies.len(),
+                        batch,
+                        "reliable batch lost messages: {:?}, subscriber lag={}",
+                        setup._nodes.0.router().unwrap().ingress_metrics(),
+                        sample.subscriber_lag
+                    );
+                });
             });
+        }
+        let (receiver, sender) = setup._nodes;
+        rt.block_on(async {
+            receiver.stop().await.unwrap();
+            sender.stop().await.unwrap();
         });
     }
 }
@@ -385,25 +456,136 @@ fn node_throughput_prod(c: &mut Criterion) {
     group.finish();
 }
 
-/// Wait until `count` packets arrive on the broadcast receiver.
-/// Lagged errors mean the pipeline processed packets faster than we polled –
-/// count them as received since they went through the full stack.
-async fn drain_batch(
-    sub: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<IncomingPacket>>>>,
-    count: usize,
-) {
-    let mut rx = sub.lock().await;
-    let mut received = 0;
-    while received < count {
-        match rx.recv().await {
-            Ok(_) => received += 1,
-            Err(RecvError::Lagged(n)) => received += n as usize,
-            Err(RecvError::Closed) => break,
-        }
+#[derive(Default)]
+struct DeliverySample {
+    latencies: Vec<Duration>,
+    jitter: Duration,
+    elapsed: Duration,
+    subscriber_lag: u64,
+}
+
+impl DeliverySample {
+    fn print(&self, label: &str, sent: usize, payload_size: usize) {
+        let delivered = self.latencies.len();
+        let mut latencies = self.latencies.clone();
+        latencies.sort_unstable();
+        let percentile_us = |p: usize| {
+            let index = (latencies.len() * p).div_ceil(100).saturating_sub(1);
+            latencies.get(index).map(Duration::as_micros)
+        };
+        let loss = 100.0 * (sent - delivered) as f64 / sent as f64;
+        let goodput = (delivered * payload_size) as f64 / self.elapsed.as_secs_f64();
+        eprintln!(
+            "[delivery] {label} sent={sent} delivered={delivered} loss_pct={loss:.2}              goodput_Bps={goodput:.0} p50_us={:?} p95_us={:?} p99_us={:?}              jitter_us={} subscriber_lag={}",
+            percentile_us(50),
+            percentile_us(95),
+            percentile_us(99),
+            self.jitter.as_micros(),
+            self.subscriber_lag
+        );
     }
 }
 
-// в”Ђв”Ђ optional CPU probe в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+async fn run_batch(
+    setup: &BenchSetup,
+    template: &Packet,
+    next_id: &AtomicU64,
+    count: usize,
+    protocol: Protocol,
+    interval: Option<Duration>,
+) -> DeliverySample {
+    let first_id = next_id.fetch_add(count as u64, Ordering::Relaxed);
+    let mut sent_at = Vec::with_capacity(count);
+    let mut received_at = vec![None; count];
+    let mut received = 0;
+    let mut subscriber_lag = 0;
+    let started = Instant::now();
+    let mut rx = setup.subscriber.lock().await;
+    let future = async {
+        let send = async {
+            for offset in 0..count {
+                if let Some(interval) = interval {
+                    tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(started) + interval * offset as u32,
+                    )
+                    .await;
+                }
+                let mut packet = template.clone();
+                packet.request_id = Some(first_id + offset as u64);
+                let sending = Instant::now();
+                setup
+                    .router_b
+                    .send_to_session(setup.session_id.clone(), packet)
+                    .await
+                    .unwrap();
+                sent_at.push(sending);
+            }
+        };
+        let receive = async {
+            while received < count {
+                let incoming = match rx.recv().await {
+                    Ok(incoming) => incoming,
+                    Err(RecvError::Lagged(n)) => {
+                        subscriber_lag += n;
+                        continue;
+                    }
+                    Err(RecvError::Closed) => break,
+                };
+                let packet = &incoming.packet;
+                if packet.sender != template.sender
+                    || packet.receiver != template.receiver
+                    || packet.protocol_id != Some(BENCH_PROTOCOL_ID)
+                    || packet.data != template.data
+                {
+                    continue;
+                }
+                let Some(offset) = packet.request_id.and_then(|id| id.checked_sub(first_id)) else {
+                    continue;
+                };
+                if let Some(slot) = received_at.get_mut(offset as usize) {
+                    if slot.is_none() {
+                        *slot = Some(Instant::now());
+                        received += 1;
+                    }
+                }
+            }
+        };
+        tokio::join!(send, receive);
+    };
+    let deadline = if matches!(protocol, Protocol::Udp) {
+        UDP_OBSERVATION_WINDOW
+    } else {
+        BATCH_TIMEOUT
+    } + interval.unwrap_or_default() * count as u32;
+    let _ = tokio::time::timeout(deadline, future).await;
+    assert_eq!(
+        sent_at.len(),
+        count,
+        "sender did not submit the whole batch before the deadline"
+    );
+    let mut latencies = Vec::with_capacity(received);
+    let mut last_latency: Option<Duration> = None;
+    let mut jitter_secs = 0.0;
+    for (send, receive) in sent_at.into_iter().zip(received_at) {
+        let Some(receive) = receive else {
+            last_latency = None;
+            continue;
+        };
+        let latency = receive.saturating_duration_since(send);
+        if let Some(last) = last_latency {
+            let delta = (latency.as_secs_f64() - last.as_secs_f64()).abs();
+            jitter_secs += (delta - jitter_secs) / 16.0;
+        }
+        last_latency = Some(latency);
+        latencies.push(latency);
+    }
+    DeliverySample {
+        latencies,
+        jitter: Duration::from_secs_f64(jitter_secs),
+        elapsed: started.elapsed(),
+        subscriber_lag,
+    }
+}
 
 struct CpuSample {
     core_index: usize,
@@ -413,19 +595,21 @@ struct CpuSample {
 async fn cpu_probe() {
     use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-    const PROBE_SECS: u64 = 8;
+    let probe_secs = std::env::var("LP2LN_BENCH_PROBE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
     const PAYLOAD: usize = 8 * 1024;
     let batch = batch_for_payload(PAYLOAD);
 
     eprintln!(
-        "\n[LP2LN_BENCH_CPU] {PROBE_SECS}s QUIC 8KB probe (verify_off, full crypto egress/ingress)..."
+        "\n[LP2LN_BENCH_CPU] {probe_secs}s QUIC 8KB probe (verify_on, full crypto egress/ingress)..."
     );
 
-    let setup = setup(Protocol::Quic, VERIFY_OFF).await;
-    let router_b = setup.router_b;
-    let sid = setup.session_id;
+    let setup = setup(Protocol::Quic, VERIFY_ON).await;
     let pkt = make_packet(PAYLOAD, &setup.peer_b, &setup.peer_a);
-    let sub = setup.subscriber;
+    let next_id = AtomicU64::new(1);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_sampler = stop.clone();
@@ -438,6 +622,7 @@ async fn cpu_probe() {
         let pid = sysinfo::get_current_pid().ok();
         let mut core_peak: Vec<f32> = Vec::new();
         let mut process_peak = 0.0f32;
+        let mut rss_peak = 0u64;
 
         while !stop_sampler.load(Ordering::Relaxed) {
             system.refresh_cpu_usage();
@@ -445,6 +630,7 @@ async fn cpu_probe() {
                 system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                 if let Some(proc_) = system.process(pid) {
                     process_peak = process_peak.max(proc_.cpu_usage());
+                    rss_peak = rss_peak.max(proc_.memory());
                 }
             }
             for (i, cpu) in system.cpus().iter().enumerate() {
@@ -466,31 +652,80 @@ async fn cpu_probe() {
                 max_util_pct,
             })
             .collect();
-        (samples, process_peak)
+        (samples, process_peak, rss_peak)
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(PROBE_SECS);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(probe_secs);
+    let measure_allocator = std::env::var_os("LP2LN_BENCH_ALLOCATIONS").is_some();
+    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    REQUESTED_BYTES.store(0, Ordering::Relaxed);
+    COUNT_ALLOCATIONS.store(measure_allocator, Ordering::Relaxed);
     let mut iterations = 0u64;
     while tokio::time::Instant::now() < deadline {
-        for _ in 0..batch {
-            router_b
-                .send_to_session(sid.clone(), pkt.clone())
-                .await
-                .unwrap();
-        }
-        drain_batch(sub.clone(), batch).await;
+        let sample = run_batch(&setup, &pkt, &next_id, batch, Protocol::Quic, None).await;
+        assert_eq!(sample.latencies.len(), batch, "CPU probe lost messages");
         iterations += 1;
     }
 
+    COUNT_ALLOCATIONS.store(false, Ordering::Relaxed);
+    let seconds = started.elapsed().as_secs_f64();
+    let packets = iterations * batch as u64;
+    let rate = packets as f64 / seconds;
+    eprintln!(
+        "[burst] delivered={packets} pps={rate:.1} goodput_mib_per_sec={:.2} alloc_calls={} requested_bytes={}",
+        rate * PAYLOAD as f64 / (1024.0 * 1024.0),
+        ALLOCATION_CALLS.load(Ordering::Relaxed),
+        REQUESTED_BYTES.load(Ordering::Relaxed),
+    );
+    let receiver = &setup._nodes.0;
+    let sample = run_batch(
+        &setup,
+        &make_packet(100, &setup.peer_b, &setup.peer_a),
+        &next_id,
+        250,
+        Protocol::Quic,
+        Some(Duration::from_millis(20)),
+    )
+    .await;
+    sample.print("quic/100B/verify_on/50pps", 250, 100);
+    let queues = receiver.router().unwrap().ingress_metrics();
+    eprintln!(
+        "[ingress] decoded={} authenticated={} authenticated_local={} replay_or_late={} queue_drops={}          queue_age_mean_us={} queue_age_max_us={}",
+        queues.decoded_packets,
+        queues.authenticated_packets,
+        queues.authenticated_local_packets,
+        queues.replay_or_late_rejections,
+        queues.processor_queue_drops,
+        queues.processor_queue_wait_total_micros / queues.processor_queue_samples.max(1),
+        queues.processor_queue_wait_max_micros,
+    );
+
+    // ADMISSION_PROFILE_BEGIN
+    let rx = receiver.router().unwrap().ingress_memory();
+    let tx = setup._nodes.1.router().unwrap().egress_contention();
+    eprintln!(
+        "[admission] ingress_peak_bytes={} ingress_refused={} ingress_contended={} egress_contended={} egress_wait_us={} reliable_transport_refused={} reliable_dispatch_refused={}",
+        rx.peak_bytes,
+        rx.refused,
+        rx.contended,
+        tx.contended,
+        tx.waited_micros,
+        rx.reliable_refused,
+        queues.reliable_admission_failures
+    );
+    // ADMISSION_PROFILE_END
     stop.store(true, Ordering::Relaxed);
-    let (core_samples, process_peak) = sampler.join().expect("cpu sampler thread");
+    let (core_samples, process_peak, rss_peak) = sampler.join().expect("cpu sampler thread");
 
     let hottest = core_samples.iter().max_by(|a, b| {
         a.max_util_pct
             .partial_cmp(&b.max_util_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    eprintln!("[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%");
+    eprintln!(
+        "[LP2LN_BENCH_CPU] iterations={iterations}, process_peak={process_peak:.1}%, rss_peak_bytes={rss_peak}"
+    );
     if let Some(h) = hottest {
         eprintln!(
             "[LP2LN_BENCH_CPU] hottest core: #{} at {:.1}% – {}",

@@ -10,11 +10,15 @@
 //!
 //! A separate JSON debug IPC (`ipc_tcp.rs`) remains unchanged.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+
+use crate::router::Router;
+use crate::router::admission::{IngressBudget, IngressPermit};
 
 pub use lp2ln_app_protocol::{
     AppCapability, AppCmd, AppErrorCode, AppEvent, DEFAULT_STREAM_CREDITS, MAX_FRAME_BYTES,
@@ -25,14 +29,48 @@ pub use lp2ln_app_protocol::{
 /// Compat alias for [`QUEUE_CAP`].
 pub const APP_PLANE_QUEUE_CAP: usize = QUEUE_CAP;
 
-/// Per-protocol broadcast to registered sidecar connections.
-/// Each connection gets its own bounded channel; if full, the packet is dropped
-/// for that connection only — the router is never blocked, and the subscriber
-/// stays registered (slow sidecar isolation).
+static NEXT_SUBSCRIBER: AtomicU64 = AtomicU64::new(1);
+
+struct Subscriber {
+    id: u64,
+    tx: mpsc::Sender<AppEvent>,
+    charges: VecDeque<IngressPermit>,
+}
+
+impl Subscriber {
+    fn reap(&mut self) {
+        let queued = self.tx.max_capacity() - self.tx.capacity();
+        let released = self.charges.len().saturating_sub(queued);
+        self.charges.drain(..released);
+    }
+}
+
+/// Retains node capacity through IPC decode or socket write. IPC host code
+/// drops this when its allocation leaves the host.
+pub struct AppPlaneMemoryCharge {
+    _permit: IngressPermit,
+}
+
+pub struct AppPlaneConnectionBudget {
+    budget: Arc<IngressBudget>,
+    id: u64,
+}
+
+impl AppPlaneConnectionBudget {
+    pub fn reserve(&self, bytes: usize) -> Option<AppPlaneMemoryCharge> {
+        self.budget
+            .fanout(bytes, Some(self.id))
+            .map(|permit| AppPlaneMemoryCharge { _permit: permit })
+    }
+}
+
+/// Each sidecar gets a bounded best-effort subscription. Retained copies are
+/// charged only until the host receives each event from its subscriber queue.
 #[derive(Clone, Default)]
 pub struct AppPlaneRouter {
-    // protocol_id → list of senders (one per connected sidecar)
-    subs: Arc<DashMap<u16, Vec<mpsc::Sender<AppEvent>>>>,
+    subs: Arc<DashMap<u16, Vec<Subscriber>>>,
+    budget: Arc<IngressBudget>,
+    refused: Arc<AtomicU64>,
 }
 
 impl AppPlaneRouter {
@@ -40,54 +78,102 @@ impl AppPlaneRouter {
         Self::default()
     }
 
-    /// Subscribe to a protocol_id; returns the receiving half.
+    /// Shares the node's fanout byte pool with the legacy rings.
+    pub fn with_router(router: &Router) -> Self {
+        Self {
+            budget: router.ingress_budget().clone(),
+            ..Self::default()
+        }
+    }
+
+    pub fn connection_budget(&self) -> Arc<AppPlaneConnectionBudget> {
+        Arc::new(AppPlaneConnectionBudget {
+            budget: self.budget.clone(),
+            id: NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
     pub fn subscribe(&self, protocol_id: u16) -> mpsc::Receiver<AppEvent> {
         let (tx, rx) = mpsc::channel(QUEUE_CAP);
-        self.subs.entry(protocol_id).or_default().push(tx);
+        let id = NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed);
+        self.subs.entry(protocol_id).or_default().push(Subscriber {
+            id,
+            tx,
+            charges: VecDeque::new(),
+        });
         rx
     }
 
-    /// Remove closed senders for a protocol_id (connection close / unsubscribe).
     pub fn prune(&self, protocol_id: u16) {
         if let Some(mut entry) = self.subs.get_mut(&protocol_id) {
-            entry.retain(|tx| !tx.is_closed());
-            if entry.is_empty() {
-                drop(entry);
-                self.subs.remove(&protocol_id);
-            }
+            entry.retain_mut(|sub| {
+                sub.reap();
+                !sub.tx.is_closed()
+            });
         }
+        self.subs
+            .remove_if(&protocol_id, |_, entry| entry.is_empty());
     }
 
-    /// Number of live senders for `protocol_id` (tests / diagnostics).
     pub fn subscriber_count(&self, protocol_id: u16) -> usize {
         self.subs
             .get(&protocol_id)
-            .map(|e| e.iter().filter(|tx| !tx.is_closed()).count())
+            .map(|entry| entry.iter().filter(|sub| !sub.tx.is_closed()).count())
             .unwrap_or(0)
     }
 
-    /// Dispatch an incoming event to all live subscribers for `protocol_id`.
-    /// Full queues drop the frame for that subscriber only — never remove a healthy sub.
+    pub fn record_refused(&self, count: u64) {
+        self.refused.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
     pub fn dispatch(&self, protocol_id: u16, ev: AppEvent) {
-        let AppEvent::Incoming { from, payload, .. } = ev else {
-            return;
-        };
+        if let AppEvent::Incoming { from, payload, .. } = ev {
+            self.dispatch_incoming(protocol_id, &from, &payload);
+        }
+    }
+
+    /// Reserves each actual payload allocation before cloning for a subscriber.
+    pub fn dispatch_incoming(&self, protocol_id: u16, from: &str, payload: &[u8]) {
         if let Some(mut entry) = self.subs.get_mut(&protocol_id) {
-            entry.retain(|tx| {
-                if tx.is_closed() {
-                    return false;
-                }
-                match tx.try_send(AppEvent::Incoming {
-                    from: from.clone(),
+            entry.retain_mut(|sub| {
+                sub.reap();
+                let slot = match sub.tx.try_reserve() {
+                    Ok(slot) => slot,
+                    Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                };
+                let bytes = payload.len() + from.len() + std::mem::size_of::<AppEvent>() + 128;
+                let Some(charge) = self.budget.fanout(bytes, Some(sub.id)) else {
+                    self.refused.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                };
+                sub.charges.push_back(charge);
+                slot.send(AppEvent::Incoming {
+                    from: from.to_owned(),
                     protocol_id,
-                    payload: payload.clone(),
-                }) {
-                    Ok(()) => true,
-                    Err(TrySendError::Full(_)) => true,
-                    Err(TrySendError::Closed(_)) => false,
-                }
+                    payload: payload.to_vec(),
+                });
+                true
             });
         }
+    }
+
+    /// Release charges from idle legacy receivers that consumed their items.
+    pub fn reap(&self) {
+        self.subs.retain(|_, entry| {
+            entry.retain_mut(|sub| {
+                sub.reap();
+                !sub.tx.is_closed()
+            });
+            !entry.is_empty()
+        });
     }
 }
 

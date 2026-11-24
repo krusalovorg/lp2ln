@@ -26,7 +26,6 @@ use crate::peer_score::{
 };
 use crate::protocol::control::NetworkControlPayload;
 use crate::router::Router;
-use crate::sessions::session::IncomingPacket;
 use crate::topology::{
     CapacityBudget, NodeDescriptor, PeerCatalog, PeerDirectory, SmartMeshPlanner, TopologyPlanner,
     TopologyReconciler, TopologySnapshot, now_ms, parse_observed_addr_line,
@@ -125,7 +124,6 @@ fn build_topology_snapshot(
 struct TopologyMaintenanceCtx<'a> {
     transports: &'a [Arc<dyn Transport>],
     router: &'a Arc<Router>,
-    incoming: &'a tokio::sync::mpsc::Sender<IncomingPacket>,
     our_peer_id: &'a str,
     nat_state: &'a Arc<NatTraversalState>,
     catalog: &'a Arc<PeerCatalog>,
@@ -181,7 +179,7 @@ async fn process_nat_jobs(ctx: &TopologyMaintenanceCtx<'_>, cancel: &Cancellatio
                             session_id.clone(),
                             session.clone(),
                         );
-                        session.spawn_reader(ctx.incoming.clone());
+                        ctx.router.start_session_reader(session);
                         crate::info!(
                             "[NodeRuntime] NAT tunnel established: peer={} session={} target={}",
                             peer_id,
@@ -346,7 +344,6 @@ pub(crate) async fn run_topology_maintenance_loop(
     let loop_ctx = TopologyMaintenanceCtx {
         transports: &transports,
         router: &router,
-        incoming: &incoming,
         our_peer_id: &our_peer_id,
         nat_state: &nat_state,
         catalog: &catalog,

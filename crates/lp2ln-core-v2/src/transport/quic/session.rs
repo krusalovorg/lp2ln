@@ -1,4 +1,5 @@
-﻿use std::io::ErrorKind;
+use crate::router::admission::{IngressPermit, ReaderIngress};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,10 +8,13 @@ use crate::event_core::prelude::{
     CoreEvent, ServiceDescriptor, ServiceKind, TransportEvent, TransportProtocol,
 };
 use crate::packet::Packet;
+#[cfg(feature = "packet-trace")]
+use crate::packet_trace::{self, LinkEvent, Stage};
 use crate::protocol::handshake::decode_hello;
 use crate::sessions::session::{IncomingPacket, LinkKind, Session};
 use crate::transport::quic::adaptive::AdaptiveLossConfig;
 use crate::transport::tcp::codec::{decode_packet, encode_packet, read_frame, write_frame};
+use crate::transport::writer_queue::{STREAM_QUEUE_BYTES, WriterQueue};
 use anyhow::Result;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -49,13 +53,15 @@ pub struct QuicSession {
     id: String,
     peer_id: Option<String>,
     kind: LinkKind,
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    tx: WriterQueue,
     read: tokio::sync::Mutex<RecvStream>,
     connection: Connection,
     // Endpoint must outlive the connection (quinn requirement).
     _endpoint: Arc<Endpoint>,
+    native_credit: std::sync::Mutex<Option<IngressPermit>>,
     shutdown: CancellationToken,
     task_tracker: tokio_util::task::TaskTracker,
+    reader_started: std::sync::atomic::AtomicBool,
     pub in_compensate: Arc<AtomicBool>,
 }
 
@@ -83,12 +89,7 @@ impl Session for QuicSession {
     }
 
     async fn send_wire(&self, encoded: Vec<u8>) -> Result<u64> {
-        let len = encoded.len() as u64;
-        self.tx
-            .send(encoded)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send packet to QUIC writer task: {}", e))?;
-        Ok(len)
+        self.tx.send(encoded).await
     }
 
     fn is_degraded(&self) -> bool {
@@ -110,6 +111,26 @@ impl Session for QuicSession {
         self: Arc<Self>,
         incoming_packets_tx: tokio::sync::mpsc::Sender<IncomingPacket>,
     ) {
+        self.start_reader(ReaderIngress::Legacy(incoming_packets_tx));
+    }
+
+    fn spawn_budgeted_reader(self: Arc<Self>, ingress: crate::router::SessionIngress) {
+        self.start_reader(ReaderIngress::Budgeted(ingress));
+    }
+}
+
+impl QuicSession {
+    pub(super) fn hold_receive_credit(&self, permit: Option<IngressPermit>) {
+        *self.native_credit.lock().unwrap() = permit;
+    }
+
+    fn start_reader(self: Arc<Self>, ingress: ReaderIngress) {
+        if self
+            .reader_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let session_id = self.id().to_string();
         let peer_id = self.peer_id().map(|s| s.to_string());
         let shutdown = self.shutdown.clone();
@@ -119,26 +140,29 @@ impl Session for QuicSession {
             loop {
                 let read_result = tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    result = self.read_packet() => result,
+                    result = self.read_packet(&ingress) => result,
                 };
                 match read_result {
-                    Ok(pkt) => {
-                        if incoming_packets_tx
-                            .send(IncomingPacket {
-                                session_id: session_id.clone(),
-                                from_node: peer_id.clone(),
-                                packet: pkt,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            crate::warn!(
-                                "[QuicSession] Incoming packets channel closed, stopping reader"
-                            );
-                            break;
+                    Ok((pkt, permit)) => {
+                        let incoming = IncomingPacket {
+                            session_id: session_id.clone(),
+                            from_node: peer_id.clone(),
+                            packet: pkt,
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            sent = ingress.submit(incoming, permit) => {
+                                if let Err(error) = sent {
+                                    crate::warn!("reliable ingress handoff failed for {}: {}", session_id, error);
+                                    break;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
+                        #[cfg(feature = "packet-trace")]
+                        packet_trace::link_event(LinkEvent::ReadEnded);
                         if is_benign_quic_disconnect(&e) {
                             crate::net_disconnect!(
                                 "[QuicSession] Peer disconnected (session={})",
@@ -147,16 +171,14 @@ impl Session for QuicSession {
                         } else {
                             crate::error!("[QuicSession] Read error for {}: {}", session_id, e);
                         }
-                        let _ = self.close().await;
                         break;
                     }
                 }
             }
+            let _ = self.close().await;
         });
     }
-}
 
-impl QuicSession {
     pub fn new_from_streams(
         endpoint: Arc<Endpoint>,
         connection: Connection,
@@ -168,7 +190,10 @@ impl QuicSession {
         adaptive: Option<AdaptiveLossConfig>,
     ) -> Result<Arc<Self>> {
         let id = Uuid::new_v4().to_string();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let (tx, mut rx) = WriterQueue::channel(
+            STREAM_QUEUE_BYTES,
+            crate::transport::tcp::codec::MAX_FRAME_BYTES,
+        );
         let shutdown = CancellationToken::new();
         let task_tracker = tokio_util::task::TaskTracker::new();
         let in_compensate = Arc::new(AtomicBool::new(false));
@@ -184,13 +209,16 @@ impl QuicSession {
             read: tokio::sync::Mutex::new(recv),
             connection,
             _endpoint: endpoint,
+            native_credit: std::sync::Mutex::new(None),
             shutdown: shutdown.clone(),
             task_tracker: task_tracker.clone(),
+            reader_started: std::sync::atomic::AtomicBool::new(false),
             in_compensate: in_compensate.clone(),
         });
 
         let mut writer = send;
         let writer_shutdown = shutdown.clone();
+        let writer_connection = session.connection.clone();
         task_tracker.spawn(async move {
             loop {
                 let data = tokio::select! {
@@ -200,24 +228,39 @@ impl QuicSession {
                         None => break,
                     },
                 };
-                let write_result =
-                    tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut writer, &data)).await;
+                let write_result = tokio::select! {
+                    biased;
+                    _ = writer_shutdown.cancelled() => break,
+                    result = tokio::time::timeout(WRITE_TIMEOUT, write_frame(&mut writer, &data.data)) => result,
+                };
                 match write_result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        #[cfg(feature = "packet-trace")]
+                        packet_trace::record_wire(&data.data, Stage::StreamWritten);
+                    }
                     Ok(Err(e)) => {
+                        #[cfg(feature = "packet-trace")]
+                        packet_trace::link_event(LinkEvent::WriteFailed);
                         if !is_benign_quic_disconnect(&e) {
                             crate::error!("[QuicSession] Write error: {}", e);
                         }
+                        writer_shutdown.cancel();
                         break;
                     }
                     Err(_) => {
+                        #[cfg(feature = "packet-trace")]
+                        packet_trace::link_event(LinkEvent::WriteFailed);
                         crate::warn!("[QuicSession] Write timed out, closing session");
                         writer_shutdown.cancel();
                         break;
                     }
                 }
             }
-            let _ = writer.finish();
+            if writer_shutdown.is_cancelled() {
+                writer_connection.close(0u32.into(), b"session closed");
+            } else {
+                let _ = writer.finish();
+            }
         });
 
         // Spawn loss monitor if adaptive loss is enabled and we have an event channel.
@@ -242,10 +285,26 @@ impl QuicSession {
         Ok(session)
     }
 
-    async fn read_packet(&self) -> Result<Packet> {
+    async fn read_packet(
+        &self,
+        ingress: &ReaderIngress,
+    ) -> Result<(Packet, Option<IngressPermit>)> {
         let mut reader = self.read.lock().await;
-        let frame_data = read_frame(&mut *reader).await?;
-        decode_packet(frame_data)
+        use crate::transport::tcp::codec::{
+            MAX_FRAME_BYTES, decode_reservation, read_frame_body, read_frame_len,
+        };
+        let len = read_frame_len(&mut *reader, MAX_FRAME_BYTES).await?;
+        let permit = ingress.reserve(decode_reservation(len)).await?;
+        let frame_data = read_frame_body(&mut *reader, len).await?;
+        #[cfg(feature = "packet-trace")]
+        packet_trace::link_event(LinkEvent::ReadFrame);
+        let packet = decode_packet(frame_data);
+        #[cfg(feature = "packet-trace")]
+        match &packet {
+            Ok(packet) => packet_trace::record(packet, Stage::Decoded),
+            Err(_) => packet_trace::link_event(LinkEvent::DecodeFailed),
+        }
+        Ok((packet?, permit))
     }
 
     #[allow(dead_code)]

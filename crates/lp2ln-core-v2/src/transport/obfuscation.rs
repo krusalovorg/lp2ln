@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, sleep};
 
@@ -99,10 +100,40 @@ impl Obfuscator {
     }
 
     pub async fn read_frame<R: AsyncReadExt + Unpin>(&self, reader: &mut R) -> Result<Vec<u8>> {
-        match self.config.mode {
-            ObfuscationMode::Plain => read_length_prefixed_frame(reader).await,
-            ObfuscationMode::MimicHttp => self.read_http_mimic_frame(reader).await,
-        }
+        Ok(self
+            .read_admitted_frame(reader, None, MAX_HTTP_BODY_BYTES)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn read_admitted_frame<R: AsyncReadExt + Unpin>(
+        &self,
+        reader: &mut R,
+        ingress: Option<&crate::router::admission::ReaderIngress>,
+        max: usize,
+    ) -> Result<(Vec<u8>, Option<crate::router::admission::IngressPermit>)> {
+        use super::tcp::codec::{decode_reservation, read_frame_body, read_frame_len};
+        let (body_len, padding) = match self.config.mode {
+            ObfuscationMode::Plain => (read_frame_len(reader, max).await?, 0),
+            ObfuscationMode::MimicHttp => {
+                let _header_charge = match ingress {
+                    Some(ingress) => ingress.reserve(MAX_HTTP_HEADER_BYTES + 1024).await?,
+                    None => None,
+                };
+                let headers = read_http_headers(reader).await?;
+                let header_text = std::str::from_utf8(&headers)?;
+                parse_http_lengths(header_text)?
+            }
+        };
+        anyhow::ensure!(body_len <= max, "frame body exceeds {max} bytes");
+        anyhow::ensure!(padding <= body_len, "padding exceeds frame body");
+        let permit = match ingress {
+            Some(ingress) => ingress.reserve(decode_reservation(body_len)).await?,
+            None => None,
+        };
+        let mut body = read_frame_body(reader, body_len).await?;
+        body.truncate(body_len - padding);
+        Ok((body, permit))
     }
 
     async fn write_http_mimic_frame<W: AsyncWriteExt + Unpin>(
@@ -119,41 +150,6 @@ impl Obfuscator {
         write_chunked(writer, body, &self.config).await?;
         writer.flush().await?;
         Ok(())
-    }
-
-    async fn read_http_mimic_frame<R: AsyncReadExt + Unpin>(
-        &self,
-        reader: &mut R,
-    ) -> Result<Vec<u8>> {
-        let header_bytes = read_http_headers(reader).await?;
-        let header_text = std::str::from_utf8(&header_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 HTTP headers: {}", e))?;
-        let (content_length, padding_len) = parse_http_lengths(header_text)?;
-
-        if content_length > MAX_HTTP_BODY_BYTES {
-            return Err(anyhow::anyhow!(
-                "HTTP-mimic body too large: {} bytes",
-                content_length
-            ));
-        }
-        if padding_len > content_length {
-            return Err(anyhow::anyhow!(
-                "Invalid HTTP-mimic payload: padding {} > length {}",
-                padding_len,
-                content_length
-            ));
-        }
-
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                anyhow::anyhow!("Connection closed while reading HTTP-mimic body")
-            } else {
-                anyhow::anyhow!("Failed to read HTTP-mimic body: {}", e)
-            }
-        })?;
-        body.truncate(content_length - padding_len);
-        Ok(body)
     }
 
     fn encode_http_mimic_datagram(&self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -309,10 +305,10 @@ async fn read_http_headers<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Ve
                 anyhow::anyhow!("Failed to read HTTP-mimic headers: {}", e)
             }
         })?;
-        buf.push(byte[0]);
-        if buf.len() > MAX_HTTP_HEADER_BYTES {
+        if buf.len() == MAX_HTTP_HEADER_BYTES {
             return Err(anyhow::anyhow!("HTTP-mimic headers exceed max size"));
         }
+        buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
             return Ok(buf);
         }
@@ -327,47 +323,24 @@ async fn write_length_prefixed_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     data: &[u8],
 ) -> Result<()> {
-    let len = data.len() as u32;
-    writer
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write plain frame length: {}", e))?;
-    writer
-        .write_all(data)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write plain frame data: {}", e))?;
+    let length = (data.len() as u32).to_be_bytes();
+    let written = if writer.is_write_vectored() {
+        writer
+            .write_vectored(&[IoSlice::new(&length), IoSlice::new(data)])
+            .await?
+    } else {
+        0
+    };
+    if written < length.len() {
+        writer.write_all(&length[written..]).await?;
+    }
+    let payload_written = written.saturating_sub(length.len());
+    writer.write_all(&data[payload_written..]).await?;
     writer
         .flush()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to flush plain frame writer: {}", e))?;
     Ok(())
-}
-
-async fn read_length_prefixed_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
-    let mut len_bytes = [0u8; 4];
-    reader.read_exact(&mut len_bytes).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            anyhow::anyhow!("Connection closed by peer")
-        } else {
-            anyhow::anyhow!("Failed to read plain frame length: {}", e)
-        }
-    })?;
-    let packet_len = u32::from_be_bytes(len_bytes) as usize;
-    if packet_len > MAX_HTTP_BODY_BYTES {
-        return Err(anyhow::anyhow!(
-            "Packet size too large: {} bytes",
-            packet_len
-        ));
-    }
-    let mut packet_bytes = vec![0u8; packet_len];
-    reader.read_exact(&mut packet_bytes).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            anyhow::anyhow!("Connection closed by peer")
-        } else {
-            anyhow::anyhow!("Failed to read plain frame data: {}", e)
-        }
-    })?;
-    Ok(packet_bytes)
 }
 
 fn pick_or_default(values: &[String], fallback: &str) -> String {
@@ -440,5 +413,76 @@ fn bounded_u64(min: u64, max: u64) -> u64 {
         min
     } else {
         rand::rng().random_range(min..=max)
+    }
+}
+
+#[cfg(test)]
+mod plain_frame_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    struct PartialWriter {
+        bytes: Vec<u8>,
+        first_write_limit: usize,
+        vectored_writes: usize,
+    }
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            parts: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes += 1;
+            let mut written = 0;
+            for part in parts {
+                let take = part.len().min(self.first_write_limit - written);
+                self.bytes.extend_from_slice(&part[..take]);
+                written += take;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_plain_frame_keeps_wire_bytes_after_partial_writes() {
+        let payload = b"packet";
+        for first_write_limit in [2, 4, 6, 32] {
+            let mut writer = PartialWriter {
+                bytes: Vec::new(),
+                first_write_limit,
+                vectored_writes: 0,
+            };
+            write_length_prefixed_frame(&mut writer, payload)
+                .await
+                .unwrap();
+            assert_eq!(writer.vectored_writes, 1);
+            assert_eq!(writer.bytes, b"\0\0\0\x06packet");
+        }
     }
 }

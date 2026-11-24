@@ -145,7 +145,7 @@ fn packet(data: Vec<u8>) -> Packet {
         signature: None,
         data,
         nodes: Vec::new(),
-        sender: "sender".to_string(),
+        sender: "router-self".to_string(),
         receiver: String::new(),
         max_hops: 8,
         request_id: None,
@@ -257,7 +257,8 @@ async fn router_refuses_to_put_chunked_packet_on_a_udp_only_link() {
 async fn router_sends_chunked_packet_over_the_reliable_link_when_one_exists() {
     let (router, _manager) = test_router();
     let udp = RecordingSession::new_with_kind("sess-udp", Some("peer-bulk"), LinkKind::DirectUdp);
-    let quic = RecordingSession::new_with_kind("sess-quic", Some("peer-bulk"), LinkKind::DirectQuic);
+    let quic =
+        RecordingSession::new_with_kind("sess-quic", Some("peer-bulk"), LinkKind::DirectQuic);
     router.register_session(
         PeerId::from("peer-bulk"),
         SessionId::from("sess-udp"),
@@ -335,7 +336,7 @@ async fn router_prefers_direct_session_over_fallback_neighbors() {
 }
 
 #[tokio::test]
-async fn router_fallback_fans_out_to_neighbors_but_skips_excluded_and_path_peers() {
+async fn router_fallback_skips_excluded_and_path_peers() {
     let (router, _manager) = test_router();
     let mut sessions = Vec::new();
     for i in 0..5 {
@@ -350,8 +351,10 @@ async fn router_fallback_fans_out_to_neighbors_but_skips_excluded_and_path_peers
     }
 
     let mut routed = packet(b"payload".to_vec());
+    routed.sender = "original-author".to_string();
+    routed.request_id = Some(42);
     routed.nodes.push("neighbor-2".to_string());
-    router
+    let request_id = router
         .send_to_peer(
             PeerId::from("missing-target"),
             routed,
@@ -360,10 +363,30 @@ async fn router_fallback_fans_out_to_neighbors_but_skips_excluded_and_path_peers
         .await
         .expect("fallback send");
 
+    assert_eq!(request_id, 42);
     let total_sent: usize = sessions.iter().map(|(_, s)| s.sent_len()).sum();
     assert_eq!(total_sent, 1, "fallback sends to one eligible neighbor");
     assert_eq!(sessions[1].1.sent_len(), 0, "exclude_from peer was flooded");
     assert_eq!(sessions[2].1.sent_len(), 0, "path peer was flooded");
+}
+
+#[tokio::test]
+async fn router_cannot_assign_a_request_id_to_a_forwarded_packet() {
+    let (router, _) = test_router();
+    let target = RecordingSession::new("sess-target", Some("peer-target"));
+    router.register_session(
+        PeerId::from("peer-target"),
+        SessionId::from("sess-target"),
+        target.clone(),
+    );
+    let mut forwarded = packet(b"payload".to_vec());
+    forwarded.sender = "original-author".to_string();
+    let err = router
+        .send_to_peer(PeerId::from("peer-target"), forwarded, None)
+        .await
+        .expect_err("missing author request ID");
+    assert!(err.to_string().contains("forwarded packet is missing"));
+    assert_eq!(target.sent_len(), 0);
 }
 
 #[tokio::test]

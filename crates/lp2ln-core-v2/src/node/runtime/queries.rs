@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::node::options::NodeRole;
 use crate::node::runtime::NodeRuntime;
-use crate::storage::block_transfer::BlockTransferService;
-use crate::storage::dht::DhtService;
 use crate::node::runtime::health::{RuntimeHealthSnapshot, RuntimeMode};
 use crate::node::runtime::lifecycle::NodeLifecycleState;
 use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
 use crate::router::Router;
 use crate::sessions::{LinkKind, SessionMetrics};
+use crate::storage::block_transfer::BlockTransferService;
+use crate::storage::dht::DhtService;
 use crate::topology::PeerCatalog;
 use crate::types::PeerId;
 
@@ -48,6 +48,10 @@ impl NodeRuntime {
 
     pub fn peer_catalog(&self) -> Arc<PeerCatalog> {
         self.peer_catalog.clone()
+    }
+
+    pub fn lan_dial_hints(&self, limit: usize) -> Vec<(PeerId, String, SocketAddr)> {
+        self.peer_dir.lan_hints(crate::topology::now_ms(), limit)
     }
 
     pub fn register_known_peer_addr(

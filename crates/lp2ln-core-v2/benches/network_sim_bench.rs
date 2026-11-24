@@ -386,7 +386,10 @@ fn routing_delivery(c: &mut Criterion, node_sizes: &[usize]) {
                                 MAX_HOPS,
                                 Some(rid),
                             );
-                            network.send_from(source, pkt).await.expect("send");
+                            tokio::time::timeout(WAIT_TIMEOUT, network.send_from(source, pkt))
+                                .await
+                                .expect("simulation enqueue timed out")
+                                .expect("send");
                             let mut guard = rx.lock().await;
                             let hops = wait_for_request_id(
                                 &mut guard,
@@ -465,11 +468,7 @@ fn routing_load(
                             m.delivery_rate() * 100.0,
                             m.avg_hops(),
                         );
-                        assert!(
-                            m.delivery_rate() >= 0.90,
-                            "delivery rate {:.1}% < 90%",
-                            m.delivery_rate() * 100.0
-                        );
+                        assert_eq!(m.delivered, m.sent, "batch contains undelivered packets");
                         m.wall_time
                     }
                 });

@@ -28,15 +28,18 @@ fn emit_transport(bus: &CoreBus, event: TransportEvent) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_listener_transports(
     supervisor: &mut NodeSupervisor,
     producer_cancel: tokio_util::sync::CancellationToken,
     transports: &[Arc<dyn Transport>],
     listens: &dashmap::DashMap<String, SocketAddr>,
+    bound_listens: Arc<dashmap::DashMap<String, SocketAddr>>,
     ctx: TransportContext,
     health: SharedHealth,
     core_bus: CoreBus,
 ) {
+    bound_listens.clear();
     for transport in transports {
         if !transport.is_listener() {
             continue;
@@ -69,6 +72,7 @@ pub(crate) fn spawn_listener_transports(
             catalog: ctx.catalog.clone(),
         };
         let transport_clone = transport.clone();
+        let bound_listens = bound_listens.clone();
         let transport_name = transport.name().to_string();
         let health = health.clone();
         let core_bus = core_bus.clone();
@@ -107,6 +111,9 @@ pub(crate) fn spawn_listener_transports(
                     Ok(bound) => {
                         let started_addr = bound.or(listen_addr);
                         if let Some(addr) = started_addr {
+                            if addr.port() != 0 {
+                                bound_listens.insert(transport_name.clone(), addr);
+                            }
                             crate::info!(
                                 "[NodeRuntime] Transport {} started on {}",
                                 transport_name,

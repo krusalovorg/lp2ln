@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 /// Upper bound for reading the client's hello on an accepted connection.
+const INCOMING_HANDSHAKE_LIMIT: usize = 64;
 const INCOMING_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn handle_incoming(
@@ -21,6 +22,7 @@ async fn handle_incoming(
     peer_addr: SocketAddr,
     obfuscator: Arc<Obfuscator>,
     incoming_sessions_tx: tokio::sync::mpsc::Sender<Arc<dyn Session>>,
+    _pre_auth: Option<crate::router::admission::IngressPermit>,
 ) {
     let handshake = tokio::time::timeout(
         INCOMING_HANDSHAKE_TIMEOUT,
@@ -42,23 +44,19 @@ async fn handle_incoming(
         }
     };
 
+    let Ok(Ok(slot)) =
+        tokio::time::timeout(INCOMING_HANDSHAKE_TIMEOUT, incoming_sessions_tx.reserve()).await
+    else {
+        return;
+    };
     match TcpSession::new_from_stream(stream, Some(peer_id), LinkKind::DirectTcp, obfuscator) {
         Ok(session) => {
-            match incoming_sessions_tx
-                .send(session.clone() as Arc<dyn Session>)
-                .await
-            {
-                Ok(()) => {
-                    crate::session!(
-                        "[TcpTransport] Session registered: {} (peer_id: {:?})",
-                        session.id(),
-                        session.peer_id()
-                    );
-                }
-                Err(_) => {
-                    crate::error!("[TcpTransport] Failed to send incoming session: channel closed");
-                }
-            }
+            slot.send(session.clone() as Arc<dyn Session>);
+            crate::session!(
+                "[TcpTransport] Session registered: {} (peer_id: {:?})",
+                session.id(),
+                session.peer_id()
+            );
         }
         Err(e) => {
             crate::error!("[TcpTransport] Failed to create session from stream: {}", e);
@@ -67,6 +65,7 @@ async fn handle_incoming(
 }
 
 pub struct TcpTransport {
+    receive_budget: std::sync::Mutex<Option<crate::transport::TransportReceiveBudget>>,
     listen_addr: SocketAddr,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     accept_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -83,6 +82,7 @@ impl Default for TcpTransport {
 impl TcpTransport {
     pub fn new() -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -93,6 +93,7 @@ impl TcpTransport {
 
     pub fn new_listener(listen_addr: Option<SocketAddr>) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -103,6 +104,7 @@ impl TcpTransport {
 
     pub fn new_dial() -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -116,6 +118,7 @@ impl TcpTransport {
         config: ObfuscationConfig,
     ) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: listen_addr.unwrap_or("0.0.0.0:8080".parse().expect("valid socket addr")),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -126,6 +129,7 @@ impl TcpTransport {
 
     pub fn new_dial_with_obfuscation(config: ObfuscationConfig) -> Self {
         Self {
+            receive_budget: std::sync::Mutex::new(None),
             listen_addr: "0.0.0.0:0".parse().expect("valid socket addr"),
             shutdown_tx: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
@@ -137,6 +141,18 @@ impl TcpTransport {
 
 #[async_trait]
 impl Transport for TcpTransport {
+    fn bind_receive_budget(&self, budget: crate::transport::TransportReceiveBudget) -> Result<()> {
+        let mut current = self.receive_budget.lock().unwrap();
+        if let Some(active) = current.as_ref().and_then(|b| b.get()) {
+            anyhow::ensure!(
+                budget.get().is_some_and(|new| Arc::ptr_eq(&active, &new)),
+                "transport already bound to another node"
+            );
+        }
+        *current = Some(budget);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "tcp"
     }
@@ -184,14 +200,22 @@ impl Transport for TcpTransport {
             *shutdown_tx_guard = Some(shutdown_tx);
         }
 
+        let shared = self
+            .receive_budget
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|b| b.get());
         let accept_handle = tokio::spawn(async move {
+            let mut handshakes = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => {
                         crate::info!("[TcpTransport] Listener shutting down");
                         break;
                     }
-                    result = listener_clone.accept() => {
+                    _ = handshakes.join_next(), if !handshakes.is_empty() => {}
+                    result = listener_clone.accept(), if handshakes.len() < INCOMING_HANDSHAKE_LIMIT => {
                         match result {
                             Ok((stream, peer_addr)) => {
                                 crate::info!("[TcpTransport] New incoming connection from {}", peer_addr);
@@ -199,11 +223,19 @@ impl Transport for TcpTransport {
                                 // connects but never sends a full hello (port scanners on a
                                 // public address, half-open mobile links) must not stall the
                                 // accept loop for everyone else.
-                                tokio::spawn(handle_incoming(
+                                let pre_auth = match &shared {
+                                    Some(b) => match b.pre_auth(208 * 1024) {
+                                        Some(permit) => Some(permit),
+                                        None => continue,
+                                    },
+                                    None => None,
+                                };
+                                handshakes.spawn(handle_incoming(
                                     stream,
                                     peer_addr,
                                     obfuscator.clone(),
                                     incoming_sessions_tx.clone(),
+                                    pre_auth,
                                 ));
                             }
                             Err(e) => {
@@ -213,6 +245,7 @@ impl Transport for TcpTransport {
                     }
                 }
             }
+            handshakes.shutdown().await;
         });
 
         {

@@ -141,7 +141,7 @@ pub(crate) async fn run_incoming_session_handler(
     incoming_node_role: NodeRole,
     incoming_topology_tuning: TopologyTuning,
     incoming_discovery_random_fraction: f32,
-    incoming_packets_tx_for_sessions: tokio::sync::mpsc::Sender<IncomingPacket>,
+    _incoming_packets_tx_for_sessions: tokio::sync::mpsc::Sender<IncomingPacket>,
 ) -> anyhow::Result<()> {
     let mut recent_redirect_until: std::collections::HashMap<PeerId, u64> =
         std::collections::HashMap::new();
@@ -356,9 +356,7 @@ pub(crate) async fn run_incoming_session_handler(
             session_manager.register_session(session_id.clone(), session.clone());
         }
 
-        session
-            .clone()
-            .spawn_reader(incoming_packets_tx_for_sessions.clone());
+        router_for_incoming.start_session_reader(session.clone());
 
         if session.peer_id().is_some() {
             let peer_id_str = session.peer_id().unwrap().to_string();

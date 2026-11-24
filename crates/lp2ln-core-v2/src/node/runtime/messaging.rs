@@ -1,4 +1,4 @@
-﻿use crate::node::runtime::NodeRuntime;
+use crate::node::runtime::NodeRuntime;
 use crate::packet::Packet;
 use crate::protocol::handshake;
 use crate::sessions::session::IncomingPacket;
@@ -12,6 +12,54 @@ use anyhow::Result;
 use tokio::sync::broadcast::error::RecvError;
 
 impl NodeRuntime {
+    /// Returns the actual listener address after transport readiness.
+    pub fn bound_transport_addr(&self, transport: &str) -> Option<SocketAddr> {
+        self.bound_listens.get(transport).map(|bound| *bound)
+    }
+
+    /// Authorizes an expected remote identity and protocol for inbound Flow
+    /// on the enabled QUIC transport. Discovery does not grant authorization.
+    pub fn authorize_realtime_peer(&self, peer: &PeerId, protocol: u16) -> Result<()> {
+        self.realtime_transport()?
+            .authorize_realtime(peer, protocol)
+    }
+
+    /// Withdraws admission for future link handshakes. Callers close existing handles separately.
+    pub fn revoke_realtime_peer(&self, peer: &PeerId, protocol: u16) -> Result<()> {
+        self.realtime_transport()?.revoke_realtime(peer, protocol)
+    }
+
+    /// Opens an authenticated unordered Flow on an explicit direct path.
+    pub async fn open_realtime_flow(
+        &self,
+        peer: &PeerId,
+        addr: SocketAddr,
+        protocol: u16,
+    ) -> Result<crate::flow::Flow> {
+        let router = self.router.as_ref().ok_or(crate::flow::FlowError::Closed)?;
+        let flow = self
+            .realtime_transport()?
+            .open_realtime(Arc::new(self.keypair.clone()), peer, addr, protocol)
+            .await?;
+        router
+            .paths()
+            .record_success("quic", addr, flow.link().rtt.as_millis() as u64);
+        Ok(flow)
+    }
+
+    /// Accepts the next mutually authenticated, authorized Flow.
+    pub async fn accept_realtime_flow(&self) -> Result<crate::flow::Flow> {
+        self.realtime_transport()?.accept_realtime().await
+    }
+
+    fn realtime_transport(&self) -> Result<&dyn crate::transport::Transport> {
+        self.transports
+            .iter()
+            .find(|transport| transport.name() == "quic")
+            .map(Arc::as_ref)
+            .ok_or(crate::flow::FlowError::Unsupported.into())
+    }
+
     pub async fn dial(
         &self,
         transport_name: &str,
@@ -38,7 +86,7 @@ impl NodeRuntime {
         let session = self.dial(transport_name, addr).await?;
         let session_id = SessionId::from(session.id().to_string());
         router.register_session_only(session_id.clone(), session.clone());
-        session.spawn_reader(router.incoming_sender());
+        router.start_session_reader(session);
         let mut obf_protocols: Vec<String> =
             self.options.transport_obfuscation.keys().cloned().collect();
         obf_protocols.sort();

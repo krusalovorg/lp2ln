@@ -1,3 +1,5 @@
+use super::admission::{AdmittedPacket, IngressBudget, IngressMemory, SessionIngress};
+use super::fanout::LegacyFanout;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +21,12 @@ use crate::{
     packet_processor::PacketProcessor,
     protocol::control::NetworkControlPayload,
     router::dispatch::PacketIngressDispatcher,
-    router::egress::PacketEgressSecurity,
+    router::egress::{EgressContention, EgressOrder, PacketEgressSecurity},
     services::{MetricsProvider, PacketPublisher, SessionRegistry, SessionSelector},
     sessions::{
         LinkKind, Session, SessionMetrics, manager::SessionManager, session::IncomingPacket,
     },
-    transport::tcp::codec::encode_packet,
+    transport::{WriterAdmissionError, tcp::codec::encode_packet},
     types::{NodeId, PeerId, SessionId},
 };
 
@@ -51,10 +53,13 @@ pub enum RouterRunOutcome {
 pub struct Router {
     session_manager: Arc<SessionManager>,
     egress: PacketEgressSecurity,
+    egress_order: EgressOrder,
     ingress: PacketIngressDispatcher,
     incoming_tx: Arc<Mutex<Option<mpsc::Sender<IncomingPacket>>>>,
-    incoming_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
-    authenticated_broadcast_tx: broadcast::Sender<Arc<IncomingPacket>>,
+    admitted_tx: Mutex<Option<mpsc::Sender<AdmittedPacket>>>,
+    admitted_rx: tokio::sync::Mutex<mpsc::Receiver<AdmittedPacket>>,
+    ingress_budget: Arc<IngressBudget>,
+    fanout: LegacyFanout,
     peer_cache: Arc<PeerCryptoCache>,
     direct_upgrade: Option<DirectUpgradeRouterSink>,
     direct_upgrade_channel_full: AtomicU64,
@@ -102,8 +107,9 @@ impl Router {
         let our_peer_id: String = our_peer_id.into();
         let our_node_id = node_id_of(&our_peer_id);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(incoming_cap);
-        let (incoming_broadcast_tx, _rx) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
-        let (authenticated_broadcast_tx, _) = broadcast::channel::<Arc<IncomingPacket>>(broadcast_cap);
+        let (admitted_tx, admitted_rx) = mpsc::channel(incoming_cap);
+        let ingress_budget = Arc::new(IngressBudget::default());
+        let fanout = LegacyFanout::new(broadcast_cap, ingress_budget.clone());
         let incoming_tx = Arc::new(Mutex::new(Some(incoming_tx)));
 
         let start_id: u64 = rand::rng().random();
@@ -119,9 +125,9 @@ impl Router {
             packet_processor,
             chunk_assembler,
             relay_dedup,
-            incoming_broadcast_tx.clone(),
             our_peer_id.clone(),
             worker_concurrency,
+            incoming_cap,
         );
         let egress = PacketEgressSecurity::new(
             signing_key,
@@ -135,10 +141,13 @@ impl Router {
             Self {
                 session_manager,
                 egress,
+                egress_order: EgressOrder::default(),
                 ingress,
                 incoming_tx,
-                incoming_broadcast_tx,
-                authenticated_broadcast_tx,
+                admitted_tx: Mutex::new(Some(admitted_tx)),
+                admitted_rx: tokio::sync::Mutex::new(admitted_rx),
+                ingress_budget,
+                fanout,
                 peer_cache,
                 direct_upgrade,
                 direct_upgrade_channel_full: AtomicU64::new(0),
@@ -150,6 +159,23 @@ impl Router {
         )
     }
 
+    // A cooperative yield between sequence assignment and writer admission
+    // must not let more recent packets pass this packet on the same link.
+    async fn order_egress(
+        &self,
+        packet: &Packet,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        if self.egress.needs_secure_envelope(packet) {
+            self.egress_order.lock(&packet.receiver).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn egress_contention(&self) -> EgressContention {
+        self.egress_order.contention()
+    }
+
     fn prepare_outgoing(&self, packet: Packet) -> Result<Packet> {
         self.egress.prepare_outgoing(packet)
     }
@@ -158,8 +184,63 @@ impl Router {
         self.egress.use_sequence_state(path)
     }
 
+    pub fn ingress_metrics(&self) -> super::dispatch::IngressMetrics {
+        self.ingress.metrics()
+    }
+
+    pub(crate) fn record_replay_or_late(&self) {
+        self.ingress.record_replay_or_late();
+    }
+
+    pub(crate) fn record_authenticated_ingress(&self, local: bool) {
+        self.ingress.record_authenticated(local);
+    }
+
+    pub(crate) fn admit_relay_packet(&self, packet: &Packet) -> bool {
+        self.ingress.admit_relay_packet(packet)
+    }
+
+    pub(crate) fn broadcast_relay_packet(
+        &self,
+        session_id: &str,
+        from_node: Option<&str>,
+        packet: &Packet,
+    ) {
+        self.fanout
+            .publish_packet(session_id, from_node, packet, false);
+    }
+
+    pub(crate) fn broadcast_legacy_packet(&self, incoming: &IncomingPacket) {
+        self.fanout.publish(incoming);
+    }
+
+    pub fn ingress_memory(&self) -> IngressMemory {
+        self.fanout.reap();
+        self.ingress_budget.snapshot()
+    }
+
+    pub(crate) fn ingress_budget(&self) -> &Arc<IngressBudget> {
+        &self.ingress_budget
+    }
+
+    /// Starts a reader on the byte-admitted path when supported by its session.
+    pub fn start_session_reader(&self, session: Arc<dyn Session>) {
+        let tx = self.admitted_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let ingress = SessionIngress::new(
+                self.ingress_budget.clone(),
+                self.session_manager.clone(),
+                tx,
+                self.incoming_sender(),
+                SessionId::from(session.id().to_owned()),
+                session.kind().is_reliable(),
+            );
+            session.spawn_budgeted_reader(ingress);
+        }
+    }
+
     pub fn subscribe_authenticated(&self) -> broadcast::Receiver<Arc<IncomingPacket>> {
-        self.authenticated_broadcast_tx.subscribe()
+        self.fanout.subscribe(true)
     }
 
     fn try_record_direct_upgrade_fallback(&self, peer_id: &PeerId, bytes: u64) {
@@ -205,6 +286,7 @@ impl Router {
     }
 
     pub fn close_incoming(&self) {
+        self.admitted_tx.lock().unwrap().take();
         if let Ok(mut guard) = self.incoming_tx.lock() {
             guard.take();
         }
@@ -219,15 +301,30 @@ impl Router {
 
     pub async fn shutdown_packet_tasks(&self, drain_timeout: std::time::Duration) {
         self.ingress.shutdown_workers(drain_timeout).await;
+        self.fanout.close();
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<IncomingPacket>> {
-        self.incoming_broadcast_tx.subscribe()
+        self.fanout.subscribe(false)
     }
 
-    pub(crate) fn broadcast_incoming_after_decrypt(&self, incoming: IncomingPacket) {
-        let _ = self.authenticated_broadcast_tx.send(Arc::new(incoming.clone()));
-        self.ingress.broadcast_incoming_after_decrypt(incoming);
+    pub(crate) fn broadcast_incoming_after_decrypt(
+        &self,
+        session_id: &str,
+        from_node: Option<&str>,
+        packet: &Packet,
+    ) {
+        #[cfg(feature = "packet-trace")]
+        crate::packet_trace::record(packet, crate::packet_trace::Stage::Published);
+        self.fanout
+            .publish_packet(session_id, from_node, packet, true);
+    }
+
+    async fn on_send_error(&self, session_id: &SessionId, error: &anyhow::Error) {
+        MetricsProvider::record_send_error(self.session_manager.as_ref(), session_id);
+        if error.downcast_ref() != Some(&WriterAdmissionError::FrameTooLarge) {
+            let _ = self.session_manager.close_session(session_id).await;
+        }
     }
 
     pub async fn send_to_session(&self, session_id: SessionId, packet: Packet) -> Result<u64> {
@@ -235,6 +332,7 @@ impl Router {
         else {
             return Err(anyhow::anyhow!("Session '{}' not found", session_id));
         };
+        let _order = self.order_egress(&packet).await?;
         let packet = self.prepare_outgoing(packet)?;
         let request_id = packet.request_id.ok_or_else(|| {
             anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
@@ -249,8 +347,8 @@ impl Router {
                 Ok(request_id)
             }
             Err(e) => {
-                MetricsProvider::record_send_error(self.session_manager.as_ref(), &session_id);
-                let _ = self.session_manager.close_session(&session_id).await;
+                drop(_order);
+                self.on_send_error(&session_id, &e).await;
                 Err(e)
             }
         }
@@ -281,6 +379,7 @@ impl Router {
         packet: Packet,
         exclude_from: Option<PeerId>,
     ) -> Result<u64> {
+        let _order = self.order_egress(&packet).await?;
         let packet = self.prepare_outgoing(packet)?;
         let request_id = packet.request_id.ok_or_else(|| {
             anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
@@ -301,10 +400,12 @@ impl Router {
         // A 256 KiB block cannot fit in a UDP datagram. Require a reliable hop
         // for both requests and replies, with automatic relay fallback when the
         // target only has UDP sessions. Other traffic keeps normal selection.
-        let is_block_transfer = packet.protocol_id == Some(crate::storage::block_transfer::BLOCK_PROTOCOL_ID);
+        let is_block_transfer =
+            packet.protocol_id == Some(crate::storage::block_transfer::BLOCK_PROTOCOL_ID);
         let bulk_needs_reliable = (packet.is_chunk() || is_block_transfer)
             && self.delivery.bulk_requires_reliable_transport;
-        if packet.is_chunk() && bulk_needs_reliable
+        if packet.is_chunk()
+            && bulk_needs_reliable
             && SessionSelector::best_session_for_peer(self.session_manager.as_ref(), &peer_id)
                 .is_some()
             && self.reliable_session_for(&peer_id).is_none()
@@ -328,8 +429,8 @@ impl Router {
                     return Ok(request_id);
                 }
                 Err(e) => {
-                    MetricsProvider::record_send_error(self.session_manager.as_ref(), &session_id);
-                    let _ = self.session_manager.close_session(&session_id).await;
+                    drop(_order);
+                    self.on_send_error(&session_id, &e).await;
                     return Err(e);
                 }
             }
@@ -408,11 +509,7 @@ impl Router {
                         break;
                     }
                     Err(e) => {
-                        MetricsProvider::record_send_error(
-                            self.session_manager.as_ref(),
-                            &session_id,
-                        );
-                        let _ = self.session_manager.close_session(&session_id).await;
+                        self.on_send_error(&session_id, &e).await;
                         last_err = Some(e);
                     }
                 }
@@ -468,6 +565,7 @@ impl Router {
     }
 
     pub async fn teardown_session(&self, session_id: &SessionId) -> Result<()> {
+        self.ingress.remove_session(session_id);
         if let Some(peer_id) = self.session_manager.get_peer_for_session(session_id) {
             self.peer_cache.remove_peer(peer_id.as_str());
         }
@@ -495,20 +593,36 @@ impl Router {
         incoming_rx: &mut mpsc::Receiver<IncomingPacket>,
         cancel: CancellationToken,
     ) -> RouterRunOutcome {
+        let mut admitted_rx = self.admitted_rx.lock().await;
+        let mut admitted_open = true;
+        let mut reap = tokio::time::interval(std::time::Duration::from_secs(1));
+        reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let incoming = tokio::select! {
+            let deadline =
+                tokio::time::Instant::now() + crate::router::dispatch::ROUTER_DRAIN_BUDGET;
+            tokio::select! {
                 _ = cancel.cancelled() => {
-                    self.ingress
-                        .drain_incoming(self.clone(), incoming_rx)
-                        .await;
+                    self.ingress.drain_incoming(self.clone(), incoming_rx, &mut admitted_rx).await;
+                    admitted_rx.close();
+                    while admitted_rx.try_recv().is_ok() {}
                     return RouterRunOutcome::Cancelled;
                 }
-                maybe = incoming_rx.recv() => match maybe {
-                    Some(incoming) => incoming,
-                    None => break,
+                _ = reap.tick() => self.ingress.maintain(self.as_ref()),
+                maybe = admitted_rx.recv(), if admitted_open => match maybe {
+                    Some(packet) => self.ingress.dispatch_admitted(self.clone(), packet, deadline).await,
+                    None => admitted_open = false,
                 },
-            };
-            self.ingress.dispatch_incoming(self.clone(), incoming);
+                maybe = incoming_rx.recv() => match maybe {
+                    Some(incoming) => self.ingress.dispatch_incoming(self.clone(), incoming, deadline).await,
+                    None => {
+                        admitted_rx.close();
+                        while let Some(packet) = admitted_rx.recv().await {
+                            self.ingress.dispatch_admitted(self.clone(), packet, deadline).await;
+                        }
+                        break;
+                    }
+                },
+            }
         }
         if self.is_ingress_closed() {
             RouterRunOutcome::IngressClosed

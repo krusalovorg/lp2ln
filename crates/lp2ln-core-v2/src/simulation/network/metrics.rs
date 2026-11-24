@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -148,12 +148,23 @@ pub async fn wait_for_unique_deliveries(
     receiver: &str,
     wait_timeout: Duration,
 ) -> RoutingMetrics {
+    wait_for_matching_deliveries(rx, expected, sender, receiver, wait_timeout, |_| true).await
+}
+
+pub(super) async fn wait_for_matching_deliveries(
+    rx: &mut broadcast::Receiver<Arc<IncomingPacket>>,
+    expected: usize,
+    sender: &str,
+    receiver: &str,
+    wait_timeout: Duration,
+    matches_id: impl Fn(u64) -> bool,
+) -> RoutingMetrics {
     use std::collections::HashSet;
     let started = Instant::now();
     let mut seen = HashSet::new();
     let mut total_hops = 0usize;
 
-    let result = timeout(wait_timeout, async {
+    let _ = timeout(wait_timeout, async {
         while seen.len() < expected {
             match rx.recv().await {
                 Ok(incoming) => {
@@ -161,6 +172,7 @@ pub async fn wait_for_unique_deliveries(
                     if pkt.sender == sender
                         && pkt.receiver == receiver
                         && let Some(rid) = pkt.request_id
+                        && matches_id(rid)
                         && seen.insert(rid)
                     {
                         total_hops += pkt.nodes.len() + 1; // edge count
@@ -174,11 +186,7 @@ pub async fn wait_for_unique_deliveries(
     .await;
 
     let delivered = seen.len();
-    let dropped = if result.is_err() {
-        expected.saturating_sub(delivered)
-    } else {
-        0
-    };
+    let dropped = expected.saturating_sub(delivered);
 
     RoutingMetrics {
         sent: expected,
@@ -187,5 +195,31 @@ pub async fn wait_for_unique_deliveries(
         total_hops,
         shortest_path_hops: 0,
         wall_time: started.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn range_filter_duplicates_and_lag_are_not_deliveries() {
+        let (tx, mut rx) = broadcast::channel(4);
+        for id in [42, 42, 80, 10, 10, 99] {
+            tx.send(Arc::new(IncomingPacket {
+                session_id: String::new(),
+                from_node: None,
+                packet: make_routing_packet_with_id("a", "b", 1, 1, Some(id)),
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let sample =
+            wait_for_matching_deliveries(&mut rx, 2, "a", "b", Duration::from_secs(1), |id| {
+                (10..12).contains(&id)
+            })
+            .await;
+        assert_eq!(sample.delivered, 1);
+        assert_eq!(sample.dropped, 1);
     }
 }

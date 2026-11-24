@@ -160,7 +160,7 @@ mod tests {
             .await
             .expect("handshake");
 
-        let h3_conn = h3_quinn::Connection::new(quinn_conn);
+        let h3_conn = h3_quinn::Connection::new(quinn_conn.clone());
         let (mut driver, mut send_req) = h3::client::new(h3_conn).await.expect("h3 client");
         tokio::spawn(async move {
             let _ = driver.wait_idle().await;
@@ -173,9 +173,17 @@ mod tests {
             .unwrap();
         let mut stream = send_req.send_request(req).await.expect("send_request");
         stream.finish().await.expect("finish");
-        let resp = stream.recv_response().await.expect("recv_response");
+        let deadline = std::time::Duration::from_secs(3);
+        let resp = tokio::time::timeout(deadline, stream.recv_response())
+            .await
+            .expect("response deadline")
+            .expect("recv_response");
         assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
 
-        server_task.await.expect("server task");
+        quinn_conn.close(0u32.into(), b"test complete");
+        tokio::time::timeout(deadline, server_task)
+            .await
+            .expect("server shutdown deadline")
+            .expect("server task");
     }
 }

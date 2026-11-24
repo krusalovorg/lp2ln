@@ -1,12 +1,10 @@
-
-
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lp2ln_core_v2::app_plane::{
-    AppCapability, AppCmd, AppErrorCode, AppEvent, AppPlaneRouter, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    QUEUE_CAP, decode_cmd, encode_event,
+    AppCapability, AppCmd, AppErrorCode, AppEvent, AppPlaneRouter, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, QUEUE_CAP, decode_cmd, encode_event,
 };
 use lp2ln_core_v2::node::{AppPlaneIpcOptions, NodeRuntime};
 use lp2ln_core_v2::packet::Packet;
@@ -49,8 +47,7 @@ impl AppPlaneServerConfig {
     }
 
     fn protocol_allowed(&self, protocol_id: u16) -> bool {
-        self.allowed_protocol_ids.is_empty()
-            || self.allowed_protocol_ids.contains(&protocol_id)
+        self.allowed_protocol_ids.is_empty() || self.allowed_protocol_ids.contains(&protocol_id)
     }
 }
 
@@ -84,7 +81,7 @@ pub async fn run(
     node: Arc<NodeRuntime>,
     router: Arc<lp2ln_core_v2::router::Router>,
 ) -> anyhow::Result<()> {
-    let app_router = Arc::new(AppPlaneRouter::new());
+    let app_router = Arc::new(AppPlaneRouter::with_router(&router));
     spawn_router_bridge(app_router.clone(), router);
 
     let mut tasks = Vec::new();
@@ -116,22 +113,29 @@ pub async fn run(
     Ok(())
 }
 
-fn spawn_router_bridge(app_router: Arc<AppPlaneRouter>, router: Arc<lp2ln_core_v2::router::Router>) {
+fn spawn_router_bridge(
+    app_router: Arc<AppPlaneRouter>,
+    router: Arc<lp2ln_core_v2::router::Router>,
+) {
+    let mut sub = router.subscribe_authenticated();
     tokio::spawn(async move {
-        let mut sub = router.subscribe();
+        let mut reap = tokio::time::interval(std::time::Duration::from_secs(1));
+        reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            match sub.recv().await {
+            let item = tokio::select! {
+                _ = reap.tick() => {
+                    app_router.reap();
+                    continue;
+                }
+                item = sub.recv() => item,
+            };
+            match item {
                 Ok(inc) => {
                     if let Some(pid) = inc.packet.protocol_id {
-                        let ev = AppEvent::Incoming {
-                            from: inc.packet.sender.clone(),
-                            protocol_id: pid,
-                            payload: inc.packet.data.clone(),
-                        };
-                        app_router.dispatch(pid, ev);
+                        app_router.dispatch_incoming(pid, &inc.packet.sender, &inc.packet.data);
                     }
                 }
-                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Lagged(n)) => app_router.record_refused(n),
                 Err(_) => break,
             }
         }
@@ -239,6 +243,31 @@ fn normalize_windows_pipe_name(path: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct IpcOutput {
+    tx: mpsc::Sender<(Vec<u8>, lp2ln_core_v2::app_plane::AppPlaneMemoryCharge)>,
+    memory: Arc<lp2ln_core_v2::app_plane::AppPlaneConnectionBudget>,
+}
+
+impl IpcOutput {
+    async fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        let permit = self.memory.reserve(bytes.capacity() + 128).ok_or(())?;
+        self.submit(bytes, permit).await
+    }
+
+    async fn submit(
+        &self,
+        bytes: Vec<u8>,
+        permit: lp2ln_core_v2::app_plane::AppPlaneMemoryCharge,
+    ) -> Result<(), ()> {
+        let timeout = std::time::Duration::from_secs(2);
+        tokio::time::timeout(timeout, self.tx.send((bytes, permit)))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
+    }
+}
+
 async fn handle_connection<S>(
     stream: S,
     node: Arc<NodeRuntime>,
@@ -248,12 +277,21 @@ async fn handle_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, writer) = tokio::io::split(stream);
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CAP);
+    let (out, mut out_rx) = mpsc::channel(QUEUE_CAP);
+    let memory = app_router.connection_budget();
+    let out_tx = IpcOutput {
+        tx: out,
+        memory: memory.clone(),
+    };
 
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
-        while let Some(frame) = out_rx.recv().await {
-            if writer.write_all(&frame).await.is_err() {
+        while let Some((frame, _permit)) = out_rx.recv().await {
+            let deadline = std::time::Duration::from_secs(5);
+            if !matches!(
+                tokio::time::timeout(deadline, writer.write_all(&frame)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -275,6 +313,9 @@ async fn handle_connection<S>(
             break;
         }
 
+        let Some(_decode_charge) = memory.reserve(2 * frame_len as usize + 4096) else {
+            break;
+        };
         let mut body = vec![0u8; frame_len as usize];
         if reader.read_exact(&mut body).await.is_err() {
             break;
@@ -356,10 +397,21 @@ async fn handle_connection<S>(
                     {
                         let mut rx = app_router.subscribe(protocol_id);
                         let out = out_tx.clone();
+                        let bridge = app_router.clone();
                         e.insert(tokio::spawn(async move {
                             while let Some(ev) = rx.recv().await {
+                                let AppEvent::Incoming { from, payload, .. } = &ev else {
+                                    continue;
+                                };
+                                // Both the postcard encoding and its length-prefixed copy coexist.
+                                let upper = 2 * (from.len() + payload.len() + 128);
+                                let Some(permit) = out.memory.reserve(upper) else {
+                                    bridge.record_refused(1);
+                                    continue;
+                                };
                                 let frame = encode_event(&ev);
-                                if out.send(frame).await.is_err() {
+                                if out.submit(frame, permit).await.is_err() {
+                                    bridge.record_refused(1);
                                     break;
                                 }
                             }
@@ -493,10 +545,7 @@ async fn handle_connection<S>(
                     break;
                 }
             }
-            AppCmd::StreamWindow {
-                stream_id,
-                credits,
-            } => {
+            AppCmd::StreamWindow { stream_id, credits } => {
                 if granted.contains(&AppCapability::OpenStream) {
                     let _ = streams.on_window(stream_id, credits);
                 }
@@ -540,7 +589,10 @@ async fn handle_connection<S>(
                             let _ = dht.announce(arr).await;
                         }
                     }
-                    encode_event(&AppEvent::Ack { ok: true, error: None })
+                    encode_event(&AppEvent::Ack {
+                        ok: true,
+                        error: None,
+                    })
                 } else {
                     encode_event(&AppEvent::Ack {
                         ok: false,
@@ -578,10 +630,12 @@ async fn handle_connection<S>(
                         let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
                             Ok(a) => a,
                             Err(_) => {
-                                let _ = tx.send(encode_event(&AppEvent::Ack {
-                                    ok: false,
-                                    error: Some("invalid content_id length".into()),
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::Ack {
+                                        ok: false,
+                                        error: Some("invalid content_id length".into()),
+                                    }))
+                                    .await;
                                 return;
                             }
                         };
@@ -614,15 +668,20 @@ async fn handle_connection<S>(
                                 }
                             }
                         }
-                        let _ = tx.send(encode_event(&AppEvent::DhtProviders {
-                            content_id: cid_bytes,
-                            providers,
-                        })).await;
+                        let _ = tx
+                            .send(encode_event(&AppEvent::DhtProviders {
+                                content_id: cid_bytes,
+                                providers,
+                            }))
+                            .await;
                     });
                 }
             }
 
-            AppCmd::BlockFetch { content_id, peer_ids } => {
+            AppCmd::BlockFetch {
+                content_id,
+                peer_ids,
+            } => {
                 let reply = if !granted.contains(&AppCapability::Send) {
                     Some(encode_event(&AppEvent::Ack {
                         ok: false,
@@ -631,7 +690,10 @@ async fn handle_connection<S>(
                 } else if node.block_transfer_service().is_none() {
                     Some(encode_event(&AppEvent::Ack {
                         ok: false,
-                        error: Some("block_transfer not enabled (set experimental.block_transfer=true)".into()),
+                        error: Some(
+                            "block_transfer not enabled (set experimental.block_transfer=true)"
+                                .into(),
+                        ),
                     }))
                 } else {
                     None
@@ -647,32 +709,42 @@ async fn handle_connection<S>(
                         let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
                             Ok(a) => a,
                             Err(_) => {
-                                let _ = tx.send(encode_event(&AppEvent::Ack {
-                                    ok: false,
-                                    error: Some("invalid content_id length".into()),
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::Ack {
+                                        ok: false,
+                                        error: Some("invalid content_id length".into()),
+                                    }))
+                                    .await;
                                 return;
                             }
                         };
                         match bt.fetch_from_providers(arr, &peer_ids).await {
                             Ok(data) => {
-                                let _ = tx.send(encode_event(&AppEvent::BlockData {
-                                    content_id: cid_bytes,
-                                    data,
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::BlockData {
+                                        content_id: cid_bytes,
+                                        data,
+                                    }))
+                                    .await;
                             }
                             Err(e) => {
-                                let _ = tx.send(encode_event(&AppEvent::Ack {
-                                    ok: false,
-                                    error: Some(format!("block fetch failed: {e}")),
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::Ack {
+                                        ok: false,
+                                        error: Some(format!("block fetch failed: {e}")),
+                                    }))
+                                    .await;
                             }
                         }
                     });
                 }
             }
 
-            AppCmd::BlockPush { content_id, data, min_replicas } => {
+            AppCmd::BlockPush {
+                content_id,
+                data,
+                min_replicas,
+            } => {
                 let reply = if !granted.contains(&AppCapability::Send) {
                     Some(encode_event(&AppEvent::Ack {
                         ok: false,
@@ -681,7 +753,10 @@ async fn handle_connection<S>(
                 } else if node.block_transfer_service().is_none() {
                     Some(encode_event(&AppEvent::Ack {
                         ok: false,
-                        error: Some("block_transfer not enabled (set experimental.block_transfer=true)".into()),
+                        error: Some(
+                            "block_transfer not enabled (set experimental.block_transfer=true)"
+                                .into(),
+                        ),
                     }))
                 } else {
                     None
@@ -698,26 +773,34 @@ async fn handle_connection<S>(
                         let arr: [u8; 32] = match cid_bytes.as_slice().try_into() {
                             Ok(a) => a,
                             Err(_) => {
-                                let _ = tx.send(encode_event(&AppEvent::Ack {
-                                    ok: false,
-                                    error: Some("invalid content_id length".into()),
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::Ack {
+                                        ok: false,
+                                        error: Some("invalid content_id length".into()),
+                                    }))
+                                    .await;
                                 return;
                             }
                         };
                         if lp2ln_core_v2::storage::hash_bytes(&data) != arr {
-                            let _ = tx.send(encode_event(&AppEvent::Ack {
-                                ok: false,
-                                error: Some("data does not hash to content_id".into()),
-                            })).await;
+                            let _ = tx
+                                .send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some("data does not hash to content_id".into()),
+                                }))
+                                .await;
                             return;
                         }
                         // Always seed the node's local store so this node can serve the block.
-                        if let Err(e) = lp2ln_core_v2::storage::BlockStoreTrait::put(&bt.store, &data) {
-                            let _ = tx.send(encode_event(&AppEvent::Ack {
-                                ok: false,
-                                error: Some(format!("local store failed: {e}")),
-                            })).await;
+                        if let Err(e) =
+                            lp2ln_core_v2::storage::BlockStoreTrait::put(&bt.store, &data)
+                        {
+                            let _ = tx
+                                .send(encode_event(&AppEvent::Ack {
+                                    ok: false,
+                                    error: Some(format!("local store failed: {e}")),
+                                }))
+                                .await;
                             return;
                         }
                         // ponytail: naive replica selection = connected peers in order;
@@ -734,10 +817,12 @@ async fn handle_connection<S>(
                                 }
                             }
                         }
-                        let _ = tx.send(encode_event(&AppEvent::BlockPushed {
-                            content_id: cid_bytes,
-                            stored_by,
-                        })).await;
+                        let _ = tx
+                            .send(encode_event(&AppEvent::BlockPushed {
+                                content_id: cid_bytes,
+                                stored_by,
+                            }))
+                            .await;
                     });
                 }
             }
@@ -752,7 +837,10 @@ async fn handle_connection<S>(
                     match key.as_slice().try_into() {
                         Ok(k) => {
                             let _ = dht.put_value(k, value, seq).await;
-                            encode_event(&AppEvent::Ack { ok: true, error: None })
+                            encode_event(&AppEvent::Ack {
+                                ok: true,
+                                error: None,
+                            })
                         }
                         Err(_) => encode_event(&AppEvent::Ack {
                             ok: false,
@@ -796,14 +884,17 @@ async fn handle_connection<S>(
                         let k: [u8; 32] = match key_bytes.as_slice().try_into() {
                             Ok(a) => a,
                             Err(_) => {
-                                let _ = tx.send(encode_event(&AppEvent::Ack {
-                                    ok: false,
-                                    error: Some("invalid key length".into()),
-                                })).await;
+                                let _ = tx
+                                    .send(encode_event(&AppEvent::Ack {
+                                        ok: false,
+                                        error: Some("invalid key length".into()),
+                                    }))
+                                    .await;
                                 return;
                             }
                         };
-                        let query_peer = node2.connected_peers()
+                        let query_peer = node2
+                            .connected_peers()
                             .into_iter()
                             .next()
                             .map(|p| p.into_string())
@@ -813,11 +904,13 @@ async fn handle_connection<S>(
                             Some(r) => (Some(r.value), r.seq),
                             None => (None, 0),
                         };
-                        let _ = tx.send(encode_event(&AppEvent::DhtValue {
-                            key: key_bytes,
-                            value,
-                            seq,
-                        })).await;
+                        let _ = tx
+                            .send(encode_event(&AppEvent::DhtValue {
+                                key: key_bytes,
+                                value,
+                                seq,
+                            }))
+                            .await;
                     });
                 }
             }
@@ -837,7 +930,12 @@ fn negotiate_hello(
     version: u16,
     requested: &[AppCapability],
     token: Option<&str>,
-) -> (bool, Vec<AppCapability>, Option<AppErrorCode>, Option<String>) {
+) -> (
+    bool,
+    Vec<AppCapability>,
+    Option<AppErrorCode>,
+    Option<String>,
+) {
     if version != PROTOCOL_VERSION {
         return (
             false,
@@ -932,11 +1030,7 @@ mod tests {
         .await;
     }
 
-    async fn handshake_caps(
-        client: &mut TcpStream,
-        token: Option<&str>,
-        caps: &[AppCapability],
-    ) {
+    async fn handshake_caps(client: &mut TcpStream, token: Option<&str>, caps: &[AppCapability]) {
         client
             .write_all(&encode_cmd(&AppCmd::Hello {
                 version: PROTOCOL_VERSION,
@@ -1555,10 +1649,7 @@ mod tests {
         client.subscribe(77).await.unwrap();
 
         // Drop connection side by reconnecting (new TCP) and resubscribe.
-        client
-            .reconnect(opts, &caps, None, 3)
-            .await
-            .unwrap();
+        client.reconnect(opts, &caps, None, 3).await.unwrap();
         client.subscribe(77).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(30)).await;

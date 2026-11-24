@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Production image for lp2lnd with health probes and graceful shutdown.
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpcap-dev \
@@ -9,11 +9,9 @@ RUN apt-get update \
 
 WORKDIR /build
 
-COPY Cargo.toml ./
-COPY Cargo.lock ./
-COPY crates/lp2ln-core-v2 ./crates/lp2ln-core-v2
-COPY crates/lp2lnd ./crates/lp2lnd
-COPY crates/lp2ln-db-export ./crates/lp2ln-db-export
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY vendor ./vendor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \

@@ -64,6 +64,19 @@ pub(crate) async fn join_accept_task(
 
 pub(crate) const ACCEPT_TASK_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Transport-side access to a node's receive ledger. A transport may outlive
+/// its node, so this binding does not keep the ledger alive.
+#[derive(Clone)]
+pub struct TransportReceiveBudget(
+    pub(crate) std::sync::Weak<crate::router::admission::IngressBudget>,
+);
+
+impl TransportReceiveBudget {
+    pub(crate) fn get(&self) -> Option<Arc<crate::router::admission::IngressBudget>> {
+        self.0.upgrade()
+    }
+}
+
 #[derive(Clone)]
 pub struct TransportContext {
     pub incoming_sessions_tx: mpsc::Sender<Arc<dyn Session>>,
@@ -98,6 +111,11 @@ pub trait Transport: Send + Sync {
         true
     }
 
+    #[doc(hidden)]
+    fn bind_receive_budget(&self, _budget: TransportReceiveBudget) -> Result<()> {
+        Ok(())
+    }
+
     async fn start(&self, ctx: TransportContext) -> Result<Option<SocketAddr>>;
 
     async fn stop(&self) -> Result<()> {
@@ -114,6 +132,32 @@ pub trait Transport: Send + Sync {
         _peer_id: Option<&str>,
     ) -> Result<Arc<dyn Session>> {
         self.dial(addr).await
+    }
+
+    #[doc(hidden)]
+    fn authorize_realtime(&self, _peer: &crate::PeerId, _protocol: u16) -> Result<()> {
+        Err(crate::flow::FlowError::Unsupported.into())
+    }
+
+    #[doc(hidden)]
+    fn revoke_realtime(&self, _peer: &crate::PeerId, _protocol: u16) -> Result<()> {
+        Err(crate::flow::FlowError::Unsupported.into())
+    }
+
+    #[doc(hidden)]
+    async fn open_realtime(
+        &self,
+        _identity: Arc<NodeKeypair>,
+        _peer: &crate::PeerId,
+        _addr: SocketAddr,
+        _protocol: u16,
+    ) -> Result<crate::flow::Flow> {
+        Err(crate::flow::FlowError::Unsupported.into())
+    }
+
+    #[doc(hidden)]
+    async fn accept_realtime(&self) -> Result<crate::flow::Flow> {
+        Err(crate::flow::FlowError::Unsupported.into())
     }
 
     fn supports_tunneling(&self) -> bool {

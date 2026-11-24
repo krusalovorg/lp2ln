@@ -1,4 +1,4 @@
-﻿use crate::packet::Packet;
+use crate::packet::Packet;
 use crate::protocol::control::{NatCandidate, NatCandidateKind, NetworkControlPayload};
 use crate::services::{NatTraversalPort, PacketPublisher, SessionSelector};
 use crate::topology::{
@@ -38,12 +38,37 @@ pub async fn try_handle_control_packet(
     peer_discovery_random_fraction: f32,
     nat_state: &dyn NatTraversalPort,
 ) -> bool {
-    let data = packet.data.as_slice();
-    let reply_to_request_id = packet.request_id;
-    let Ok(ctrl) = NetworkControlPayload::decode(data) else {
+    let Ok(ctrl) = NetworkControlPayload::decode(&packet.data) else {
         return false;
     };
+    handle_verified_control(
+        packet.request_id,
+        ctrl,
+        our_peer_id,
+        from,
+        peer_id,
+        peer_catalog,
+        publisher,
+        sessions,
+        peer_discovery_random_fraction,
+        nat_state,
+    )
+    .await;
+    true
+}
 
+pub(super) async fn handle_verified_control(
+    reply_to_request_id: Option<u64>,
+    ctrl: NetworkControlPayload,
+    our_peer_id: &str,
+    from: &str,
+    peer_id: &PeerId,
+    peer_catalog: &PeerCatalog,
+    publisher: &dyn PacketPublisher,
+    sessions: &dyn SessionSelector,
+    peer_discovery_random_fraction: f32,
+    nat_state: &dyn NatTraversalPort,
+) {
     nat_state.cleanup_expired();
 
     let local_nat_candidates = || -> Vec<NatCandidate> {
@@ -180,7 +205,6 @@ pub async fn try_handle_control_packet(
             nat_state.mark_result(&session_id, success, selected_addr, reason);
         }
     }
-    true
 }
 
 #[cfg(test)]
